@@ -1,0 +1,44 @@
+# P0 验证记录
+
+版本：0.1.0。记录日期：2026-10-20。
+
+本轮结果：Node.js 24.19.0 下 `npm test` 的 50 项测试全部通过；`npm run check` 通过；`npm run package` 成功生成扩展 ZIP。未执行真实账号和用户设备端到端测试。
+
+## 已完成的程序检查
+
+- Node.js 自动化测试：原生结构、分支展示、未知字段、凭据脱敏、消息分页标记、路径安全与固定命名。
+- 隔离执行函数的序列化测试：无外部闭包依赖，身份前后变化拒收，ID 不匹配拒收，非法请求和异常不泄露凭据。
+- GitHub 模拟测试：私有仓库约束、固定合成文件、空仓库、幂等、冲突保护、网络不确定结果复核和读回检查。
+- 本地文件句柄模拟测试：权限不足、预检冲突、重复写入、部分文件续写、大小限制和读回失败。
+- 静态检查：Manifest、JavaScript 语法、模块引用和界面元素引用。
+- 打包检查：仅收录扩展源码，不包含测试数据、个人档案或开发环境文件。
+
+以上程序检查不等同于真实浏览器、平台账号或网络服务验收。
+
+## 仍待实际验证
+
+| 项目 | 当前状态 | 需要的证据 |
+| --- | --- | --- |
+| Chrome / Edge 加载与界面 | 待实测 | 扩展正常加载、权限弹窗和按钮流程 |
+| 当前账号身份 | 待实测 | 普通账号识别正确，换号后可重新识别 |
+| 普通列表与分页 | 待实测 | 不同页的 ID、排序与范围核对 |
+| 新版消息列表详情 | 待实测 | 实际响应结构、分页标志和消息顺序 |
+| 旧版消息树详情 | 待实测 | mapping/current_node 和分支关系 |
+| 长对话与编辑/重新生成 | 待实测 | 已取得范围与网页一致；缺页明确显示 |
+| 真实目录与权限恢复 | 待实测 | 文件实际落盘、重开页面/浏览器后授权恢复 |
+| 私有 GitHub 真实提交 | 待实测 | 用户点击后产生合成文件与可读回提交 |
+| 团队/项目/归档/临时对话 | 未接入 | 后续平台范围验证 |
+| 自动扫描、切换批次、真实对话上传和多设备合并 | 未实现 | P1–P3 |
+
+## 接口与实现参考
+
+以下参考仅说明实现依据，不证明目标账号已经可用：
+
+- [Chrome scripting API](https://developer.chrome.com/docs/extensions/reference/api/scripting)：将自包含函数注入受授权页面的隔离环境。
+- [Chrome File System Access](https://developer.chrome.com/docs/capabilities/web-apis/file-system-access)：用户手势选择真实目录、保存句柄、核验权限和写入。
+- [GitHub Contents API](https://docs.github.com/en/rest/repos/contents)：私有仓库合成文件创建与读回。
+- [GitHub References API](https://docs.github.com/en/rest/git/refs)：查询分支指向。
+- [ChatGPT-Exporter 接口说明](https://github.com/Kirito-Elucidator/ChatGPT-Exporter/blob/main/README.md)：公开项目记录的会话、列表和旧版详情路径，仅用于定位实验接口，未复制其实现代码。
+- [chatgpt-conversation-export 格式说明](https://github.com/ThierryAbalea/chatgpt-conversation-export/blob/main/docs/format.md)：公开项目记录的 messages/page_info 与 mapping 结构差异，仅作为实验适配依据。
+
+上述网站内部接口不是官方稳定 API 契约，可能随账号和日期变化。本项目不绕过登录、额外挑战或访问限制。

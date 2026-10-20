@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "AI Memory Collector · P0",
+  "version": "0.1.0",
+  "description": "手动验证 ChatGPT 对话采集、本地保存和私有 GitHub 仓库连接。",
+  "minimum_chrome_version": "120",
+  "permissions": ["scripting"],
+  "optional_host_permissions": ["https://chatgpt.com/*", "https://api.github.com/*"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_title": "打开 AI Memory Collector" },
+  "options_ui": { "page": "panel.html", "open_in_tab": true },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; connect-src https://api.github.com"
+  }
+}
