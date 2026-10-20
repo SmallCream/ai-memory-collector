@@ -1,0 +1,27 @@
+# Dependencies and build outputs (when implementation is added)
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Local credentials and configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+config.local.*
+
+# Personal archives, local experiments and raw capture artifacts
+/data/
+/archives/
+/private/
+/local-data/
+/tmp/
+*.har
+*.log
+
+# Operating system files
+.DS_Store
+Thumbs.db
