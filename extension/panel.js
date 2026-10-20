@@ -5,8 +5,30 @@ import { probeRepository, commitProbe } from './lib/github.js';
 
 const $ = (id) => document.getElementById(id);
 let identity = null, nextOffset = null, directory = null, pending = null, busy = false, locked = true;
+let activeFeedback = null;
 const buttons = [...document.querySelectorAll('button')];
-function status(text, error = false) { $('global-status').textContent = text; $('global-status').className = error ? 'error' : ''; }
+function showFeedback(element, text, error = false) {
+  if (!element) return;
+  element.textContent = text;
+  element.classList.toggle('error', error);
+}
+function status(text, error = false) {
+  showFeedback($('global-status'), text, error);
+  showFeedback(activeFeedback, text, error);
+}
+function startupStatus(text, error = false) {
+  status(text, error);
+  for (const element of document.querySelectorAll('[data-action-status]')) showFeedback(element, error ? text : '', error);
+  window.dispatchEvent(new Event('collector:ready'));
+}
+function errorText(error) {
+  let message = error?.message || '操作未完成，请重试。';
+  const token = $('github-token').value.trim();
+  if (token.length >= 8) message = message.split(token).join('[已隐藏]');
+  message = message.replace(/(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]+/g, '[已隐藏]');
+  const code = /^[A-Z][A-Z0-9_]{0,60}$/.test(error?.code || '') ? `（${error.code}）` : '';
+  return `${message}${code}`;
+}
 function refreshControls() {
   for (const button of buttons) button.disabled = busy || locked;
   for (const input of document.querySelectorAll('input,select')) input.disabled = busy || locked;
@@ -19,15 +41,26 @@ function refreshControls() {
   $('reauthorize').disabled ||= !directory;
 }
 function action(id, fn) {
-  $(id).addEventListener('click', async () => {
+  const button = $(id);
+  button.addEventListener('click', async () => {
     if (busy || locked) return;
-    busy = true; refreshControls(); status('正在处理…');
+    const label = button.textContent;
+    activeFeedback = button.closest('section')?.querySelector('[data-action-status]');
+    busy = true; refreshControls();
+    button.textContent = '处理中…';
+    button.setAttribute('aria-busy', 'true');
+    status(`正在${label}…`);
     try { await fn(); }
     catch (error) {
       // Chrome errors and GitHub wrapper errors must not include API bodies or tokens.
-      status(error?.message || '操作未完成，请重试。', true);
+      status(errorText(error), true);
       if (error?.code === 'ACCOUNT_CHANGED' || error?.code === 'IDENTITY') clearIdentity();
-    } finally { busy = false; refreshControls(); }
+    } finally {
+      button.textContent = label;
+      button.removeAttribute('aria-busy');
+      activeFeedback = null;
+      busy = false; refreshControls();
+    }
   });
 }
 function clearIdentity() {
@@ -38,7 +71,11 @@ function clearIdentity() {
 }
 async function permissions(origin) {
   // Must run directly in a user click chain.
-  if (!await chrome.permissions.request({ origins: [origin] })) throw new Error('未获得所需站点权限。');
+  if (!await chrome.permissions.request({ origins: [origin] })) {
+    const error = new Error('未获得站点访问权限，请再次点击并允许浏览器授权。');
+    error.code = 'SITE_PERMISSION_DENIED';
+    throw error;
+  }
 }
 async function runProbe(request) {
   const tabId = Number($('source-tab').value);
@@ -137,23 +174,29 @@ function githubOptions() {
   return { owner: match[1], repo: match[2], branch: $('branch').value.trim() || undefined, token };
 }
 async function githubAction(write) {
-  await permissions('https://api.github.com/*');
   const options = githubOptions();
+  status('正在请求 GitHub 站点权限；如出现浏览器授权弹窗，请选择允许。');
+  await permissions('https://api.github.com/*');
+  status(write ? '正在验证仓库、写入测试文件并读回；请勿重复点击。' : '正在检查 GitHub 仓库连接…');
   const result = await (write ? commitProbe(options) : probeRepository(options));
-  // Persist only non-secret form values, never the token.
-  await setSetting('githubTarget', { repository: `${options.owner}/${options.repo}`, branch: options.branch || '' });
   $('github-status').textContent = write ?
     `测试结果：${result.status}，读回确认：${result.readbackVerified ? '通过' : '未通过'}。${result.writeVerified ? '本次写入已验证。' : '文件已存在且相同，本次未验证新写入权限。'}` :
     `私有仓库连接成功，分支 ${result.branch}。${result.empty ? '仓库为空，可进行测试写入。' : '尚未执行写入。'}`;
   status(write ? 'GitHub 连接测试完成，没有上传真实对话。' : '仓库只读检查完成。');
+  // Remote success must remain visible even if remembering the form values fails.
+  try {
+    await setSetting('githubTarget', { repository: `${options.owner}/${options.repo}`, branch: options.branch || '' });
+  } catch {
+    status('GitHub 操作已成功，但本机未能记住仓库设置。下次打开需重新填写。');
+  }
 }
 action('check-github', () => githubAction(false));
 action('write-probe', () => githubAction(true));
 // One panel per extension origin prevents concurrent writes by this prototype.
-if (!navigator.locks) { locked = true; status('当前环境缺少页面互斥能力，原型暂不可用。', true); }
+if (!navigator.locks) { locked = true; startupStatus('当前环境缺少页面互斥能力，原型暂不可用。', true); }
 else {
   navigator.locks.request('ai-memory-collector-p0-panel', { ifAvailable: true }, async lock => {
-    if (!lock) { locked = true; status('另一个采集台正在打开。请关闭此页，使用已有采集台。', true); refreshControls(); return; }
+    if (!lock) { locked = true; startupStatus('另一个采集台正在打开。请关闭此页，使用已有采集台。', true); refreshControls(); return; }
     try {
       [directory, pending] = await Promise.all([getSetting('directory'), getSetting('pendingArchive')]);
       const target = await getSetting('githubTarget');
@@ -161,10 +204,10 @@ else {
       if (target) { $('repository').value = target.repository; $('branch').value = target.branch; }
       displayPending();
       locked = false;
-      status(pending ? '已恢复待保存副本，可重新选择或授权目录后保存。' : '准备就绪，从连接 ChatGPT 开始。');
-    } catch { locked = true; status('无法读取本机暂存，请检查浏览器存储权限。', true); }
+      startupStatus(pending ? '已恢复待保存副本，可重新选择或授权目录后保存。' : '准备就绪，从连接 ChatGPT 开始。');
+    } catch { locked = true; startupStatus('无法读取本机暂存，请检查浏览器存储权限。', true); }
     refreshControls();
     await new Promise(() => {});
-  }).catch(() => { locked = true; refreshControls(); status('无法取得采集台锁，请关闭其他采集台后重试。', true); });
+  }).catch(() => { locked = true; refreshControls(); startupStatus('无法取得采集台锁，请关闭其他采集台后重试。', true); });
 }
 refreshControls();

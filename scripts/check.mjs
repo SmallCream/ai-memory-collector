@@ -21,7 +21,7 @@ async function checkDirectory(directory) {
     const result = spawnSync(process.execPath, ['--check', path], { encoding: 'utf8' });
     assert.equal(result.status, 0, result.stderr);
     const source = await readFile(path, 'utf8');
-    for (const match of source.matchAll(/from ['"](\.\.?\/[^'"]+)['"]/g)) await access(resolve(dirname(path), match[1]));
+    for (const match of source.matchAll(/(?:from\s+|import\()['"](\.\.?\/[^'"]+)['"]/g)) await access(resolve(dirname(path), match[1]));
   }
 }
 await checkDirectory(extension);
