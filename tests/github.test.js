@@ -41,6 +41,28 @@ test('read-only probe uses private fixed API origin and excludes credentials fro
   mock.done();
 });
 
+test('default browser fetch keeps its global receiver for reads, writes and readback', async t => {
+  const mock = scripted([
+    { data: META }, { data: REF },
+    { data: META }, { data: REF }, { status: 404 },
+    { method: 'PUT', status: 201, data: { commit: { sha: COMMIT } } },
+    { method: 'GET', data: FILE },
+  ]);
+  t.mock.method(globalThis, 'fetch', function (...args) {
+    // Browser Web IDL methods reject a plain config object as their receiver.
+    // Node's native fetch and the arrow mocks above do not enforce this.
+    assert.equal(this, globalThis, 'Browser fetch requires its global receiver');
+    return mock.fetchImpl(...args);
+  });
+  const repository = await probeRepository(INPUT);
+  assert.equal(repository.headSha, SHA);
+  const result = await commitProbe(INPUT);
+  assert.equal(result.status, 'created');
+  assert.equal(result.writeVerified, true);
+  assert.equal(result.readbackVerified, true);
+  mock.done();
+});
+
 test('public repository rejected before any content or write request', async () => {
   const mock = scripted([{ data: { ...META, private: false } }]);
   await assert.rejects(commitProbe({ ...INPUT, fetchImpl: mock.fetchImpl }), { code: 'PRIVATE_REPOSITORY_REQUIRED' });

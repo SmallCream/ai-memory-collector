@@ -57,7 +57,8 @@ function client(input) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
-      const response = await config.fetchImpl(`${API_ROOT}${base}${suffix}`, {
+      // Browser fetch requires its Window/Worker receiver, not the config object.
+      const response = await config.fetchImpl.call(globalThis, `${API_ROOT}${base}${suffix}`, {
         method,
         headers: {
           Accept: 'application/vnd.github+json',
