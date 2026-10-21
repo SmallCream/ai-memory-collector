@@ -78,6 +78,89 @@ test('capture persists exact image, regenerates Markdown and enqueues archive wh
   assert.ok(!JSON.stringify(await env.fs.getSetting(`assetJobs:${account.accountKey}`)).includes('retrieval'));
 });
 
+test('failure diagnostics immediately reflect durable queue and never expose raw error URLs or tokens', async () => {
+  const env = setup(); await env.save(detail()); env.resolveFailure(true);
+  await env.tick();
+  assert.equal((await env.fs.getSetting(`assetStatus:${account.accountKey}`)).failed, 1);
+  const state = await env.fs.getSetting(`assetJobs:${account.accountKey}`);
+  state.tasks[0].error = { code: 'HTTP_403', message: 'https://example.invalid/?sig=private Bearer private github_pat_private' };
+  await env.fs.setSetting(`assetJobs:${account.accountKey}`, state);
+  const diagnostics = await env.service.diagnostics({ directory: env.fs.directory, account });
+  assert.equal(diagnostics.total, 1); assert.equal(diagnostics.pending, 1); assert.equal(diagnostics.failed, 1);
+  assert.equal(diagnostics.failures[0].code, 'HTTP_403'); assert.equal(diagnostics.failures[0].attempt, 1);
+  assert.equal(diagnostics.failures[0].conversationTitle, 'Synthetic image conversation');
+  assert.ok(!JSON.stringify(diagnostics).includes('private'));
+  assert.equal((await env.service.diagnostics({ account })).failed, 1);
+});
+
+test('manual retry bypasses backoff once per failed task while paused and leaves fresh tasks alone', async () => {
+  const env = setup(); await env.save(detail()); env.resolveFailure(true); await env.tick();
+  const other = detail([{ content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_other' }]);
+  other.payload.conversation_id = 'conversation-two'; await env.save(other);
+  await env.service.retryFailed({ account });
+  const retry = () => env.service.tick({ directory: env.fs.directory, account, tabId: 7, manualOnly: true });
+  assert.equal((await retry()).runnable, false);
+  assert.equal(env.captures.length, 2); assert.equal((await retry()).runnable, false);
+  env.time(1_000_000); await retry(); assert.equal(env.captures.length, 2);
+  assert.equal((await env.service.diagnostics({ account })).failed, 1);
+  env.resolveFailure(false); await env.service.retryFailed({ account }); await retry();
+  assert.equal(env.captures.length, 3); assert.equal((await env.service.diagnostics({ account })).failed, 0);
+  assert.equal((await env.service.diagnostics({ account })).pending, 1);
+});
+
+test('retry refreshes live attachment link after worker restart without replacing archived native conversation', async () => {
+  const env = setup(), saved = await env.save(detail()), original = env.fs.text(saved.entry.jsonPath);
+  env.resolveFailure(true); await env.tick(); env.resolveFailure(false);
+  const refreshes = [], live = detail([{ content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_image',
+    asset_pointer_link: 'https://files.oaiusercontent.com/image.png?sig=synthetic-fresh-secret' }]);
+  live.payload.title = 'New online title';
+  env.dependencies.refreshConversation = async request => { refreshes.push(request); return live; };
+  env.restart(); await env.service.retryFailed({ account });
+  await env.service.tick({ directory: env.fs.directory, account, tabId: 7, manualOnly: true });
+  assert.deepEqual(refreshes, [{ tabId: 7, accountKey: account.accountKey, conversationId: 'conversation-one' }]);
+  assert.equal(env.captures[1].asset.retrieval.url, live.payload.mapping.reply.message.content.parts[0].asset_pointer_link);
+  assert.equal(env.fs.text(saved.entry.jsonPath), original);
+  assert.ok(!JSON.stringify(await env.manifest()).includes('synthetic-fresh-secret'));
+  assert.equal((await env.service.diagnostics({ account })).pending, 0);
+});
+
+test('refreshed image details reject wrong account, wrong conversation, incomplete source and missing asset', async () => {
+  for (const kind of ['account', 'conversation', 'incomplete', 'missing']) {
+    const env = setup(), saved = await env.save(detail()), original = env.fs.text(saved.entry.jsonPath);
+    env.resolveFailure(true); await env.tick(); env.resolveFailure(false);
+    const live = detail(kind === 'missing' ? ['image no longer in source'] : undefined);
+    if (kind === 'account') live.identity.accountKey = 'acct-ffffffffffffffffffffffff';
+    if (kind === 'conversation') live.payload.conversation_id = 'other';
+    if (kind === 'incomplete') live.completeness = 'partial';
+    env.dependencies.refreshConversation = async () => live;
+    env.restart(); await env.service.retryFailed({ account }); await env.tick();
+    assert.equal(env.captures.length, 1); assert.equal(env.fs.text(saved.entry.jsonPath), original);
+    const diagnostic = await env.service.diagnostics({ account });
+    assert.equal(diagnostic.failed, 1);
+    assert.equal(diagnostic.failures[0].code, kind === 'account' ? 'ACCOUNT_CHANGED' : kind === 'missing' ? 'ASSET_SOURCE_MISSING' : 'INCOMPLETE_DETAIL');
+  }
+});
+
+test('source refresh updates Library location while retaining original byte identity constraints', async () => {
+  const env = setup(), initial = detail([{ content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_image',
+    library_file_id: 'libfile_old', width: 1, height: 1, size_bytes: PNG.length }]);
+  await env.save(initial); env.resolveFailure(true); await env.tick(); env.resolveFailure(false);
+  const live = detail([{ content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_image',
+    library_file_id: 'libfile_new', width: 2, height: 2, size_bytes: PNG.length + 1 }]);
+  env.dependencies.refreshConversation = async () => live;
+  env.restart(); await env.service.retryFailed({ account }); await env.tick();
+  const captured = env.captures[1].asset;
+  assert.equal(captured.libraryFileId, 'libfile_new'); assert.equal(captured.retrieval.libraryFileId, 'libfile_new');
+  assert.equal(captured.width, 1); assert.equal(captured.height, 1); assert.equal(captured.expectedSize, PNG.length);
+});
+
+test('manual retry keeps pending outbox receipt without fetching or downloading original again', async () => {
+  const env = setup(); await env.save(detail()); env.enqueueFailure(true); await env.tick();
+  let refreshed = 0; env.dependencies.refreshConversation = async () => { refreshed++; throw new Error('must not fetch'); };
+  env.restart(); env.enqueueFailure(false); await env.service.retryFailed({ account }); await env.tick();
+  assert.equal(refreshed, 0); assert.equal(env.captures.length, 1); assert.equal(env.enqueued.length, 1);
+});
+
 test('restart after enqueue failure delivers saved image without recapture even if another source scan occurs', async () => {
   const env = setup(); await env.save(detail()); env.enqueueFailure(true);
   assert.equal((await env.tick()).pending, 1); assert.equal(env.captures.length, 1);

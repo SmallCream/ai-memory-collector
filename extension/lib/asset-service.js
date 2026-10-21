@@ -16,10 +16,37 @@ const nativeId = native => native.conversation_id ?? native.id;
 const isImage = asset => asset.kind === 'image' || /^image\//i.test(asset.mimeType || '') || /\.(png|jpe?g|gif|webp|avif)$/i.test(asset.fileName || '');
 
 export function createAssetService({ getSetting, setSetting, readAccountManifest, saveConversation,
-  resolveAsset, enqueueArchive, browser = globalThis.chrome, fetchImpl = globalThis.fetch, downloadRepositoryFile,
+  resolveAsset, refreshConversation, enqueueArchive, browser = globalThis.chrome, fetchImpl = globalThis.fetch, downloadRepositoryFile,
   lfsFactory = createLfsClient, now = Date.now }) {
   const ephemeral = new Map();
   async function jobs(account) { return await getSetting(key(account)) || { tasks: [] }; }
+  const label = value => String(value || '').replace(/(?:https?:\/\/|blob:|data:)[^\s<>"']+/gi, '[链接已隐藏]')
+    .replace(/(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]+/g, '[已隐藏]').replace(/Bearer\s+[^\s,;]+/gi, '[已隐藏]')
+    .replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, '').slice(0, 200);
+  async function diagnostics({ directory, account }) {
+    const state = await jobs(account);
+    let manifest;
+    if (directory) { try { manifest = await readAccountManifest(directory, account); } catch { /* queue remains readable without directory access */ } }
+    const failures = state.tasks.filter(task => task.error);
+    return { total: state.tasks.length, pending: state.tasks.length, failed: failures.length,
+      failures: failures.slice(0, 200).map(task => {
+        const entry = manifest?.conversations?.[task.conversationId], asset = entry?.assets?.find(a => a.id === task.assetId);
+        return { conversationId: label(task.conversationId), assetId: label(task.assetId),
+          conversationTitle: label(entry?.title), fileName: label(asset?.fileName),
+          code: safeError(task.error).code, message: '图片处理未完成，请根据错误代码检查后重试。',
+          attempt: Number.isSafeInteger(task.attempt) && task.attempt >= 0 ? task.attempt : 0,
+          retryAt: Number.isFinite(task.retryAt) ? task.retryAt : 0 };
+      }) };
+  }
+  async function retryFailed({ account }) {
+    const state = await jobs(account);
+    for (const task of state.tasks) if (task.error) {
+      // Keep the last failure visible until the retry actually succeeds. A
+      // manual request permits one attempt per failed task while scans are paused.
+      task.retryAt = 0; task.manualRetry = true; task.refreshSource = true;
+    }
+    await setSetting(key(account), state);
+  }
   async function status(account, manifest) {
     const unique = new Map();
     for (const entry of Object.values(manifest?.conversations || {})) for (const asset of entry.assets || []) if (isImage(asset)) unique.set(asset.id, asset);
@@ -92,22 +119,38 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
     await writeLocalAsset({ ...request, asset: managed, bytes, getSetting, setSetting });
     return managed;
   }
-  async function tick({ directory, account, tabId }) {
-    const state = await jobs(account), task = state.tasks.find(t => (t.retryAt || 0) <= now());
+  async function tick({ directory, account, tabId, manualOnly = false }) {
+    const runnable = task => (!manualOnly || task.manualRetry === true) && (task.retryAt || 0) <= now();
+    const state = await jobs(account), task = state.tasks.find(runnable);
     if (!task) return { pending: state.tasks.length, runnable: false };
     let finalManifest;
     try {
       const manifest = await readAccountManifest(directory, account), entry = manifest?.conversations?.[task.conversationId];
+      finalManifest = manifest;
       const asset = entry?.assets?.find(a => a.id === task.assetId);
       if (!task.pendingArchives?.length && asset) {
         const nativeBytes = await readLocalBytes(directory, entry.jsonPath, 24 * 1024 * 1024);
         if (!nativeBytes || await hashBytes(nativeBytes) !== entry.contentHash) throw collectorError('LOCAL_CONFLICT', '对话原始文件已变化，图片任务暂停以保护原文件。');
         const native = JSON.parse(text(nativeBytes));
-        const fresh = (await extractAssets(native)).find(a => a.id === asset.id);
-        const retrieval = ephemeral.get(`${account.accountKey}:${task.conversationId}:${asset.id}`) || fresh?.retrieval;
+        let fresh = (await extractAssets(native)).find(a => a.id === asset.id);
+        let retrieval = ephemeral.get(`${account.accountKey}:${task.conversationId}:${asset.id}`) || fresh?.retrieval;
+        if (!ready(asset) && asset.status !== 'external' && refreshConversation && (task.refreshSource || task.error)) {
+          const detail = await refreshConversation({ tabId, accountKey: account.accountKey, conversationId: task.conversationId });
+          if (detail?.identity?.accountKey !== account.accountKey) throw collectorError('ACCOUNT_CHANGED', '图片详情所属账号不匹配。');
+          if (nativeId(detail?.payload || {}) !== task.conversationId || detail.completeness !== 'complete') {
+            throw collectorError('INCOMPLETE_DETAIL', '图片来源详情未完整确认，原归档保持不变。');
+          }
+          const online = (await extractAssets(detail.payload)).find(a => a.id === asset.id);
+          if (!online) throw collectorError('ASSET_SOURCE_MISSING', '最新详情中未找到这张图片，保留已有记录等待检查。');
+          fresh = online; retrieval = online.retrieval;
+          if (retrieval) ephemeral.set(`${account.accountKey}:${task.conversationId}:${asset.id}`, retrieval);
+        }
         // Re-enqueue a saved derivative if the worker stopped after filesystem
         // commit but before its outbox checkpoint. Capturing the bytes again is unnecessary.
-        const completed = ready(asset) || asset.status === 'external' ? asset : await capture({ ...asset, retrieval }, { directory, account, tabId });
+        // A newly resolved Library ID is a location hint. Keep original byte
+        // size/dimension/hash constraints and message anchors from the archive.
+        const completed = ready(asset) || asset.status === 'external' ? asset : await capture({ ...fresh, ...asset,
+          ...(fresh?.libraryFileId ? { libraryFileId: fresh.libraryFileId } : {}), retrieval }, { directory, account, tabId });
         const updated = entry.assets.map(a => a.id === asset.id ? completed : a);
         const saved = await saveConversation({ directory, account, assets: sanitizeAssetRecords(updated), detail: {
           payload: native, identity: { accountKey: account.accountKey, displayName: account.displayName },
@@ -132,9 +175,14 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
       task.attempt++; task.error = safeError(error);
       task.retryAt = now() + Math.min(60, 2 ** Math.min(task.attempt, 6)) * 60000;
     }
+    delete task.manualRetry; delete task.refreshSource;
     await setSetting(key(account), state);
     if (finalManifest) await status(account, finalManifest);
-    return { pending: state.tasks.length, runnable: state.tasks.some(t => (t.retryAt || 0) <= now()) };
+    else {
+      const previous = await getSetting(`assetStatus:${account.accountKey}`) || {};
+      await setSetting(`assetStatus:${account.accountKey}`, { ...previous, failed: state.tasks.filter(t => t.error).length });
+    }
+    return { pending: state.tasks.length, runnable: state.tasks.some(runnable) };
   }
   async function prepareUploads({ directory, account, config, bundles }) {
     const records = new Map();
@@ -244,5 +292,5 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
     if (unresolved.length) throw collectorError(unresolved[0].error.code, unresolved[0].error.message);
     return { downloaded, pending: remaining, failed: 0 };
   }
-  return { save, tick, prepareUploads, acknowledgeUploads, hydrateAssets };
+  return { save, tick, diagnostics, retryFailed, prepareUploads, acknowledgeUploads, hydrateAssets };
 }

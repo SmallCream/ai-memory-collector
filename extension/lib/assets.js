@@ -5,7 +5,22 @@ const SECRET_QUERY = /(?:token|signature|credential|authorization|api[_-]?key|^a
 const SOURCE_TYPES = new Set(['external', 'platform', 'temporary', 'embedded', 'unknown']);
 const READY = new Set(['downloaded', 'ready', 'local', 'synced']);
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/;
+const REFERENCE_FIELDS = ['asset_pointer', 'asset_pointer_link', 'image_url', 'url', 'download_url', 'src'];
 const cleanName = value => typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 240) : undefined;
+
+// Prefer a downloadable URL over a native pointer regardless of traversal order.
+// Preserve the first URL at equal priority: extraction cannot tell which of two
+// signed URLs is still valid, and resolution still validates the chosen host.
+function retrievalPriority(value) {
+  try {
+    const url = new URL(value);
+    if (url.username || url.password) return 0;
+    if (url.protocol === 'https:') return 3;
+    if (url.protocol === 'blob:') return 2;
+    if (url.protocol === 'http:') return 1;
+  } catch { /* opaque native pointer */ }
+  return 0;
+}
 export async function sha256(value) {
   const bytes = typeof value === 'string' ? new TextEncoder().encode(value) : value;
   return [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(byte => byte.toString(16).padStart(2, '0')).join('');
@@ -70,20 +85,21 @@ export async function extractAssets(conversation) {
     const type = String(value.content_type ?? value.type ?? '');
     if (type === 'code') return;
     const media = /image|audio|video|file|attachment/i.test(type) || info.attachment;
-    const fileId = value.file_id ?? value.fileId ?? (info.attachment ? value.id : undefined);
+    const pointerFileId = typeof value.asset_pointer === 'string' ? classifyAssetReference(value.asset_pointer).fileId : undefined;
+    const fileId = value.file_id ?? value.fileId ?? (info.attachment ? value.id : undefined) ?? pointerFileId;
     const libraryFileId = value.library_file_id ?? value.libraryFileId;
     const mimeType = value.mime_type ?? value.mimeType ?? value.content_mime_type;
     const common = { ...info, fileId, libraryFileId, mimeType,
       fileName: value.name ?? value.file_name ?? value.filename, kind: kindFor(mimeType || type, info.kind),
       width: value.width, height: value.height, expectedSize: value.size_bytes ?? value.size ?? value.file_size, quality: value.quality };
     let found = false;
-    for (const key of ['asset_pointer', 'image_url', 'url', 'download_url', 'src']) {
+    for (const key of REFERENCE_FIELDS) {
       const ref = typeof value[key] === 'string' ? value[key] : value[key]?.url;
-      if (ref && (media || key === 'asset_pointer' || key === 'image_url')) { add(ref, { ...common, path: `${info.path}/${key}` }); found = true; }
+      if (ref && (media || key === 'asset_pointer' || key === 'asset_pointer_link' || key === 'image_url')) { add(ref, { ...common, path: `${info.path}/${key}` }); found = true; }
     }
     if (!found && (fileId || libraryFileId)) add(libraryFileId ? `library:${libraryFileId}` : `file-service://${fileId}`, common);
     for (const [key, child] of Object.entries(value)) {
-      if (['asset_pointer', 'image_url', 'url', 'download_url', 'src', 'file_id', 'fileId', 'library_file_id', 'libraryFileId'].includes(key)) continue;
+      if (REFERENCE_FIELDS.includes(key) || ['file_id', 'fileId', 'library_file_id', 'libraryFileId'].includes(key)) continue;
       if (key === 'file_ids' && Array.isArray(child)) {
         for (const id of child) if (typeof id === 'string') add(`file-service://${id}`, { ...info, fileId: id, kind: 'attachment', path: `${info.path}/${key}` });
         continue;
@@ -128,7 +144,7 @@ export async function extractAssets(conversation) {
     const retrieval = asset.retrieval;
     if (classified.fileId) retrieval.fileId = classified.fileId;
     if (classified.libraryFileId) retrieval.libraryFileId = classified.libraryFileId;
-    if (/^https?:\/\//i.test(classified.original) && !/^https?:\/\//i.test(retrieval.url)) {
+    if (retrievalPriority(classified.original) > retrievalPriority(retrieval.url)) {
       retrieval.url = classified.original;
     }
     if (!asset.references.includes(classified.sourceRef)) asset.references.push(classified.sourceRef);

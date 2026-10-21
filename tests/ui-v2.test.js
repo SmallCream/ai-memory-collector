@@ -25,7 +25,7 @@ const initialState = () => ({
   config: { setupComplete: true, autoEnabled: true, intervalMinutes: 30, github: { enabled: false, repository: 'example/archive', branch: '', hasToken: false } },
   identity: { accountKey: 'acct-demo', displayName: 'Demo User', platform: 'chatgpt' },
   account: { accountKey: 'acct-demo', alias: 'Demo', initialized: true, enabled: true },
-  directory: { name: 'archive', granted: true }, job: null, githubStatus: null,
+  directory: { name: 'archive', granted: true }, job: null, githubStatus: null, tabId: 11,
 });
 async function setup(options = {}) {
   let state = structuredClone(options.state || initialState());
@@ -293,5 +293,104 @@ test('asset summary distinguishes pending images from successful uploads', async
   const state = initialState(); state.assetStatus = { local: 5, uploaded: 3, pendingUpload: 2, pendingCapture: 1, failed: 1 };
   const app = await setup({ state });
   assert.equal(app.elements.get('asset-summary').hidden, false);
-  assert.match(app.elements.get('asset-summary-text').textContent, /本地图片 5.*已上传 3.*待采集 1.*待上传 2.*失败 1/);
+  assert.match(app.elements.get('asset-summary-text').textContent, /本地图片 5.*已上传 3.*待采集 1（其中失败 1）.*待上传 2/);
+});
+
+test('image failures are a subset of pending tasks and use queue diagnostics over stale counts', async () => {
+  const state = initialState(); state.assetStatus = { pendingCapture: 1, failed: 0 };
+  state.assetDiagnostics = { total: 30, pending: 30, failed: 30, failures: [
+    { conversationId: 'chat-a', assetId: 'image-a', conversationTitle: '旅行计划', fileName: '地图.png', code: 'ASSET_PENDING', attempt: 2, retryAt: 0 },
+  ] };
+  const app = await setup({ state });
+  assert.equal(app.elements.get('asset-summary-text').textContent, '待处理 30（其中失败 30）');
+  assert.equal(app.elements.get('asset-failures').hidden, false);
+  assert.equal(app.elements.get('asset-failures-heading').textContent, '查看失败原因（30）');
+  const item = app.elements.get('asset-failure-list').children[0];
+  assert.equal(item.children[0].textContent, '旅行计划');
+  assert.equal(item.children[1].textContent, '地图.png');
+  assert.match(item.children[2].textContent, /尚未取得可确认归属的原图/);
+  assert.equal(item.children[3].textContent, 'ASSET_PENDING · 已尝试 2 次');
+});
+
+test('image diagnostics do not render raw server messages, signed URLs, credentials, or HTML', async () => {
+  const state = initialState();
+  state.assetDiagnostics = { total: 1, pending: 1, failed: 1, failures: [
+    { conversationTitle: '<img onerror=alert(1)>', fileName: 'https://example.com/image?token=sensitive ghp_privateToken',
+      code: 'UNKNOWN_ERROR', message: 'Bearer private-bearer https://example.com/image?sig=private-sig', attempt: 1 },
+  ] };
+  const app = await setup({ state });
+  const parts = app.elements.get('asset-failure-list').children[0].children.map(child => child.textContent);
+  assert.equal(parts[0], '<img onerror=alert(1)>');
+  assert.equal(parts[1], '[链接已隐藏] [已隐藏]');
+  assert.match(parts[2], /根据错误代码继续排查/);
+  assert(!parts.join(' ').match(/private|sensitive|https:\/\//));
+});
+
+test('image retry works while conversation scan is paused without sending a capture or resume command', async () => {
+  const state = initialState(); state.job = { status: 'paused' };
+  state.assetDiagnostics = { total: 1, pending: 1, failed: 1, failures: [] };
+  const app = await setup({ state, url: 'chrome-extension://test/panel.html?tab=22' });
+  assert.equal(app.elements.get('retry-images').hidden, false);
+  assert.equal(app.elements.get('retry-images').disabled, false);
+  await app.click('retry-images');
+  assert.deepEqual(app.messages.filter(message => message.type === 'collector:retry-images'), [{ type: 'collector:retry-images', tabId: 22 }]);
+  assert(!app.messages.some(message => ['collector:start', 'collector:resume'].includes(message.type)));
+  assert.equal(app.permissionRequests.length, 0);
+  assert.match(html, /逐张重试失败图片，不会重新扫描对话列表。对话采集暂停时，每项只尝试一次。/);
+});
+
+test('image retry cannot run without a matching enabled account, writable directory and source tab', async () => {
+  const variations = [
+    state => { state.account.enabled = false; },
+    state => { state.account = null; },
+    state => { state.identity = null; },
+    state => { state.identity.accountKey = 'another-account'; },
+    state => { state.directory.granted = false; },
+    state => { state.tabId = null; },
+  ];
+  for (const change of variations) {
+    const state = initialState(); state.assetDiagnostics = { total: 1, pending: 1, failed: 1, failures: [] }; change(state);
+    const app = await setup({ state });
+    assert.equal(app.elements.get('retry-images').disabled, true);
+    await app.click('retry-images');
+    assert(!app.messages.some(message => message.type === 'collector:retry-images'));
+  }
+});
+
+test('image diagnostic details and retry action disappear after failures clear', async () => {
+  const state = initialState();
+  state.assetDiagnostics = { total: 1, pending: 1, failed: 1, failures: [{ code: 'HTTP_404', attempt: 1 }] };
+  const app = await setup({ state });
+  state.assetDiagnostics = { total: 0, pending: 0, failed: 0, failures: [] };
+  app.setState(state); app.poll(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.elements.get('asset-failures').hidden, true);
+  assert.equal(app.elements.get('asset-failure-list').children.length, 0);
+  assert.equal(app.elements.get('asset-failures-limit').hidden, true);
+  assert.equal(app.elements.get('retry-images').hidden, true);
+  assert.equal(app.elements.get('image-retry-note').hidden, true);
+});
+
+test('source refresh failures explain missing images and incomplete details safely', async () => {
+  const state = initialState();
+  state.assetDiagnostics = { total: 2, pending: 2, failed: 2, failures: [
+    { code: 'ASSET_SOURCE_MISSING', message: 'https://example.com/?token=private', attempt: 1 },
+    { code: 'INCOMPLETE_DETAIL', message: 'Bearer private-token', attempt: 1 },
+  ] };
+  const app = await setup({ state });
+  const items = app.elements.get('asset-failure-list').children;
+  assert.match(items[0].children[2].textContent, /最新对话中未找到这张图片/);
+  assert.match(items[1].children[2].textContent, /对话详情不完整，未覆盖已保存数据/);
+  assert(!items.map(item => item.children[2].textContent).join('').includes('private'));
+  assert.equal(app.elements.get('asset-failures-limit').hidden, true);
+});
+
+test('capped image diagnostics show that only the first 200 failures are listed', async () => {
+  const state = initialState();
+  state.assetDiagnostics = { total: 250, pending: 250, failed: 250,
+    failures: Array.from({ length: 200 }, () => ({ code: 'ASSET_PENDING', attempt: 1 })) };
+  const app = await setup({ state });
+  assert.equal(app.elements.get('asset-failure-list').children.length, 200);
+  assert.equal(app.elements.get('asset-failures-limit').hidden, false);
+  assert.equal(app.elements.get('asset-failures-limit').textContent, '仅显示前 200 条失败记录，其余任务仍会保留。');
+  assert.equal(app.elements.get('asset-summary-text').textContent, '待处理 250（其中失败 250）');
 });

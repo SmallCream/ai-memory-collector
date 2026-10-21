@@ -65,14 +65,16 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
     if (await browser.permissions.contains({ origins: [ORIGIN] })) {
       try { current = await context(tabId); } catch (e) { error = safeError(e); }
     } else error = { code: 'SITE_PERMISSION_REQUIRED', message: '请先授权访问 ChatGPT，之后会自动识别当前账号。' };
-    const account = current?.account || null;
-    return { config: publicConfig(config), directory: await directoryState(),
+    const account = current?.account || null, directory = await directoryState();
+    return { config: publicConfig(config), directory,
       identity: current?.identity || null, account,
       job: account ? await engine.getState(account.accountKey) : null,
       lastResult: account?.lastResult || null,
       nextRunAt: config.autoEnabled && account?.enabled ? account.nextRunAt || now() : null,
       githubStatus: account ? await getSetting(`githubStatus:${account.accountKey}`) || { status: 'idle' } : { status: 'idle' },
       assetStatus: account ? await getSetting(`assetStatus:${account.accountKey}`) || null : null,
+      assetDiagnostics: account && assetService?.diagnostics ? await assetService.diagnostics({ account,
+        directory: directory.granted ? await getSetting('directory') : null }) : null,
       restoreStatus: restoreService ? await restoreService.state() : null,
       legacyPending: Boolean(await getSetting('pendingArchive')), error, tabId: current?.tab.id ?? null };
   }
@@ -278,8 +280,9 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
       await engine.start({ account, tabId: tab.id, mode: account.initialized ? 'incremental' : 'initial' });
       continueSoon();
     }
-    if (assetService && (await directoryState()).granted && job?.status !== 'paused') {
-      const work = await assetService.tick({ directory: await getSetting('directory'), account, tabId: tab.id });
+    if (assetService && (await directoryState()).granted) {
+      const work = await assetService.tick({ directory: await getSetting('directory'), account, tabId: tab.id,
+        manualOnly: job?.status === 'paused' });
       if (work.runnable) continueSoon();
     }
     if (job?.status !== 'running') await synchronize(account);
@@ -365,6 +368,14 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
         continueSoon(); break;
       }
       case 'collector:permissions-changed': await registerContent(); break;
+      case 'collector:retry-images': {
+        if (!assetService?.retryFailed) throw collectorError('ASSET_UNAVAILABLE', '当前版本不支持图片补采。');
+        if (!await browser.permissions.contains({ origins: [ORIGIN] })) throw collectorError('SITE_PERMISSION_REQUIRED', '请先恢复 ChatGPT 站点访问权限。');
+        const { account } = await context(tabId, true);
+        if (!account?.enabled) throw collectorError('ACCOUNT_DISABLED', '请先启用当前账号。');
+        if (!(await directoryState()).granted) throw collectorError('DIRECTORY_PERMISSION', '请在设置中恢复保存目录权限。');
+        await assetService.retryFailed({ account }); continueSoon(); break;
+      }
       case 'collector:start': {
         const { account, tab, config } = await context(tabId, true);
         if (!account?.enabled || !config.setupComplete) throw collectorError('SETUP_INCOMPLETE', '请先完成配置并启用此账号。');

@@ -12,8 +12,10 @@ import { createRestoreService } from './lib/restore-service.js';
 import { fetchRepositorySnapshot, downloadRepositoryFile } from './lib/github-restore.js';
 
 const resolver = createChatGPTAssetResolver(chrome, { allowLibraryDownload: true });
+const adapter = getAdapter('chatgpt');
 const assets = createAssetService({ getSetting, setSetting, readAccountManifest, saveConversation,
   resolveAsset: resolver.resolve, downloadRepositoryFile,
+  refreshConversation: ({ tabId, ...request }) => adapter.detail(tabId, request),
   enqueueArchive: input => service.engine.enqueueArchive(input) });
 const restore = createRestoreService({ getSetting, setSetting, fetchRepositorySnapshot, downloadRepositoryFile,
   applyRemoteFiles, readLocalManifest: readAccountManifest, hydrateAssets: assets.hydrateAssets,
@@ -21,7 +23,7 @@ const restore = createRestoreService({ getSetting, setSetting, fetchRepositorySn
   // Queue them without creating a binding; only enabled configured accounts upload.
   enqueueRecovered: ({ account, archive }) => service.engine.enqueueArchive({ account: { ...account, enabled: true }, archive }) });
 const service = createCollectorService({ browser: chrome, getSetting, setSetting,
-  adapter: getAdapter('chatgpt'), createEngine: createCollectorEngine,
+  adapter, createEngine: createCollectorEngine,
   readAccountManifest, saveConversation: assets.save, applyRemoteFiles, syncArchives, probeRepository,
   assetService: assets, restoreService: restore });
 const extensionURL = new URL(chrome.runtime.getURL('/'));

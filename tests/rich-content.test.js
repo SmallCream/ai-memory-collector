@@ -126,6 +126,75 @@ test('native image pointer and metadata attachment merge filename and library id
   assert.equal(Object.keys(asset).includes('retrieval'), false);
 });
 
+test('native asset_pointer_link enriches the pointer asset without persisting its signed URL', async () => {
+  const link = 'https://files.oaiusercontent.com/synthetic-image.png?sig=synthetic-private-signature';
+  const source = conversation({ content_type: 'multimodal_text', parts: [
+    { content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_synthetic_image', asset_pointer_link: link },
+  ] });
+  const snapshot = structuredClone(source);
+  const [asset, ...others] = await extractAssets(source);
+  assert.equal(others.length, 0);
+  assert.equal(asset.fileId, 'file_synthetic_image');
+  assert.equal(asset.sourceRef, 'sediment://file_synthetic_image');
+  assert.equal(asset.retrieval.url, link);
+  assert.equal(asset.occurrences.length, 2);
+  assert.equal(Object.keys(asset).includes('retrieval'), false);
+  assert.doesNotMatch(JSON.stringify(asset), /synthetic-private-signature/);
+  assert.doesNotMatch(JSON.stringify(sanitizeAssetRecords([asset])), /synthetic-private-signature/);
+  const archive = await build(source, [asset]);
+  assert.doesNotMatch(JSON.stringify(archive.manifest), /synthetic-private-signature/);
+  const archivedNative = structuredClone(snapshot);
+  archivedNative.messages[0].content.parts[0].asset_pointer_link = link.split('?')[0];
+  assert.deepEqual(JSON.parse(archive.files[0].content), archivedNative);
+  assert.deepEqual(source, snapshot);
+});
+
+test('attachment links and native pointers merge in either traversal order', async () => {
+  const link = 'https://files.oaiusercontent.com/synthetic.png?token=synthetic-only-secret';
+  const content = { content_type: 'multimodal_text', parts: [
+    { content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_synthetic_attachment' },
+  ] };
+  const metadata = { attachments: [{ id: 'file_synthetic_attachment', asset_pointer_link: { url: link },
+    library_file_id: 'libfile_synthetic_attachment', mime_type: 'image/png', name: 'synthetic.png' }] };
+  for (const fields of [{ content, metadata }, { metadata, content }]) {
+    const source = { id: 'demo', messages: [{ id: 'user-msg', role: 'user', ...fields }] };
+    const assets = await extractAssets(source);
+    assert.equal(assets.length, 1);
+    assert.equal(assets[0].retrieval.url, link);
+    assert.equal(assets[0].retrieval.fileId, 'file_synthetic_attachment');
+    assert.equal(assets[0].retrieval.libraryFileId, 'libfile_synthetic_attachment');
+    assert.equal(assets[0].kind, 'image');
+    assert.doesNotMatch(JSON.stringify(sanitizeAssetRecords(assets)), /synthetic-only-secret/);
+  }
+});
+
+test('deduplicated image retrieval prefers HTTPS over HTTP, blob and opaque pointers', async () => {
+  const usable = 'https://files.oaiusercontent.com/synthetic.png?sig=synthetic-secret';
+  const alternatives = ['sediment://file_synthetic_precedence', 'http://files.oaiusercontent.com/synthetic.png',
+    'blob:https://chatgpt.com/00000000-0000-0000-0000-000000000000'];
+  for (const alternate of alternatives) {
+    for (const urls of [[alternate, usable], [usable, alternate]]) {
+      const source = conversation({ content_type: 'multimodal_text', parts: urls.map(url => ({
+        content_type: 'image', file_id: 'file_synthetic_precedence', url,
+      })) });
+      const assets = await extractAssets(source);
+      assert.equal(assets.length, 1);
+      assert.equal(assets[0].retrieval.url, usable);
+      assert.doesNotMatch(JSON.stringify(assets), /synthetic-secret/);
+    }
+  }
+});
+
+test('null attachment links still retain the native pointer and library identity', async () => {
+  const source = conversation({ content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_synthetic_null' });
+  source.messages[0].metadata = { attachments: [{ id: 'file_synthetic_null', asset_pointer_link: null,
+    library_file_id: 'libfile_synthetic_null', mime_type: 'image/png' }] };
+  const assets = await extractAssets(source);
+  assert.equal(assets.length, 1);
+  assert.equal(assets[0].retrieval.url, 'sediment://file_synthetic_null');
+  assert.equal(assets[0].retrieval.libraryFileId, 'libfile_synthetic_null');
+});
+
 test('signed URLs are temporary and never appear in synchronized asset metadata', async () => {
   const secret = 'private-credential-value';
   const source = conversation(`<img src="https://files.example.test/picture.png?width=200&amp;sig=${secret}&amp;se=tomorrow">`);

@@ -130,6 +130,42 @@ test('pending LFS work retains text outbox and only commits after upload prepara
   assert.equal(acknowledged, 1); assert.equal((await f.service.engine.getOutbox(accountKey)).length, 0);
 });
 
+test('image-only retry remains account scoped and works while conversation collection stays paused', async () => {
+  const f = fixture({ config: { autoEnabled: false } }), retries = [], ticks = [];
+  const diagnostics = { total: 1, pending: 1, failed: 1, failures: [{ code: 'HTTP_404' }] };
+  f.dependencies.assetService = {
+    diagnostics: async ({ account: current }) => { assert.equal(current.accountKey, accountKey); return diagnostics; },
+    retryFailed: async ({ account: current }) => retries.push(current.accountKey),
+    tick: async request => { ticks.push(request); return { runnable: false }; },
+  };
+  f.service = createCollectorService(f.dependencies);
+  await f.service.command({ type: 'collector:start', mode: 'full' }, 1);
+  await f.service.command({ type: 'collector:pause' }, 1);
+  const result = await f.service.command({ type: 'collector:retry-images' }, 1);
+  assert.deepEqual(result.state.assetDiagnostics, diagnostics);
+  await f.service.pump();
+  assert.deepEqual(retries, [accountKey]); assert.equal(ticks.length, 1); assert.equal(ticks[0].manualOnly, true);
+  assert.equal(ticks[0].account.accountKey, accountKey); assert.equal(ticks[0].tabId, 1);
+  assert.equal((await f.service.engine.getState(accountKey)).status, 'paused');
+  assert.equal(f.calls.lists, 0); assert.equal(f.calls.details, 0);
+});
+
+test('image retry rejects unavailable permissions, disabled account and newly switched unbound account', async () => {
+  for (const kind of ['site', 'directory', 'disabled', 'switched']) {
+    const f = fixture(); let retried = false;
+    f.dependencies.assetService = { retryFailed: async () => { retried = true; } };
+    f.service = createCollectorService(f.dependencies); await f.service.state(1);
+    if (kind === 'site') f.permissions.delete(site);
+    if (kind === 'directory') f.root.granted = false;
+    if (kind === 'disabled') f.config().accounts[accountKey].enabled = false;
+    if (kind === 'switched') f.identities.set(1, { platform: 'chatgpt', accountKey: 'acct-' + 'b'.repeat(24), displayName: 'Other' });
+    await assert.rejects(f.service.command({ type: 'collector:retry-images' }, 1), {
+      code: kind === 'site' ? 'SITE_PERMISSION_REQUIRED' : kind === 'directory' ? 'DIRECTORY_PERMISSION' : 'ACCOUNT_DISABLED',
+    });
+    assert.equal(retried, false);
+  }
+});
+
 test('automatic collection requires bound enabled account, setup and scheduling; state excludes token', async () => {
   for (const config of [{ setupComplete: false }, { autoEnabled: false }, { accounts: {} }, { accounts: { [accountKey]: { ...account, enabled: false } } }]) {
     const f = fixture({ config }); await f.service.pump();

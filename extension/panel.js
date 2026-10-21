@@ -47,6 +47,57 @@ function time(value) {
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 function count(value) { return Number.isFinite(Number(value)) && Number(value) >= 0 ? String(Number(value)) : '0'; }
+function assetFailureCode(value) { return typeof value === 'string' && /^[A-Z][A-Z0-9_]{0,60}$/.test(value) ? value : 'ASSET_UNKNOWN'; }
+function assetFailureMessage(code) {
+  // Error strings can originate in network/extension APIs. Only fixed messages
+  // reach this diagnostic view; response bodies, signed URLs and tokens do not.
+  if (/^(?:HTTP_401|HTTP_403|IDENTITY)$/.test(code)) return '请确认 ChatGPT 已登录，且当前账号可以打开原图。';
+  if (code === 'HTTP_404') return '图片下载入口未找到；原图可能需要打开后补采，或等待接口适配。';
+  if (code === 'HTTP_429') return '图片请求受到限流，请稍后重试。';
+  if (/^HTTP_5\d\d$/.test(code)) return '图片服务暂时不可用，请稍后重试。';
+  if (code === 'ACCOUNT_CHANGED') return '账号已切换，已停止处理。请回到图片所属账号后重试。';
+  if (/^(?:TAB_|ORIGIN)/.test(code)) return '请打开所属账号的 ChatGPT 标签页，并确认站点访问权限。';
+  if (code === 'ASSET_PENDING') return '尚未取得可确认归属的原图。可打开对应对话和图片后重试；部分资源仍需适配。';
+  if (code === 'ASSET_SOURCE_MISSING') return '最新对话中未找到这张图片，已有文件和任务已保留。请打开对应对话检查后重试。';
+  if (code === 'INCOMPLETE_DETAIL') return '本次返回的对话详情不完整，未覆盖已保存数据。请稍后重试。';
+  if (/^(?:ASSET_URL|ASSET_REDIRECT|ASSET_PROTOCOL)$/.test(code)) return '图片下载地址或跳转尚未支持。可打开原图后重试；部分资源仍需适配。';
+  if (/^(?:ASSET_NETWORK|ASSET_TIMEOUT)$/.test(code)) return '图片下载未完成，请检查网络后重试。';
+  if (code === 'ASSET_LINK_UNKNOWN') return '外链暂时无法验证。请检查设置中的外链图片权限；原链接已保留。';
+  if (/^(?:ASSET_SIZE|ASSET_TOO_LARGE)$/.test(code)) return '图片数据为空或超过当前处理上限。';
+  if (/^(?:ASSET_FORMAT|ASSET_RESPONSE|ASSET_NOT_IMAGE|ASSET_STREAM)$/.test(code)) return '未取得受支持的完整图片，任务已保留。';
+  if (/^(?:ASSET_VARIANT|ASSET_HASH|ASSET_HASH_MISMATCH)$/.test(code)) return '图片与原始附件信息不一致，未作为原图保存。';
+  if (/^(?:LOCAL_CONFLICT|ASSET_LOCAL_CONFLICT)$/.test(code)) return '本地文件已变化，已保留原文件。请检查对应对话或图片。';
+  if (code === 'DIRECTORY_PERMISSION') return '请恢复保存目录的读写权限。';
+  if (code === 'DIRECTORY_CHANGED') return '图片写入尚未完成，请恢复原保存目录后重试。';
+  if (code === 'ASSET_WRITE') return '图片写入未完成，请检查保存目录后重试。';
+  return '本次图片处理未完成，任务已保留。可根据错误代码继续排查。';
+}
+function assetLabel(value, fallback) {
+  return safeMessage(typeof value === 'string' && value ? value : fallback)
+    .replace(/(?:https?:\/\/|blob:|data:)[^\s<>"']+/gi, '[链接已隐藏]')
+    .replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, '').slice(0, 200);
+}
+function renderAssetFailures(diagnostics) {
+  const failures = Array.isArray(diagnostics?.failures) ? diagnostics.failures : [];
+  show('asset-failures', failures.length > 0);
+  text('asset-failures-heading', `查看失败原因（${count(diagnostics?.failed)}）`);
+  show('asset-failures-limit', Number(diagnostics?.failed) > failures.length);
+  text('asset-failures-limit', `仅显示前 ${failures.length} 条失败记录，其余任务仍会保留。`);
+  const list = $('asset-failure-list');
+  list.replaceChildren();
+  for (const failure of failures) {
+    const item = document.createElement('li');
+    const title = document.createElement('strong');
+    title.textContent = assetLabel(failure.conversationTitle, '未命名对话');
+    const filename = document.createElement('p');
+    filename.textContent = assetLabel(failure.fileName, '未命名图片');
+    const code = assetFailureCode(failure.code);
+    const explanation = document.createElement('p'); explanation.textContent = assetFailureMessage(code);
+    const metadata = document.createElement('p'); metadata.classList.add('muted');
+    metadata.textContent = `${code} · 已尝试 ${count(failure.attempt)} 次${time(failure.retryAt) ? ` · 重试等待至 ${time(failure.retryAt)}` : ''}`;
+    item.append(title, filename, explanation, metadata); list.append(item);
+  }
+}
 function jobError(job) { return job?.error?.message || (typeof job?.error === 'string' ? job.error : ''); }
 function describeGithub(value, enabled) {
   if (!enabled) return '未启用';
@@ -164,15 +215,21 @@ function render() {
   show('github-detail', Boolean(githubDetail));
   $('github-detail').classList.toggle('warning-text', current.githubStatus?.status === 'conflicts');
   const assets = current.assetStatus || {};
+  const diagnostics = current.assetDiagnostics;
+  const pendingImages = Number(diagnostics?.pending ?? assets.pendingCapture) || 0;
+  const failedImages = Number(diagnostics?.failed ?? assets.failed) || 0;
   const assetParts = [];
   if (Number(assets.local) > 0) assetParts.push(`本地图片 ${count(assets.local)}`);
   if (Number(assets.uploaded) > 0) assetParts.push(`已上传 ${count(assets.uploaded)}`);
   if (Number(assets.downloaded) > 0) assetParts.push(`已恢复 ${count(assets.downloaded)}`);
   if (Number(assets.external) > 0) assetParts.push(`外链 ${count(assets.external)}`);
-  if (Number(assets.pendingCapture) > 0) assetParts.push(`待采集 ${count(assets.pendingCapture)}`);
+  if (pendingImages > 0) assetParts.push(`${diagnostics ? '待处理' : '待采集'} ${count(pendingImages)}${failedImages > 0 ? `（其中失败 ${count(failedImages)}）` : ''}`);
+  else if (failedImages > 0) assetParts.push(`待处理失败 ${count(failedImages)}`);
   if (Number(assets.pendingUpload) > 0) assetParts.push(`待上传 ${count(assets.pendingUpload)}`);
-  if (Number(assets.failed) > 0) assetParts.push(`失败 ${count(assets.failed)}`);
   text('asset-summary-text', assetParts.join(' · ')); show('asset-summary', assetParts.length > 0);
+  renderAssetFailures(diagnostics);
+  show('retry-images', failedImages > 0);
+  show('image-retry-note', failedImages > 0);
   const imagePermissionNeeded = assets.needsPermission || current.githubStatus?.needsPermission ||
     /PERMISSION/.test(assets.error?.code || current.githubStatus?.error?.code || '');
   show('grant-github-images', Boolean(config.github?.enabled && config.github?.lfsEnabled !== false && imagePermissionNeeded));
@@ -231,6 +288,8 @@ function render() {
   $('start-capture').disabled = busy || !account?.enabled || !granted;
   $('full-capture').disabled = busy || !account?.enabled || !granted;
   $('resume-capture').disabled = busy || !account?.enabled || !granted;
+  $('retry-images').disabled = busy || failedImages <= 0 || !account?.enabled || !granted || !hasIdentity ||
+    account.accountKey !== identity.accountKey || !Number.isSafeInteger(current.tabId) || current.tabId < 0;
   $('restore-github').disabled = busy || !restoreReady || restoreRunning;
   $('restore-retry').disabled = busy || !restoreReady || restoreRunning;
   $('grant-external-images').disabled = busy || externalImagePermission;
@@ -338,6 +397,7 @@ action('start-capture', () => send('collector:start', { mode: current?.account?.
 action('full-capture', () => send('collector:start', { mode: 'full' }));
 action('pause-capture', () => send('collector:pause'));
 action('resume-capture', () => send('collector:resume'));
+action('retry-images', () => send('collector:retry-images'));
 action('retry-github', async () => { await grantGithub(current?.config?.github?.lfsEnabled !== false); await send('collector:retry-github'); });
 action('grant-github-images', async () => { await grantGithub(true); await send('collector:retry-github'); });
 for (const id of ['open-restore', 'wizard-open-restore']) action(id, () => { screen = 'settings'; settingsLoaded = false; });
