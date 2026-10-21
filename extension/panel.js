@@ -190,15 +190,16 @@ action('use-current', async () => {
   $('list-status').textContent = '从所选页面地址取得对话 ID；没有验证列表接口。';
   status('已选择当前页面对话。采集时会重新核验账号和详情 ID。');
 });
-function displayPending() {
-  $('capture-summary').textContent = pending ? JSON.stringify(pending.summary, null, 2) : '尚无采集结果';
-  const summary = pending?.summary;
+function displayPending(savedSummary = null) {
+  const summary = pending?.summary || savedSummary;
+  $('capture-summary').textContent = summary ? JSON.stringify(summary, null, 2) : '尚无采集结果';
   $('capture-overview').textContent = pending ?
     `已有采集副本：${summary?.title || '未命名对话'}${Number.isInteger(summary?.displayedMessageCount) ? ` · 阅读版 ${summary.displayedMessageCount} 条消息` : ''}。保存状态见下方。` :
-    '尚无采集结果。选择一条对话后开始采集。';
+    savedSummary ? `已保存：${savedSummary.title || '未命名对话'}。可以采集下一条对话。` :
+      '尚无采集结果。选择一条对话后开始采集。';
 }
 action('capture', async () => {
-  if (pending) throw new Error('已有待保存副本。请先保存并清除暂存，或明确清除后再采集。');
+  if (pending) throw new Error(`上一条「${pending.summary?.title || '未命名对话'}」仍在暂存。请在“保存到本地文件夹”点击“保存 JSON 与 Markdown”，成功后即可采集下一条；若不需要保留，可点击“清除本机待保存副本”。`);
   const result = await runProbe({ kind: 'detail', conversationId: $('conversation').value,
     format: $('detail-format').value, expectedAccountKey: identity.accountKey });
   const archive = await buildArchive({ conversation: result.payload, identity: result.identity, capturedAt: result.capturedAt });
@@ -221,10 +222,20 @@ action('reauthorize', async () => {
   status('目录权限已恢复。');
 });
 action('save-local', async () => {
+  const savedSummary = pending.summary;
   const result = await writeArchive(directory, pending);
-  // Keep the exact bundle for safe retry; clear explicitly after inspecting the files.
   $('local-status').textContent = `已保存并读回核对：新写入 ${result.written} 个，已有相同内容 ${result.unchanged} 个。`;
-  status('本地文件组已保存。请查看目录中的 JSON 与 Markdown；暂存副本可手动清除。');
+  // Only release the slot after file verification and the storage transaction
+  // both succeed. A cleanup failure must not hide the successful file save.
+  try { await setSetting('pendingArchive', null); }
+  catch {
+    status('本地文件已保存并核对，但暂存清理失败。请再次点击“保存 JSON 与 Markdown”重试，相同文件不会重复写入；暂存副本仍保留。', true);
+    return;
+  }
+  pending = null;
+  displayPending(savedSummary);
+  showFeedback($('capture-feedback'), '上一条已保存，暂存已自动清理，可以采集下一条对话。');
+  status('本地文件已保存并核对，暂存已自动清理。可以采集下一条对话，无需手动清除。');
 });
 action('discard', async () => {
   if (!window.confirm('清除扩展内的待保存副本？尚未落盘的内容将被移除；已保存的本地文件不受影响。')) { status('已保留暂存副本。'); return; }

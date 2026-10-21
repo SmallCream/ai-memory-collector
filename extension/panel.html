@@ -3,7 +3,7 @@
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AI Memory Collector</title><link rel="stylesheet" href="panel.css"></head>
 <body>
 <main>
-  <header><div><p class="eyebrow">AI MEMORY COLLECTOR</p><h1>保存你的 AI 对话</h1><p class="muted">再次点击扩展图标，会回到这个采集台。</p></div><span class="badge">实验版 0.1.4</span></header>
+  <header><div><p class="eyebrow">AI MEMORY COLLECTOR</p><h1>保存你的 AI 对话</h1><p class="muted">再次点击扩展图标，会回到这个采集台。</p></div><span class="badge">实验版 0.1.5</span></header>
   <nav class="shortcuts" aria-label="页面导航"><a href="#source-heading">连接账号</a><a href="#capture-heading">采集对话</a><a href="#local-heading">保存文件</a><a href="#github-heading">GitHub 设置</a></nav>
   <p class="notice">当前支持手动采集与本地保存；GitHub 暂用于连接测试。自动扫描和真实对话上传仍在后续计划中。</p>
   <p id="global-status" role="status" aria-live="polite">正在加载本机状态…</p>
@@ -32,7 +32,7 @@
     <div class="row"><button id="save-local" class="primary">保存 JSON 与 Markdown</button><button id="discard">清除本机待保存副本</button></div>
     <p id="local-feedback" class="action-feedback" data-action-status role="status" aria-live="polite"></p>
     <p id="local-status" class="muted">尚未保存</p>
-    <p class="hint">采集结果先暂存在扩展中；保存失败或关闭页面后可恢复。更换对话或内容变化时请另选空目录，更新合并属于 P1。清除暂存不会删除已保存文件。</p>
+    <p class="hint">保存并核对成功后会自动清理暂存，可以继续采集下一条；保存失败则保留副本。更换对话或内容变化时仍需另选空目录，更新合并属于 P1。手动清除暂存不会删除已保存文件。</p>
   </section>
   <section aria-labelledby="github-heading">
     <div class="section-head"><span class="step">04</span><div><h2 id="github-heading">GitHub 设置</h2><p>仓库与分支填写后自动保存在本机。请选择私有数据仓库。</p></div></div>

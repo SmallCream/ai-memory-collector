@@ -30,7 +30,7 @@ async function panel(overrides = {}) {
   }
   const buttons = [...nodes.values()].filter(x => x.tag === 'button');
   const inputs = [...nodes.values()].filter(x => ['input', 'select'].includes(x.tag));
-  const calls = { permissions: 0, probe: 0, write: 0, settings: [] };
+  const calls = { permissions: 0, probe: 0, write: 0, settings: [], localWrites: [], details: 0 };
   const permissions = overrides.permissions ?? (async () => true);
   const probeRepository = overrides.probe ?? (async () => ({ branch: 'main', private: true, empty: false }));
   const commitProbe = overrides.write ?? (async () => ({ status: 'created', readbackVerified: true, writeVerified: true }));
@@ -38,7 +38,14 @@ async function panel(overrides = {}) {
     document: { getElementById: id => nodes.get(id), querySelectorAll: selector => selector === 'button' ? buttons : selector === 'input,select' ? inputs : feedback },
     window: { dispatchEvent() {}, confirm: () => true }, Event: class { constructor(type) { this.type = type; } },
     navigator: { locks: { request: (_name, _options, callback) => callback(overrides.lock === false ? null : {}) } },
-    chrome: { permissions: { request: async (...args) => { calls.permissions++; return permissions(...args); } } },
+    chrome: {
+      permissions: { request: async (...args) => { calls.permissions++; return permissions(...args); } },
+      tabs: { get: async () => ({ url: 'https://chatgpt.com/c/synthetic-conversation' }) },
+      scripting: { executeScript: async ({ args: [request] }) => {
+        if (request.kind === 'detail') calls.details++;
+        return [{ frameId: 0, result: { ok: true, identity: { accountKey: 'synthetic-account', displayName: '测试身份' }, payload: {}, capturedAt: '2026-10-21T00:00:00.000Z' } }];
+      } },
+    },
     getSetting: overrides.getSetting ?? (async key => store.get(key)),
     setSetting: async (key, value) => {
       const copy = structuredClone(value);
@@ -50,7 +57,11 @@ async function panel(overrides = {}) {
     probeRepository: async (...args) => { calls.probe++; return probeRepository(...args); },
     commitProbe: async (...args) => { calls.write++; return commitProbe(...args); },
     Option: class {}, URL, location: { href: 'chrome-extension://test/panel.html' }, TextEncoder,
-    probeChatGPT() {}, buildArchive() {}, writeArchive() {}
+    probeChatGPT() {}, buildArchive: overrides.buildArchive ?? (async () => ({ summary: { title: '合成新对话' }, files: [] })),
+    writeArchive: async (...args) => {
+      calls.localWrites.push(args);
+      return overrides.localWrite ? overrides.localWrite(...args) : { written: 2, unchanged: 0 };
+    },
   });
   vm.runInContext(source, context);
   await tick();
@@ -214,5 +225,97 @@ test('forget failure is shown without claiming that the persisted Token was remo
   assert.equal(p.nodes.get('github-feedback').classList.contains('error'), true);
   assert.equal(p.nodes.get('preferences-status').classList.contains('error'), true);
   assert.match(p.nodes.get('preferences-status').textContent, /可能仍保留/);
+});
+
+function localArchiveStore() {
+  return new Map([
+    ['directory', { name: 'synthetic-local-folder', kind: 'directory' }],
+    ['pendingArchive', { summary: { title: '合成旧对话', displayedMessageCount: 2 }, files: [] }],
+  ]);
+}
+
+async function selectNextConversation(p) {
+  p.nodes.get('source-tab').value = '1';
+  p.nodes.get('personal-space').checked = true;
+  await p.click('identify');
+  await p.change('conversation', 'synthetic-next');
+}
+
+test('verified local save clears durable pending, survives reopen and permits the next capture', async () => {
+  const store = localArchiveStore();
+  const p = await panel({ store });
+  await selectNextConversation(p);
+  await p.click('save-local');
+  assert.equal(store.get('pendingArchive'), null);
+  assert.match(p.nodes.get('local-status').textContent, /已保存并读回核对/);
+  assert.match(p.nodes.get('capture-overview').textContent, /已保存：合成旧对话.*下一条/);
+  assert.equal(p.nodes.get('discard').disabled, true);
+  const reopened = await panel({ store });
+  assert.equal(reopened.nodes.get('save-local').disabled, true);
+  assert.match(reopened.nodes.get('capture-overview').textContent, /尚无采集结果/);
+  await p.click('capture');
+  assert.equal(p.calls.details, 1);
+  assert.equal(store.get('pendingArchive').summary.title, '合成新对话');
+});
+
+test('pending stays protected until file verification and durable cleanup both finish', async () => {
+  const store = localArchiveStore(), original = store.get('pendingArchive');
+  let finishWrite, finishCleanup;
+  const p = await panel({ store,
+    localWrite: () => new Promise(resolve => { finishWrite = resolve; }),
+    beforeSave: (key, value) => {
+      if (key === 'pendingArchive' && value === null) return new Promise(resolve => { finishCleanup = resolve; });
+    },
+  });
+  const saving = p.click('save-local');
+  assert.equal(store.get('pendingArchive'), original);
+  assert.equal(p.calls.settings.length, 0);
+  finishWrite({ written: 2, unchanged: 0 });
+  await tick();
+  assert.equal(store.get('pendingArchive'), original);
+  assert.equal(p.nodes.get('capture').disabled, true);
+  assert.match(p.nodes.get('capture-overview').textContent, /已有采集副本/);
+  finishCleanup(); await saving;
+  assert.equal(store.get('pendingArchive'), null);
+});
+
+test('failed file writes preserve the original pending without attempting cleanup', async () => {
+  const store = localArchiveStore(), original = store.get('pendingArchive');
+  const p = await panel({ store, localWrite: async () => { throw new Error('文件组核对失败，保留待保存任务。'); } });
+  await p.click('save-local');
+  assert.equal(store.get('pendingArchive'), original);
+  assert.equal(p.calls.settings.some(x => x.key === 'pendingArchive'), false);
+  assert.equal(p.nodes.get('save-local').disabled, false);
+  assert.match(p.nodes.get('local-feedback').textContent, /核对失败/);
+});
+
+test('cleanup failure keeps verified-save feedback and pending, then an idempotent retry releases it', async () => {
+  const store = localArchiveStore(), original = store.get('pendingArchive');
+  let failCleanup = true;
+  const p = await panel({ store,
+    localWrite: async () => ({ written: 0, unchanged: 2 }),
+    beforeSave: async key => { if (key === 'pendingArchive' && failCleanup) throw new Error('quota'); },
+  });
+  await p.click('save-local');
+  assert.equal(store.get('pendingArchive'), original);
+  assert.match(p.nodes.get('local-status').textContent, /已保存并读回核对.*已有相同内容 2/);
+  assert.match(p.nodes.get('local-feedback').textContent, /本地文件已保存.*暂存清理失败/);
+  assert.equal(p.nodes.get('local-feedback').classList.contains('error'), true);
+  failCleanup = false;
+  await p.click('save-local');
+  assert.equal(store.get('pendingArchive'), null);
+  assert.match(p.nodes.get('local-feedback').textContent, /暂存已自动清理/);
+  assert.equal(p.nodes.get('local-feedback').classList.contains('error'), false);
+});
+
+test('uncleared pending blocks a new detail request and names the conversation to save', async () => {
+  const store = localArchiveStore(), original = store.get('pendingArchive');
+  const p = await panel({ store });
+  await selectNextConversation(p);
+  await p.click('capture');
+  assert.match(p.nodes.get('capture-feedback').textContent, /合成旧对话.*保存 JSON 与 Markdown/);
+  assert.equal(p.calls.details, 0);
+  assert.equal(p.calls.settings.length, 0);
+  assert.equal(store.get('pendingArchive'), original);
 });
 
