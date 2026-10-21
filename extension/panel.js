@@ -1,301 +1,294 @@
-import { probeChatGPT } from './lib/chatgpt.js';
-import { buildArchive } from './lib/archive.js';
-import { getSetting, setSetting, writeArchive } from './lib/storage.js';
-import { probeRepository, commitProbe } from './lib/github.js';
+import { getSetting, setSetting } from './lib/storage.js';
 
-const $ = (id) => document.getElementById(id);
-let identity = null, nextOffset = null, directory = null, pending = null, busy = false, locked = true;
-let activeFeedback = null;
-let preferencesQueue = Promise.resolve(), preferencesRevision = 0;
-const buttons = [...document.querySelectorAll('button')];
-function showFeedback(element, text, error = false) {
-  if (!element) return;
-  element.textContent = text;
-  element.classList.toggle('error', error);
+const $ = id => document.getElementById(id);
+const setupPage = new URL(location.href).searchParams.get('setup') === '1';
+const sourceParameter = new URL(location.href).searchParams.get('tab');
+const sourceTabId = sourceParameter !== null && /^\d+$/.test(sourceParameter) ? Number(sourceParameter) : null;
+let current = null;
+let directory = null;
+let screen = 'home';
+let step = 0;
+let busy = false;
+let started = false;
+let wizardGithubVerified = false;
+let settingsLoaded = false;
+let stateRevision = 0;
+let activeAliasKey = null;
+const runningStatuses = new Set(['running', 'scanning', 'collecting', 'saving', 'syncing']);
+const pausedStatuses = new Set(['paused', 'blocked', 'waiting', 'retrying', 'interrupted', 'waiting-source', 'waiting-permission', 'partial']);
+const controls = () => document.querySelectorAll('button,input,select');
+const show = (id, visible) => { $(id).hidden = !visible; };
+const text = (id, value) => { const element = $(id); const next = String(value ?? ''); if (element.textContent !== next) element.textContent = next; };
+const safeMessage = value => String(typeof value === 'string' ? value : value?.message || '操作未完成，请稍后重试。')
+  .replace(/(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]+/g, '[已隐藏]')
+  .replace(/Bearer\s+[^\s,;]+/gi, 'Bearer [已隐藏]');
+function feedback(message = '', error = false) {
+  text('global-status', safeMessage(message));
+  $('global-status').classList.toggle('error', error);
 }
-function status(text, error = false) {
-  showFeedback($('global-status'), text, error);
-  showFeedback(activeFeedback, text, error);
+function errorObject(error) {
+  const e = new Error(safeMessage(error?.message || error));
+  e.code = typeof error?.code === 'string' ? error.code : 'UI_ERROR';
+  return e;
 }
-function startupStatus(text, error = false) {
-  status(text, error);
-  for (const element of document.querySelectorAll('[data-action-status]')) showFeedback(element, error ? text : '', error);
-  window.dispatchEvent(new Event('collector:ready'));
+async function send(type, fields = {}) {
+  const reply = await chrome.runtime.sendMessage({ type, ...(sourceTabId === null ? {} : { tabId: sourceTabId }), ...fields });
+  if (!reply?.ok) throw errorObject(reply?.error || '后台暂未响应，请重新加载扩展后重试。');
+  if (reply.state) current = reply.state;
+  return reply;
 }
-function preferencesSnapshot() {
-  const rememberToken = $('remember-token').checked;
-  return {
-    schemaVersion: 1,
-    repository: $('repository').value.trim(),
-    branch: $('branch').value.trim(),
-    detailFormat: $('detail-format').value === 'tree' ? 'tree' : 'flat',
-    rememberToken,
-    ...(rememberToken ? { token: $('github-token').value.trim() } : {}),
-  };
+function time(value) {
+  const date = new Date(value);
+  if (!value || !Number.isFinite(date.getTime())) return '';
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
-function savePreferences() {
-  // Each snapshot is committed in order. An uncheck/forget cannot be undone by
-  // an earlier in-flight input save. This record is never part of an archive.
-  const snapshot = preferencesSnapshot();
-  const revision = ++preferencesRevision;
-  showFeedback($('preferences-status'), '正在保存本机设置…');
-  preferencesQueue = preferencesQueue.then(async () => {
-    try {
-      await setSetting('formPreferences', snapshot);
-      if (revision === preferencesRevision) {
-        showFeedback($('preferences-status'), snapshot.rememberToken && snapshot.token ?
-          '设置与 Token 已保存在此浏览器。' : '设置已保存；Token 不保存在此浏览器。');
-      }
-      return true;
-    } catch {
-      if (revision === preferencesRevision) {
-        showFeedback($('preferences-status'), snapshot.rememberToken ?
-          '本机设置保存失败，请重试；刷新后可能需要重新填写。' :
-          '本机设置保存失败；若此前保存过 Token，可能仍保留，请点击“清除已保存 Token”重试。', true);
-      }
-      return false;
-    }
-  });
-  return preferencesQueue;
+function count(value) { return Number.isFinite(Number(value)) && Number(value) >= 0 ? String(Number(value)) : '0'; }
+function jobError(job) { return job?.error?.message || (typeof job?.error === 'string' ? job.error : ''); }
+function describeGithub(value, enabled) {
+  if (!enabled) return '未启用';
+  const status = typeof value === 'string' ? value : value?.status;
+  if (['synced', 'success', 'completed'].includes(status)) return '已同步';
+  if (status === 'idle') return '等待首次同步';
+  if (status === 'conflicts') return '已保留冲突副本';
+  if (['syncing', 'running'].includes(status)) return '同步中';
+  if (['error', 'failed', 'pending', 'waiting', 'conflict', 'blocked'].includes(status)) return '本地已保存，待同步';
+  return '已启用';
 }
-async function restorePreferences() {
-  const saved = await getSetting('formPreferences');
-  const target = saved?.schemaVersion === 1 ? saved : await getSetting('githubTarget');
-  $('repository').value = typeof target?.repository === 'string' ? target.repository : '';
-  $('branch').value = typeof target?.branch === 'string' ? target.branch : '';
-  $('detail-format').value = saved?.detailFormat === 'tree' ? 'tree' : 'flat';
-  const rememberToken = saved?.schemaVersion === 1 && saved.rememberToken === true;
-  $('remember-token').checked = rememberToken;
-  $('github-token').value = rememberToken && typeof saved.token === 'string' ? saved.token : '';
-  showFeedback($('preferences-status'), rememberToken && $('github-token').value ?
-    '已恢复本机设置与 Token。' : '仓库、分支和详情接口会自动保存；Token 需勾选后才记住。');
+function renderSummary() {
+  const target = $('wizard-summary');
+  target.replaceChildren();
+  const values = [
+    `ChatGPT · ${current.account?.alias || current.identity?.displayName || '尚未绑定'}`,
+    `保存到 ${current.directory?.name || directory?.name || '尚未选择'}`,
+    '默认保存 JSON 与 Markdown',
+    current.config?.github?.enabled ? `GitHub：${current.config.github.repository || '已配置'}` : 'GitHub：暂不启用',
+  ];
+  for (const value of values) { const p = document.createElement('p'); p.textContent = value; target.append(p); }
 }
-for (const id of ['repository', 'branch', 'github-token']) {
-  for (const event of ['input', 'change']) $(id).addEventListener(event, () => {
-    if (!busy && !locked) {
-      $('github-status').textContent = '设置已更改，请重新检查连接。';
-      showFeedback($('github-feedback'), '');
-      return savePreferences();
-    }
-  });
-}
-for (const id of ['detail-format', 'remember-token']) $(id).addEventListener('change', () => {
-  if (!busy && !locked) return savePreferences();
-});
-function errorText(error) {
-  let message = error?.message || '操作未完成，请重试。';
-  const token = $('github-token').value.trim();
-  if (token.length >= 8) message = message.split(token).join('[已隐藏]');
-  message = message.replace(/(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]+/g, '[已隐藏]');
-  const code = /^[A-Z][A-Z0-9_]{0,60}$/.test(error?.code || '') ? `（${error.code}）` : '';
-  return `${message}${code}`;
-}
-function refreshControls() {
-  for (const button of buttons) button.disabled = busy || locked;
-  for (const input of document.querySelectorAll('input,select')) input.disabled = busy || locked;
-  $('next').disabled ||= nextOffset === null || !identity;
-  $('list').disabled ||= !identity;
-  $('use-current').disabled ||= !identity;
-  $('capture').disabled ||= !identity || !$('conversation').value;
-  $('save-local').disabled ||= !pending || !directory;
-  $('discard').disabled ||= !pending;
-  $('reauthorize').disabled ||= !directory;
-}
-function action(id, fn) {
-  const button = $(id);
-  button.addEventListener('click', async () => {
-    if (busy || locked) return;
-    const label = button.textContent;
-    activeFeedback = button.closest('section')?.querySelector('[data-action-status]');
-    busy = true; refreshControls();
-    button.textContent = '处理中…';
-    button.setAttribute('aria-busy', 'true');
-    status(`正在${label}…`);
-    try { await fn(); }
-    catch (error) {
-      // Chrome errors and GitHub wrapper errors must not include API bodies or tokens.
-      status(errorText(error), true);
-      if (error?.code === 'ACCOUNT_CHANGED' || error?.code === 'IDENTITY') clearIdentity();
-    } finally {
-      button.textContent = label;
-      button.removeAttribute('aria-busy');
-      activeFeedback = null;
-      busy = false; refreshControls();
-    }
-  });
-}
-function clearIdentity() {
-  identity = null; nextOffset = null;
-  $('identity').textContent = '需要重新识别账号';
-  $('conversation').replaceChildren(new Option('先读取列表', ''));
-  $('list-status').textContent = '尚未读取列表';
-}
-async function permissions(origin) {
-  // Must run directly in a user click chain.
-  if (!await chrome.permissions.request({ origins: [origin] })) {
-    const error = new Error('未获得站点访问权限，请再次点击并允许浏览器授权。');
-    error.code = 'SITE_PERMISSION_DENIED';
-    throw error;
-  }
-}
-async function runProbe(request) {
-  const tabId = Number($('source-tab').value);
-  if (!$('source-tab').value || !Number.isInteger(tabId)) throw new Error('请先连接并选择 ChatGPT 标签页。');
-  if (!$('personal-space').checked) throw new Error('请先切换到个人空间并勾选确认。');
-  const tab = await chrome.tabs.get(tabId);
-  if (!tab.url || new URL(tab.url).origin !== 'https://chatgpt.com') throw new Error('标签页已离开 ChatGPT，请重新连接。');
-  const results = await chrome.scripting.executeScript({ target: { tabId }, world: 'ISOLATED', func: probeChatGPT, args: [request] });
-  const result = results.find(x => x.frameId === 0)?.result;
-  if (!result?.ok) { const e = new Error(result?.error?.message || '没有取得有效结果，请检查网站状态。'); e.code = result?.error?.code; throw e; }
-  return result;
-}
-action('connect', async () => {
-  await permissions('https://chatgpt.com/*');
-  const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
-  $('source-tab').replaceChildren(new Option('请选择标签页', ''));
-  for (const tab of tabs) $('source-tab').append(new Option(tab.title || `ChatGPT ${tab.id}`, String(tab.id)));
-  const preferred = new URL(location.href).searchParams.get('tab');
-  if (tabs.some(t => String(t.id) === preferred)) $('source-tab').value = preferred;
-  else if (tabs.length === 1) $('source-tab').value = String(tabs[0].id);
-  clearIdentity(); status(tabs.length ? `找到 ${tabs.length} 个标签页，请识别账号。` : '请先打开并登录 chatgpt.com，然后重新连接。');
-});
-$('source-tab').addEventListener('change', () => { clearIdentity(); refreshControls(); });
-$('personal-space').addEventListener('change', () => { clearIdentity(); refreshControls(); });
-$('conversation').addEventListener('change', refreshControls);
-action('identify', async () => {
-  clearIdentity();
-  const result = await runProbe({ kind: 'identity' });
-  identity = result.identity;
-  $('identity').textContent = `${identity.displayName} · ${identity.accountKey}`;
-  status('已观察到当前登录身份。工作区和切换边界仍需实测。');
-});
-async function listPage(offset) {
-  const result = await runProbe({ kind: 'list', offset, expectedAccountKey: identity.accountKey });
-  const page = result.payload;
-  $('conversation').replaceChildren(new Option('请选择测试对话', ''));
-  for (const item of page.items) $('conversation').append(new Option(item.title, item.id));
-  nextOffset = page.nextOffset;
-  $('list-status').textContent = `本页 ${page.items.length} 条，偏移 ${offset}；覆盖范围未验证`;
-  status('已读取一页。项目、归档、临时会话和完整历史尚未验证。');
-}
-action('list', () => listPage(0));
-action('next', () => listPage(nextOffset));
-action('use-current', async () => {
-  const tab = await chrome.tabs.get(Number($('source-tab').value));
-  const url = new URL(tab.url);
-  const match = url.origin === 'https://chatgpt.com' && /\/c\/([a-zA-Z0-9_-]{1,100})(?:\/|$)/.exec(url.pathname);
-  if (!match) throw new Error('所选标签页尚未打开已有对话，请先在网站打开一条普通测试对话。');
-  $('conversation').replaceChildren(new Option(tab.title || '当前页面对话', match[1]));
-  nextOffset = null;
-  $('list-status').textContent = '从所选页面地址取得对话 ID；没有验证列表接口。';
-  status('已选择当前页面对话。采集时会重新核验账号和详情 ID。');
-});
-function displayPending(savedSummary = null) {
-  const summary = pending?.summary || savedSummary;
-  $('capture-summary').textContent = summary ? JSON.stringify(summary, null, 2) : '尚无采集结果';
-  $('capture-overview').textContent = pending ?
-    `已有采集副本：${summary?.title || '未命名对话'}${Number.isInteger(summary?.displayedMessageCount) ? ` · 阅读版 ${summary.displayedMessageCount} 条消息` : ''}。保存状态见下方。` :
-    savedSummary ? `已保存：${savedSummary.title || '未命名对话'}。可以采集下一条对话。` :
-      '尚无采集结果。选择一条对话后开始采集。';
-}
-action('capture', async () => {
-  if (pending) throw new Error(`上一条「${pending.summary?.title || '未命名对话'}」仍在暂存。请在“保存到本地文件夹”点击“保存 JSON 与 Markdown”，成功后即可采集下一条；若不需要保留，可点击“清除本机待保存副本”。`);
-  const result = await runProbe({ kind: 'detail', conversationId: $('conversation').value,
-    format: $('detail-format').value, expectedAccountKey: identity.accountKey });
-  const archive = await buildArchive({ conversation: result.payload, identity: result.identity, capturedAt: result.capturedAt });
-  if (new TextEncoder().encode(JSON.stringify(archive)).byteLength > 10 * 1024 * 1024) throw new Error('归档超过 P0 暂存上限，本次未保存。');
-  await setSetting('pendingArchive', archive);
-  pending = archive; displayPending(); $('local-status').textContent = '已在扩展中暂存，尚未写入本地目录。';
-  status('已取得单次详情响应并暂存。请保存到本地，完整度以归档说明为准。');
-});
-action('choose-directory', async () => {
-  if (!window.showDirectoryPicker) throw new Error('此浏览器环境没有真实目录选择能力，请使用桌面 Chrome / Edge。');
-  directory = await window.showDirectoryPicker({ mode: 'readwrite', id: 'ai-memory-collector-p0' });
-  await setSetting('directory', directory);
-  $('directory').textContent = directory.name;
-  $('local-status').textContent = '已选择目录，尚未在此目录保存本次文件组。';
-  status('测试目录已选择。');
-});
-action('reauthorize', async () => {
-  const state = await directory.requestPermission({ mode: 'readwrite' });
-  if (state !== 'granted') throw new Error('未获得目录读写权限。');
-  status('目录权限已恢复。');
-});
-action('save-local', async () => {
-  const savedSummary = pending.summary;
-  const result = await writeArchive(directory, pending);
-  $('local-status').textContent = `已保存并读回核对：新写入 ${result.written} 个，已有相同内容 ${result.unchanged} 个。`;
-  // Only release the slot after file verification and the storage transaction
-  // both succeed. A cleanup failure must not hide the successful file save.
-  try { await setSetting('pendingArchive', null); }
-  catch {
-    status('本地文件已保存并核对，但暂存清理失败。请再次点击“保存 JSON 与 Markdown”重试，相同文件不会重复写入；暂存副本仍保留。', true);
-    return;
-  }
-  pending = null;
-  displayPending(savedSummary);
-  showFeedback($('capture-feedback'), '上一条已保存，暂存已自动清理，可以采集下一条对话。');
-  status('本地文件已保存并核对，暂存已自动清理。可以采集下一条对话，无需手动清除。');
-});
-action('discard', async () => {
-  if (!window.confirm('清除扩展内的待保存副本？尚未落盘的内容将被移除；已保存的本地文件不受影响。')) { status('已保留暂存副本。'); return; }
-  await setSetting('pendingArchive', null); pending = null; displayPending();
-  $('local-status').textContent = '已清除本机暂存；没有删除本地文件。'; status('暂存副本已清除。');
-});
-action('forget-token', async () => {
-  $('remember-token').checked = false;
+function fillSettings() {
+  const config = current?.config || {};
+  $('auto-enabled').checked = config.autoEnabled !== false;
+  $('interval-minutes').value = String([15, 30, 60].includes(config.intervalMinutes) ? config.intervalMinutes : 30);
+  $('github-enabled').checked = config.github?.enabled === true;
+  $('repository').value = config.github?.repository || '';
+  $('branch').value = config.github?.branch || '';
   $('github-token').value = '';
-  $('github-status').textContent = 'Token 已清空，填写后请重新检查连接。';
-  if (await savePreferences()) status('已清除本机保存的 Token。');
-  else status('未能确认 Token 已从本机清除，请重试。', true);
-});
-function githubOptions() {
-  const match = /^([A-Za-z0-9][A-Za-z0-9-]*)\/([A-Za-z0-9_.-]+)$/.exec($('repository').value.trim());
-  if (!match) throw new Error('仓库请填写 用户名/仓库名。');
-  const token = $('github-token').value.trim();
-  if (!token) throw new Error('请填写仅授权指定私有仓库的 Token。');
-  return { owner: match[1], repo: match[2], branch: $('branch').value.trim() || undefined, token };
+  text('token-status', config.github?.hasToken ? '此浏览器已保存 Token，留空沿用。' : '尚未保存 Token。');
+  settingsLoaded = true;
 }
-async function githubAction(write) {
-  // Enqueue without awaiting: permissions.request must keep the click gesture.
-  const saving = savePreferences();
-  try {
-    const options = githubOptions();
-    status('正在请求 GitHub 站点权限；如出现浏览器授权弹窗，请选择允许。');
-    await permissions('https://api.github.com/*');
-    status(write ? '正在验证仓库、写入测试文件并读回；请勿重复点击。' : '正在检查 GitHub 仓库连接…');
-    const result = await (write ? commitProbe(options) : probeRepository(options));
-    $('github-status').textContent = write ?
-      `测试结果：${result.status}，读回确认：${result.readbackVerified ? '通过' : '未通过'}。${result.writeVerified ? '本次写入已验证。' : '文件已存在且相同，本次未验证新写入权限。'}` :
-      `私有仓库连接成功，分支 ${result.branch}。${result.empty ? '仓库为空，可进行测试写入。' : '尚未执行写入。'}`;
-    status(write ? 'GitHub 连接测试完成，没有上传真实对话。' : '仓库只读检查完成。');
-    // Remote success must remain visible even if remembering the form fails.
-    if (!await saving) status('GitHub 操作已成功，但本机未能记住设置。下次打开需重新填写。');
-  } finally {
-    await saving;
+function render() {
+  if (!current) return;
+  const config = current.config || {};
+  const identity = current.identity;
+  const account = current.account;
+  const job = current.job;
+  const isRunning = runningStatuses.has(job?.status);
+  const isPaused = pausedStatuses.has(job?.status);
+  const isPartial = job?.status === 'partial';
+  const isWizard = !config.setupComplete;
+  show('legacy-notice', current.legacyPending === true);
+  show('context-error', Boolean(current.error?.message) && (screen === 'settings' || !current.identity));
+  text('context-error', current.error?.message ? safeMessage(current.error) : '');
+  if (isWizard && step > 0 && !account?.enabled) step = 0;
+  document.body.classList.toggle('setup-page', setupPage && isWizard);
+  show('wizard', isWizard);
+  show('home', !isWizard && screen === 'home');
+  show('settings', !isWizard && screen === 'settings');
+  show('open-settings', !isWizard && screen !== 'settings');
+  const selectedName = account?.alias || identity?.displayName || '尚未识别账号';
+  text('account-name', selectedName);
+  text('account-avatar', identity ? Array.from(selectedName).slice(0, 2).join('').toUpperCase() : 'AI');
+  text('account-context', identity ? 'ChatGPT · 普通对话' : '打开并登录 ChatGPT 后自动识别');
+  text('account-badge', !identity ? '等待登录' : account?.enabled ? '已启用' : '未启用');
+  const hasIdentity = Boolean(identity?.accountKey);
+  show('account-alert', !hasIdentity || !account?.enabled);
+  show('bind-account', hasIdentity && !account?.enabled);
+  show('new-account-alias', hasIdentity && !account?.enabled);
+  $('new-account-alias').parentElement.hidden = !hasIdentity || Boolean(account?.enabled);
+  const requiresPermission = !current.error || ['SITE_PERMISSION_DENIED', 'SITE_PERMISSION', 'SITE_PERMISSION_REQUIRED', 'PERMISSION_REQUIRED'].includes(current.error?.code);
+  show('home-grant', !hasIdentity && requiresPermission);
+  show('home-open-chatgpt', !hasIdentity && !requiresPermission);
+  text('account-alert-text', hasIdentity ? '当前账号尚未启用。确认后会保存到它自己的目录。' :
+    safeMessage(current.error?.message || '请打开并登录 ChatGPT。页面会自动更新，无需手动选择标签页。'));
+  if (activeAliasKey !== identity?.accountKey) {
+    activeAliasKey = identity?.accountKey || null;
+    $('account-alias').value = account?.alias || identity?.displayName || '';
+    $('new-account-alias').value = account?.alias || identity?.displayName || '';
   }
+  const interval = config.intervalMinutes || 30;
+  text('home-heading', isRunning ?
+    job.mode === 'full' ? '正在全量补采' : job.mode === 'initial' ? '正在初始化采集' : '正在检查新增与更新' :
+    isPartial ? '部分采集已完成' : isPaused ? '采集已暂停' : !account?.initialized ? '准备好首次采集' : config.autoEnabled === false ? '对话归档已就绪' : '对话正在自动归档');
+  text('schedule-status', config.autoEnabled === false ? '自动采集已暂停，可以手动采集。' :
+    isRunning ? `每 ${interval} 分钟自动检查 · 当前任务完成后继续调度` :
+    current.nextRunAt ? `自动采集已开启 · 下次检查 ${time(current.nextRunAt)}` : `自动采集已开启 · 每 ${interval} 分钟检查`);
+  show('job-progress', isRunning || isPaused);
+  const phases = { list: '扫描对话列表', listing: '扫描对话列表', scan: '扫描对话列表', scanning: '扫描对话列表', detail: '读取对话详情', details: '读取对话详情', capture: '读取对话详情', save: '保存 JSON 与 Markdown', saving: '保存 JSON 与 Markdown', sync: '同步 GitHub', syncing: '同步 GitHub', complete: '采集完成' };
+  text('job-phase', phases[job?.phase] || (isPaused ? '进度已保留' : '正在处理'));
+  const discovered = Number(job?.discovered) || 0;
+  const processed = Number(job?.processed) || 0;
+  text('job-count', discovered ? `${processed} / ${discovered}` : '');
+  if (discovered > 0 && !['list', 'listing', 'scan', 'scanning'].includes(job?.phase)) {
+    $('progress-meter').max = Math.max(discovered, processed, 1);
+    $('progress-meter').value = processed;
+  } else $('progress-meter').removeAttribute('value');
+  text('job-detail', isPartial ? `已保存的对话会保留，继续处理未完成项${Number(job?.failed) > 0 ? `（${count(job.failed)} 条待处理）` : ''}。` : isPaused ? '恢复后继续处理未完成项。' : '收起面板不会主动暂停任务。');
+  const error = jobError(job) || (hasIdentity ? current.error?.message : '');
+  show('job-error', Boolean(error)); text('job-error', safeMessage(error || ''));
+  show('start-capture', !isRunning && !isPaused);
+  text('start-capture', account?.initialized ? '立即检查更新' : '开始初始化采集');
+  show('full-capture', Boolean(account?.initialized) && !isRunning && (!isPaused || isPartial));
+  show('pause-capture', isRunning);
+  show('resume-capture', isPaused);
+  text('resume-capture', isPartial ? '重试未完成项' : '继续采集');
+  const directoryName = current.directory?.name || directory?.name || '尚未选择';
+  const granted = current.directory?.granted === true;
+  text('directory-name', directoryName);
+  text('directory-status', granted ? '自动保存' : current.directory?.name ? '需要授权' : '未设置');
+  show('restore-directory', !granted && Boolean(current.directory?.name || directory));
+  text('settings-directory', `${directoryName} · JSON + Markdown`);
+  show('settings-restore-directory', !granted && Boolean(current.directory?.name || directory));
+  const githubDescription = describeGithub(current.githubStatus, config.github?.enabled);
+  text('github-state', githubDescription);
+  show('retry-github', Boolean(config.github?.enabled) && (githubDescription.includes('待同步') || Number(current.githubStatus?.pending) > 0));
+  const githubDetail = config.github?.enabled ? current.githubStatus?.message || current.githubStatus?.error?.message || '' : '';
+  text('github-detail', safeMessage(githubDetail));
+  show('github-detail', Boolean(githubDetail));
+  $('github-detail').classList.toggle('warning-text', current.githubStatus?.status === 'conflicts');
+  const result = current.lastResult || (['completed', 'complete', 'done', 'partial', 'failed'].includes(job?.status) ? job : null);
+  show('last-result', Boolean(result));
+  if (result) {
+    text('count-added', count(result.added)); text('count-updated', count(result.updated));
+    text('count-unchanged', count(result.unchanged)); text('count-failed', count(result.failed));
+    text('last-result-time', time(result.completedAt || result.finishedAt || result.updatedAt));
+  }
+  text('settings-account', hasIdentity ? `ChatGPT · ${selectedName}` : '尚未识别当前账号');
+  if (screen === 'settings' && !settingsLoaded) fillSettings();
+  if (isWizard) {
+    for (let index = 0; index < 4; index++) {
+      show(`wizard-step-${index}`, index === step);
+      const item = document.querySelector(`[data-step="${index}"]`);
+      item.classList.toggle('current', index === step); item.classList.toggle('done', index < step);
+      if (index === step) item.setAttribute('aria-current', 'step'); else item.removeAttribute('aria-current');
+    }
+    text('wizard-identity', identity ? `已识别：${selectedName}` : safeMessage(current.error?.message || '打开 ChatGPT 并完成授权后自动识别。'));
+    show('grant-chatgpt', !identity); show('open-chatgpt', !identity);
+    text('wizard-directory', directoryName); text('wizard-directory-permission', granted ? '读写权限已确认' : '需要选择或恢复写入权限');
+    show('wizard-restore-directory', !granted && Boolean(current.directory?.name || directory));
+    if (step === 3) renderSummary();
+  }
+  for (const control of controls()) control.disabled = busy;
+  $('wizard-bind').disabled = busy || !hasIdentity;
+  $('wizard-next-1').disabled = busy || !granted;
+  $('wizard-next-2').disabled = busy || !wizardGithubVerified;
+  $('start-capture').disabled = busy || !account?.enabled || !granted;
+  $('full-capture').disabled = busy || !account?.enabled || !granted;
+  $('resume-capture').disabled = busy || !account?.enabled || !granted;
+  if (!started) { started = true; window.dispatchEvent(new Event('collector:ready')); }
 }
-action('check-github', () => githubAction(false));
-action('write-probe', () => githubAction(true));
-// One panel per extension origin prevents concurrent writes by this prototype.
-if (!navigator.locks) { locked = true; startupStatus('当前环境缺少页面互斥能力，原型暂不可用。', true); }
-else {
-  navigator.locks.request('ai-memory-collector-p0-panel', { ifAvailable: true }, async lock => {
-    if (!lock) { locked = true; startupStatus('另一个采集台正在打开。请关闭此页，使用已有采集台。', true); refreshControls(); return; }
+async function refresh() {
+  const revision = ++stateRevision;
+  const reply = await chrome.runtime.sendMessage({ type: 'collector:get-state', ...(sourceTabId === null ? {} : { tabId: sourceTabId }) });
+  if (!reply?.ok) throw errorObject(reply?.error || '暂时无法读取后台状态。');
+  if (revision !== stateRevision) return;
+  current = reply.state;
+  render();
+}
+function action(id, handler) {
+  $(id).addEventListener('click', async () => {
+    if (busy) return;
+    busy = true; stateRevision++; render(); feedback('正在处理…');
     try {
-      [directory, pending] = await Promise.all([getSetting('directory'), getSetting('pendingArchive'), restorePreferences()]);
-      if (directory) $('directory').textContent = `${directory.name}（保存前检查权限）`;
-      // Identity and personal-space confirmation are live checks, not preferences.
-      $('personal-space').checked = false;
-      $('source-tab').value = '';
-      clearIdentity();
-      displayPending();
-      locked = false;
-      startupStatus(pending ? '已恢复待保存副本，可重新选择或授权目录后保存。' : '准备就绪，从连接 ChatGPT 开始。');
-    } catch { locked = true; startupStatus('无法读取本机暂存，请检查浏览器存储权限。', true); }
-    refreshControls();
-    await new Promise(() => {});
-  }).catch(() => { locked = true; refreshControls(); startupStatus('无法取得采集台锁，请关闭其他采集台后重试。', true); });
+      // Calling before the first await preserves the activation for native pickers/permissions.
+      await handler();
+      await refresh();
+      feedback('');
+    } catch (error) { feedback(safeMessage(error), true); }
+    finally { busy = false; render(); }
+  });
 }
-refreshControls();
-
+async function grantChatGPT() {
+  const granted = await chrome.permissions.request({ origins: ['https://chatgpt.com/*'] });
+  if (!granted) throw new Error('未获得 ChatGPT 访问权限。需要时可再次授权。');
+  await send('collector:permissions-changed');
+}
+async function chooseDirectory() {
+  if (!window.showDirectoryPicker) throw new Error('当前环境不支持选择真实目录，请使用桌面 Chrome 或 Edge。');
+  const selected = await window.showDirectoryPicker({ mode: 'readwrite', id: 'ai-memory-collector-p0' });
+  await setSetting('directoryCandidate', selected);
+  await send('collector:directory-changed');
+  directory = selected;
+}
+async function restoreDirectory() {
+  if (!directory) throw new Error('保存目录尚未加载，请稍后重试或重新选择目录。');
+  if (await directory.requestPermission({ mode: 'readwrite' }) !== 'granted') throw new Error('目录权限未恢复；已有采集进度会保留。');
+  await send('collector:directory-changed');
+}
+async function saveGithub(wizard = false) {
+  const repository = $(wizard ? 'wizard-repository' : 'repository').value.trim();
+  const branch = $(wizard ? 'wizard-branch' : 'branch').value.trim();
+  const tokenInput = $(wizard ? 'wizard-token' : 'github-token');
+  const token = tokenInput.value.trim();
+  const enabled = wizard || $('github-enabled').checked;
+  if (enabled) {
+    const granted = await chrome.permissions.request({ origins: ['https://api.github.com/*'] });
+    if (!granted) throw new Error('未获得 GitHub 访问权限，配置尚未启用。');
+  }
+  await send('collector:github-config', { repository, branch, enabled, ...(token ? { token } : {}) });
+  if (enabled) await send('collector:github-test');
+  tokenInput.value = '';
+  if (wizard) { wizardGithubVerified = true; text('wizard-github-status', '私有仓库连接验证成功。'); }
+  else settingsLoaded = false;
+}
+function populateWizardGithub() {
+  const github = current?.config?.github || {};
+  $('wizard-repository').value = github.repository || '';
+  $('wizard-branch').value = github.branch || '';
+  $('wizard-token').value = '';
+  $('wizard-token').placeholder = github.hasToken ? '已保存 Token，留空沿用' : '粘贴仅授权此仓库的 Token';
+  wizardGithubVerified = false;
+  text('wizard-github-status', '');
+}
+async function closePanel(hide = false) {
+  await send('collector:close-panel', { hide });
+  if (!setupPage) window.close();
+}
+action('grant-chatgpt', grantChatGPT);
+action('home-grant', grantChatGPT);
+for (const id of ['open-chatgpt', 'home-open-chatgpt']) action(id, () => chrome.tabs.create({ url: 'https://chatgpt.com/' }));
+action('wizard-bind', async () => { await send('collector:bind', { alias: $('account-alias').value.trim() }); step = 1; });
+action('bind-account', () => send('collector:bind', { alias: $('new-account-alias').value.trim() }));
+for (const id of ['wizard-choose-directory', 'choose-directory']) action(id, chooseDirectory);
+for (const id of ['wizard-restore-directory', 'restore-directory', 'settings-restore-directory']) action(id, restoreDirectory);
+action('wizard-next-1', () => { step = 2; populateWizardGithub(); });
+action('wizard-connect-github', () => saveGithub(true));
+action('wizard-next-2', () => { step = 3; });
+action('wizard-skip-github', async () => { await send('collector:github-config', { enabled: false }); step = 3; });
+for (let index = 1; index <= 3; index++) action(`wizard-back-${index}`, () => { step = index - 1; });
+action('wizard-finish', async () => {
+  await send('collector:configure', { setupComplete: true, autoEnabled: $('wizard-auto-enabled').checked, intervalMinutes: 30 });
+  await send('collector:start', { mode: 'initial' });
+  screen = 'home';
+});
+action('start-capture', () => send('collector:start', { mode: current?.account?.initialized ? 'incremental' : 'initial' }));
+action('full-capture', () => send('collector:start', { mode: 'full' }));
+action('pause-capture', () => send('collector:pause'));
+action('resume-capture', () => send('collector:resume'));
+action('retry-github', () => send('collector:retry-github'));
+action('open-settings', () => { screen = 'settings'; settingsLoaded = false; });
+action('back-home', () => { screen = 'home'; });
+action('save-schedule', () => send('collector:configure', { autoEnabled: $('auto-enabled').checked, intervalMinutes: Number($('interval-minutes').value) }));
+action('save-github', () => saveGithub(false));
+action('forget-token', async () => { await send('collector:github-config', { token: '', enabled: false }); settingsLoaded = false; });
+action('collapse-panel', () => closePanel(false));
+action('hide-panel', () => closePanel(true));
+action('settings-hide', () => closePanel(true));
+for (const id of ['wizard-repository', 'wizard-branch', 'wizard-token']) $(id).addEventListener('input', () => {
+  wizardGithubVerified = false; $('wizard-next-2').disabled = true; text('wizard-github-status', '配置已改变，请重新验证。');
+});
+window.addEventListener('focus', () => { if (!busy) refresh().catch(error => feedback(safeMessage(error), true)); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden && !busy) refresh().catch(error => feedback(safeMessage(error), true)); });
+const poll = setInterval(() => { if (!document.hidden && !busy) refresh().catch(error => feedback(safeMessage(error), true)); }, 3000);
+window.addEventListener('pagehide', () => clearInterval(poll), { once: true });
+try { directory = await getSetting('directory'); await refresh(); feedback(''); }
+catch (error) { feedback(safeMessage(error), true); window.dispatchEvent(new Event('collector:ready')); }

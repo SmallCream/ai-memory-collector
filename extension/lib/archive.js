@@ -1,4 +1,4 @@
-/** P0 archive builder. Native web-detail JSON is authoritative; Markdown is derived. */
+/** Native web-detail JSON is authoritative; Markdown is derived from the same snapshot. */
 export const RENDERER_VERSION = 'p0-2';
 const PLATFORM = 'chatgpt';
 const SECRET_KEYS = new Set(['accesstoken', 'access_token', 'refreshtoken', 'refresh_token',
@@ -230,10 +230,10 @@ function checkedManifest(existingManifest, prefix, accountKey) {
 }
 
 /**
- * Build only P0 capture paths, never the production data/ namespace.
+ * Default paths preserve the P0 format. Production callers opt into a validated account prefix.
  * Filesystem callers must independently verify ownership and external edits before writing.
  */
-export async function buildArchive({ conversation, identity, capturedAt, existingManifest } = {}) {
+export async function buildArchive({ conversation, identity, capturedAt, existingManifest, productionPrefix } = {}) {
   const hasMapping = isRecord(conversation?.mapping) && Object.keys(conversation.mapping).length > 0;
   const hasMessages = Array.isArray(conversation?.messages);
   if (!isRecord(conversation) || (!hasMapping && !hasMessages)) {
@@ -249,7 +249,12 @@ export async function buildArchive({ conversation, identity, capturedAt, existin
   }
   const captureTime = dateValue(capturedAt);
   if (!captureTime) throw new Error('capturedAt 必须是有效时间。');
-  const prefix = `p0-captures/${PLATFORM}/${accountKey}`;
+  if (productionPrefix !== undefined && (typeof productionPrefix !== 'string' ||
+      !/^data\/web\/chatgpt\/[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/.test(productionPrefix) ||
+      /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(productionPrefix.split('/').at(-1)))) {
+    throw new Error('正式归档目录不合法。');
+  }
+  const prefix = productionPrefix ?? `p0-captures/${PLATFORM}/${accountKey}`;
   const manifest = checkedManifest(existingManifest, prefix, accountKey);
   const previous = own(manifest.conversations, id) ? manifest.conversations[id] : null;
   const redactions = [];
@@ -306,7 +311,7 @@ export async function buildArchive({ conversation, identity, capturedAt, existin
   Object.defineProperty(manifest.conversations, id, { value: entry, enumerable: true, writable: true, configurable: true });
   const account = { schemaVersion: 1, platform: PLATFORM, accountKey,
     displayName: typeof identity?.displayName === 'string' ? identity.displayName : accountKey,
-    dataPath: prefix, purpose: 'p0-capture' };
+    dataPath: prefix, purpose: productionPrefix ? 'conversation-archive' : 'p0-capture' };
   return {
     files: [
       { path: jsonPath, content }, { path: markdownPath, content: markdown },

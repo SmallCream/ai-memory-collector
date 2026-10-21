@@ -1,52 +1,87 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AI Memory Collector</title><link rel="stylesheet" href="panel.css"></head>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AI Memory Collector</title>
+  <link rel="stylesheet" href="panel.css">
+</head>
 <body>
-<main>
-  <header><div><p class="eyebrow">AI MEMORY COLLECTOR</p><h1>保存你的 AI 对话</h1><p class="muted">再次点击扩展图标，会回到这个采集台。</p></div><span class="badge">实验版 0.1.5</span></header>
-  <nav class="shortcuts" aria-label="页面导航"><a href="#source-heading">连接账号</a><a href="#capture-heading">采集对话</a><a href="#local-heading">保存文件</a><a href="#github-heading">GitHub 设置</a></nav>
-  <p class="notice">当前支持手动采集与本地保存；GitHub 暂用于连接测试。自动扫描和真实对话上传仍在后续计划中。</p>
-  <p id="global-status" role="status" aria-live="polite">正在加载本机状态…</p>
-  <section aria-labelledby="source-heading">
-    <div class="section-head"><span class="step">01</span><div><h2 id="source-heading">连接当前 ChatGPT</h2><p>在网站正常登录，授权后选择要读取的标签页。</p></div></div>
-    <div class="row"><button id="connect" class="primary">授权并查找标签页</button><select id="source-tab" aria-label="ChatGPT 标签页"><option value="">尚未连接</option></select></div>
-    <label class="check"><input type="checkbox" id="personal-space">我已切换到个人空间；本次不测试团队、项目或临时对话。</label>
-    <div class="row"><button id="identify">识别当前账号</button><span id="identity" class="muted">尚未识别</span></div>
-    <p id="source-feedback" class="action-feedback" data-action-status role="status" aria-live="polite"></p>
-    <p class="hint">工作区识别和快速往返切换保护仍待验证。试采集期间请保持当前账号与空间不变。</p>
+<main id="collector">
+  <header class="app-header">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">M</span><strong>记忆采集器</strong></div>
+    <div class="header-actions">
+      <button id="open-settings" class="icon-button" aria-label="打开设置">设置</button>
+      <button id="collapse-panel" class="icon-button" aria-label="收起面板">收起</button>
+      <button id="hide-panel" class="icon-button" aria-label="隐藏面板和悬浮入口">隐藏</button>
+    </div>
+  </header>
+  <p id="global-status" class="feedback" role="status" aria-live="polite">正在读取本机配置…</p>
+
+  <p id="context-error" class="notice" role="status" hidden></p>
+  <p id="legacy-notice" class="hint" hidden>检测到旧版未保存的采集副本，已保留在此浏览器中。更新不会清除此副本。</p>
+
+  <section id="wizard" hidden aria-labelledby="wizard-heading">
+    <div class="wizard-heading"><p class="eyebrow">首次设置</p><h1 id="wizard-heading">让对话自动归档</h1><p class="muted">配置完成后，在 ChatGPT 页面侧边即可使用。</p></div>
+    <ol class="wizard-steps" aria-label="配置步骤"><li data-step="0">连接账号</li><li data-step="1">保存位置</li><li data-step="2">GitHub</li><li data-step="3">完成</li></ol>
+    <div id="wizard-step-0" class="wizard-page">
+      <h2>连接当前 ChatGPT</h2><p>授权后自动识别已登录账号。请先在 ChatGPT 中切换到个人空间，第一版采集普通对话。</p>
+      <div id="wizard-identity" class="surface">正在检查账号…</div>
+      <button id="grant-chatgpt" class="primary block">授权并识别 ChatGPT</button>
+      <button id="open-chatgpt" class="text-button">打开 ChatGPT</button>
+      <label for="account-alias">账号名称<input id="account-alias" maxlength="60" autocomplete="off" placeholder="例如：我的主账号"></label>
+      <p class="hint">名称便于你识别；实际归属按稳定账号标识绑定。每个新账号只需启用一次。</p>
+      <button id="wizard-bind" class="primary block">启用此账号并继续</button>
+    </div>
+    <div id="wizard-step-1" class="wizard-page" hidden>
+      <h2>选择固定保存位置</h2><p>之后的所有对话自动保存到这个目录，按平台与账号分开。</p>
+      <div class="surface"><strong id="wizard-directory">尚未选择文件夹</strong><span id="wizard-directory-permission" class="muted"></span></div>
+      <button id="wizard-choose-directory" class="primary block">选择文件夹</button>
+      <button id="wizard-restore-directory" class="text-button" hidden>恢复此目录的写入权限</button>
+      <p class="hint">默认保存 JSON 和 Markdown。JSON 保留数据，Markdown 自动生成，方便阅读。更新插件时会保留目录设置。</p>
+      <div class="wizard-footer"><button id="wizard-back-1">上一步</button><button id="wizard-next-1" class="primary">继续</button></div>
+    </div>
+    <div id="wizard-step-2" class="wizard-page" hidden>
+      <h2>连接 GitHub</h2><p>本地保存后自动同步到你的私有数据仓库，也可以稍后再配置。</p>
+      <label for="wizard-repository">仓库<input id="wizard-repository" autocomplete="off" spellcheck="false" placeholder="用户名/私有数据仓库"></label>
+      <label for="wizard-branch">分支（可选）<input id="wizard-branch" autocomplete="off" spellcheck="false" placeholder="留空使用默认分支"></label>
+      <label for="wizard-token">GitHub Token<input id="wizard-token" type="password" autocomplete="off" spellcheck="false" maxlength="1024" placeholder="粘贴仅授权此仓库的 Token"></label>
+      <p class="hint">仅需此仓库的 Contents 读写权限。Token 保存在此浏览器，不进入对话文件，也不传给 ChatGPT。</p>
+      <button id="wizard-connect-github" class="primary block">验证并连接</button>
+      <p id="wizard-github-status" class="feedback" role="status" aria-live="polite"></p>
+      <div class="wizard-footer"><button id="wizard-back-2">上一步</button><button id="wizard-skip-github">稍后配置</button><button id="wizard-next-2" class="primary">继续</button></div>
+    </div>
+    <div id="wizard-step-3" class="wizard-page" hidden>
+      <h2>准备开始首次采集</h2><div id="wizard-summary" class="surface summary-list"></div>
+      <p>首次遍历所有可访问的普通对话；完成后按设置自动检查新增与更新。</p>
+      <label class="check-line"><input id="wizard-auto-enabled" type="checkbox" checked><span>启用定时增量采集，每 30 分钟检查一次</span></label>
+      <p class="hint">需要浏览器运行、有效登录和目录权限。电脑休眠或浏览器退出期间不会执行，恢复后补做检查。</p>
+      <div class="wizard-footer"><button id="wizard-back-3">上一步</button><button id="wizard-finish" class="primary">完成并初始化采集</button></div>
+    </div>
   </section>
-  <section aria-labelledby="capture-heading">
-    <div class="section-head"><span class="step">02</span><div><h2 id="capture-heading">选择要保存的对话</h2><p>从列表选择一条，或使用当前 ChatGPT 页面中的对话。</p></div></div>
-    <div class="row"><button id="list">读取第一页</button><button id="next" disabled>读取下一页</button><button id="use-current">使用当前页面对话</button><span id="list-status" class="muted">尚未读取列表</span></div>
-    <label>对话<select id="conversation"><option value="">先读取列表</option></select></label>
-    <details class="advanced"><summary>采集选项</summary><label>详情接口<select id="detail-format"><option value="flat">分页消息列表（新版，实验性）</option><option value="tree">消息树（旧版，实验性）</option></select></label><p class="hint">会记住上次选择。接口报错或格式不匹配时，可切换后重试。</p></details>
-    <div class="row"><button id="capture" class="primary">采集所选对话</button></div>
-    <p id="capture-feedback" class="action-feedback" data-action-status role="status" aria-live="polite"></p>
-    <p class="hint">两种接口均需在实际账号验证。单次返回不代表完整历史；遇到分页只保存已取得部分，附件实体不下载。</p>
-    <p id="capture-overview" class="capture-overview" role="status" aria-live="polite">尚无待保存的对话。</p>
-    <details class="advanced"><summary>查看采集详情</summary><pre id="capture-summary">尚无采集结果</pre></details>
+
+  <section id="home" hidden aria-label="日常采集">
+    <div class="account-row"><div id="account-avatar" class="avatar" aria-hidden="true">AI</div><div class="account-text"><strong id="account-name">识别账号中…</strong><span id="account-context" class="muted">ChatGPT</span></div><span id="account-badge" class="badge">检查中</span></div>
+    <div id="account-alert" class="notice" hidden><p id="account-alert-text"></p><label for="new-account-alias">账号名称<input id="new-account-alias" maxlength="60" autocomplete="off"></label><button id="bind-account" class="primary block">为此账号启用采集</button><button id="home-grant" class="primary block" hidden>授权 ChatGPT</button><button id="home-open-chatgpt" hidden>打开 ChatGPT</button></div>
+    <div class="headline"><h1 id="home-heading">自动归档你的对话</h1><p id="schedule-status" class="muted"></p></div>
+    <div id="job-progress" hidden><div class="progress-heading"><strong id="job-phase"></strong><span id="job-count" class="muted"></span></div><progress id="progress-meter" aria-label="采集进度"></progress><p id="job-detail" class="hint"></p></div>
+    <div id="job-error" class="notice" role="status" hidden></div>
+    <div class="main-actions"><button id="start-capture" class="primary block">立即检查更新</button><button id="full-capture" class="block">全量补采</button><button id="pause-capture" class="block" hidden>暂停采集</button><button id="resume-capture" class="primary block" hidden>继续采集</button></div>
+    <p id="capture-help" class="hint center">JSON + Markdown 自动保存</p>
+    <div class="destinations"><div><span>本地目录</span><strong id="directory-name">尚未设置</strong><span id="directory-status" class="muted"></span></div><button id="restore-directory" class="text-button" hidden>恢复保存权限</button><div><span>GitHub</span><strong id="github-state">未连接</strong></div><button id="retry-github" class="text-button" hidden>重试 GitHub 同步</button><p id="github-detail" class="hint" hidden></p></div>
+    <section id="last-result" class="history" hidden aria-labelledby="history-heading"><div class="history-heading"><h2 id="history-heading">最近一次采集</h2><span id="last-result-time" class="muted"></span></div><div class="stats"><div><strong id="count-added">0</strong><span>新增</span></div><div><strong id="count-updated">0</strong><span>更新</span></div><div><strong id="count-unchanged">0</strong><span>无变化</span></div><div><strong id="count-failed">0</strong><span>待处理</span></div></div></section>
+    <p class="scope-note">当前范围：ChatGPT 个人空间普通对话。附件保留引用，暂不下载附件实体。</p>
   </section>
-  <section aria-labelledby="local-heading">
-    <div class="section-head"><span class="step">03</span><div><h2 id="local-heading">保存到本地文件夹</h2><p>先选一个空的测试目录。本版不覆盖不同内容，重复保存相同文件可安全重试。</p></div></div>
-    <div class="row"><button id="choose-directory">选择测试目录</button><button id="reauthorize">恢复目录权限</button><span id="directory" class="muted">未选择</span></div>
-    <div class="row"><button id="save-local" class="primary">保存 JSON 与 Markdown</button><button id="discard">清除本机待保存副本</button></div>
-    <p id="local-feedback" class="action-feedback" data-action-status role="status" aria-live="polite"></p>
-    <p id="local-status" class="muted">尚未保存</p>
-    <p class="hint">保存并核对成功后会自动清理暂存，可以继续采集下一条；保存失败则保留副本。更换对话或内容变化时仍需另选空目录，更新合并属于 P1。手动清除暂存不会删除已保存文件。</p>
+
+  <section id="settings" hidden aria-labelledby="settings-heading">
+    <div class="settings-heading"><button id="back-home" class="text-button">‹ 返回采集</button><h1 id="settings-heading">设置</h1></div>
+    <section class="settings-group" aria-labelledby="automation-heading"><h2 id="automation-heading">自动采集</h2><label class="check-line"><input id="auto-enabled" type="checkbox"><span>启用定时增量采集</span></label><label for="interval-minutes">检查间隔<select id="interval-minutes"><option value="15">每 15 分钟</option><option value="30">每 30 分钟</option><option value="60">每 60 分钟</option></select></label><button id="save-schedule">保存采集设置</button><p class="hint">浏览器运行且账号可访问时执行。定时任务与手动任务共用进度，不重复启动。</p></section>
+    <section class="settings-group" aria-labelledby="storage-heading"><h2 id="storage-heading">保存位置</h2><div id="settings-directory" class="surface"></div><button id="choose-directory">更改保存位置</button><button id="settings-restore-directory" hidden>恢复目录权限</button><p class="hint">默认生成 JSON 与 Markdown；更换目录后可用“全量补采”补齐文件。</p></section>
+    <section class="settings-group" aria-labelledby="github-heading"><h2 id="github-heading">GitHub 同步</h2><label class="check-line"><input id="github-enabled" type="checkbox"><span>本地保存后自动同步</span></label><label for="repository">私有仓库<input id="repository" autocomplete="off" spellcheck="false" placeholder="用户名/私有数据仓库"></label><label for="branch">分支（可选）<input id="branch" autocomplete="off" spellcheck="false" placeholder="留空使用默认分支"></label><label for="github-token">GitHub Token<input id="github-token" type="password" autocomplete="off" spellcheck="false" maxlength="1024" placeholder="已保存时留空即可沿用"></label><p id="token-status" class="hint"></p><div class="button-row"><button id="save-github" class="primary">验证并保存</button><button id="forget-token">清除 Token</button></div><p class="hint">凭据仅保存在此浏览器。真实对话只上传到你配置并启用的私有数据仓库。</p></section>
+    <section class="settings-group"><h2>当前账号</h2><p id="settings-account"></p><p class="hint">账号按实际登录身份识别。切换身份后先核验；新账号需要单独启用。</p></section>
+    <button id="settings-hide" class="text-button">隐藏页面上的悬浮入口</button><p class="hint">隐藏后，点击浏览器工具栏的采集器图标即可恢复。</p>
   </section>
-  <section aria-labelledby="github-heading">
-    <div class="section-head"><span class="step">04</span><div><h2 id="github-heading">GitHub 设置</h2><p>仓库与分支填写后自动保存在本机。请选择私有数据仓库。</p></div></div>
-    <div class="grid"><label>仓库<input id="repository" placeholder="你的用户名/私有测试仓库" autocomplete="off" spellcheck="false"></label><label>分支（可选）<input id="branch" placeholder="留空使用默认分支" autocomplete="off" spellcheck="false"></label></div>
-    <label>细粒度 Token<input id="github-token" type="password" placeholder="粘贴仅授权此仓库的 Token" autocomplete="off" spellcheck="false" maxlength="1024"></label>
-    <div class="row"><label class="check"><input type="checkbox" id="remember-token">在此浏览器记住 Token</label><button id="forget-token">清除已保存 Token</button></div>
-    <p class="hint">勾选后会在本机持久保存，重新打开或原地更新扩展后可恢复；未勾选则只在当前页面使用。Token 不进入对话归档，也不传给 ChatGPT。请仅授予目标仓库 Contents 读写权限。</p>
-    <p id="preferences-status" class="action-feedback" role="status" aria-live="polite">正在读取本机设置…</p>
-    <div class="row"><button id="check-github">检查仓库连接</button><button id="write-probe">写入并读回测试文件</button></div>
-    <p id="github-feedback" class="action-feedback" data-action-status role="status" aria-live="polite"></p>
-    <p id="github-status" class="muted">尚未验证。测试路径：collector-probe/connection-check.json</p>
-  </section>
-  <footer>全部操作手动触发 · 源内容仅作为数据处理 · 本版没有自动上传真实对话</footer>
 </main>
 <script src="bootstrap.js" defer></script>
-</body></html>
-
+</body>
+</html>

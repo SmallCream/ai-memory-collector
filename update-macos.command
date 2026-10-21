@@ -94,7 +94,7 @@ function run(a) {
     if (!/^[a-f0-9]{40}$/.test(sha || "")) throw Error("Invalid GitHub commit");
     return sha;
   }
-  if (x.manifest_version !== 3 || x.name !== "AI Memory Collector · P0" ||
+  if (x.manifest_version !== 3 || ["AI Memory Collector · P0", "AI Memory Collector"].indexOf(x.name) < 0 ||
       x.background.service_worker !== "background.js" || x.options_ui.page !== "panel.html")
     throw Error("Not an AI Memory Collector extension");
   if (typeof x.version !== "string" || !/^\d+(\.\d+){0,3}$/.test(x.version) ||

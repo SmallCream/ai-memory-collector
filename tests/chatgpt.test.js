@@ -106,3 +106,110 @@ test('network exception messages are not forwarded', async () => {
   assert.equal(result.error.code, 'NETWORK');
   assert.ok(!JSON.stringify(result).includes('secret-value'));
 });
+
+
+function completeTree() {
+  return { conversation_id: 'demo', title: 'Synthetic conversation', current_node: 'a',
+    mapping: {
+      root: { id: 'root', parent: null, children: ['u'], message: null },
+      u: { id: 'u', parent: 'root', children: ['a'], message: { id: 'u', author: { role: 'user' }, content: { parts: ['Hello'] }, status: 'finished_successfully' } },
+      a: { id: 'a', parent: 'u', children: [], message: { id: 'a', author: { role: 'assistant' }, content: { parts: ['Hi'] }, status: 'finished_successfully' } },
+    } };
+}
+const autoRequest = { kind: 'detail', format: 'auto', conversationId: 'demo', expectedAccountKey: expectedKey };
+test('automatic detail prefers a coherent tree and checks identity before returning', async () => {
+  const { run, calls } = setup([session(), completeTree(), session()]);
+  const result = await run(autoRequest);
+  assert.equal(result.ok, true);
+  assert.equal(result.detailFormat, 'tree');
+  assert.equal(result.completeness, 'complete');
+  assert.equal(calls[1].path, '/backend-api/conversation/demo');
+  assert.equal(calls.length, 3);
+  assert.ok(!JSON.stringify(result).includes('synthetic-bearer-secret'));
+  assert.match(result.coverage, /未验证/u);
+});
+test('automatic detail uses flat only on absent or unsupported tree endpoint', async () => {
+  const flat = { conversation_id: 'demo', messages: [{ id: 'm', role: 'user', content: 'Synthetic' }],
+    page_info: { has_previous_page: false, has_next_page: false } };
+  for (const initial of [new Response('', { status: 404 }), { conversation_id: 'demo', renamed_mapping: {} }]) {
+    const { run, calls } = setup([session(), initial, flat, session()]);
+    const result = await run(autoRequest);
+    assert.equal(result.ok, true);
+    assert.equal(result.detailFormat, 'flat');
+    assert.equal(result.completeness, 'complete');
+    assert.equal(calls[2].path, '/backend-api/conversations/demo?num_turns=100');
+  }
+});
+test('authentication, rate limits and wrong IDs never trigger a fallback detail request', async () => {
+  for (const status of [401, 403, 429, 500]) {
+    const { run, calls } = setup([session(), new Response('sensitive', { status })]);
+    const result = await run(autoRequest);
+    assert.equal(result.error.code, `HTTP_${status}`);
+    assert.equal(calls.length, 2);
+  }
+  const { run, calls } = setup([session(), { ...completeTree(), conversation_id: 'other' }]);
+  assert.equal((await run(autoRequest)).error.code, 'CONVERSATION_ID');
+  assert.equal(calls.length, 2);
+});
+test('automatic detail rejects streaming, disconnected, cyclic and partial trees', async () => {
+  const mutations = [
+    value => { value.mapping.a.message.status = 'in_progress'; },
+    value => { value.mapping.u.parent = 'missing'; },
+    value => { value.mapping.u.parent = 'a'; },
+    value => { value.current_node = 'missing'; },
+    value => { value.mapping.root.children = ['missing']; },
+    value => { value.mapping.side = { id: 'side', parent: 'side', message: null }; },
+    value => { value.is_incomplete = true; },
+    value => { value.page_info = { has_previous_page: true }; },
+  ];
+  for (const mutate of mutations) {
+    const value = completeTree(); mutate(value);
+    const { run, calls } = setup([session(), value]);
+    const result = await run(autoRequest);
+    assert.equal(result.error.code, 'INCOMPLETE_DETAIL');
+    assert.equal(result.payload, undefined);
+    assert.equal(calls.length, 2, 'do not fall back after an incomplete tree');
+  }
+});
+test('automatic flat fallback refuses unknown pagination, missing stable IDs and duplicate messages', async () => {
+  for (const flat of [
+    { messages: [] },
+    { messages: [], page_info: { has_previous_page: false } },
+    { messages: [], page_info: { has_previous_page: true, has_next_page: false } },
+    { messages: [{ content: 'missing id' }], page_info: { has_previous_page: false, has_next_page: false } },
+    { messages: [{ id: 'same' }, { id: 'same' }], page_info: { has_previous_page: false, has_next_page: false } },
+  ]) {
+    const { run } = setup([session(), new Response('', { status: 404 }), { conversation_id: 'demo', ...flat }]);
+    const result = await run(autoRequest);
+    assert.equal(result.error.code, 'INCOMPLETE_DETAIL');
+    assert.equal(result.payload, undefined);
+  }
+});
+test('automatic mode discards even a complete response if account changes in flight', async () => {
+  const { run } = setup([session(), completeTree(), session('changed-account')]);
+  const result = await run(autoRequest);
+  assert.equal(result.error.code, 'ACCOUNT_CHANGED');
+  assert.equal(result.payload, undefined);
+});
+test('list rejects duplicate, stalled, inconsistent and malformed pages', async () => {
+  for (const raw of [
+    { items: [], total: 10 },
+    { items: [{ id: 'a' }, { id: 'a' }], total: 2 },
+    { items: [{ id: 'a' }], total: '10' },
+    { items: [{ id: 'a' }], total: 0 },
+    { items: [{ id: 'a' }], total: 1, offset: 10 },
+  ]) {
+    const { run } = setup([session(), raw]);
+    const result = await run({ kind: 'list', offset: 0, expectedAccountKey: expectedKey });
+    assert.equal(result.ok, false);
+    assert.equal(result.payload, undefined);
+  }
+});
+test('empty complete list and exact full final page terminate pagination honestly', async () => {
+  for (const items of [[], Array.from({ length: 20 }, (_, i) => ({ id: `item-${i}` }))]) {
+    const { run } = setup([session(), { items, total: items.length }, session()]);
+    const result = await run({ kind: 'list', offset: 0, expectedAccountKey: expectedKey });
+    assert.equal(result.ok, true);
+    assert.equal(result.payload.nextOffset, null);
+  }
+});

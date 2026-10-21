@@ -6,7 +6,7 @@ import zipfile
 root = Path(__file__).resolve().parents[1]
 extension = root / 'extension'
 version = json.loads((extension / 'manifest.json').read_text())['version']
-destination = root / 'dist' / f'ai-memory-collector-{version}-p0.zip'
+destination = root / 'dist' / f'ai-memory-collector-{version}.zip'
 destination.parent.mkdir(exist_ok=True)
 allowed = {'.json', '.js', '.html', '.css'}
 files = sorted(path for path in extension.rglob('*') if path.is_file())
