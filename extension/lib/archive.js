@@ -77,6 +77,11 @@ function sanitizedCopy(value, path, redactions, ancestors = new Set(), depth = 0
   return copy;
 }
 
+/** Use the same native-data normalization for comparisons and persisted JSON. */
+export function sanitizeNativeConversation(value) {
+  return sanitizedCopy(value, '', []);
+}
+
 function json(value) { return `${JSON.stringify(value, null, 2)}\n`; }
 async function hash(text) {
   const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));

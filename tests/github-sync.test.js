@@ -161,6 +161,102 @@ test('equal-time divergence preserves both versions without changing remote cano
   assert.equal(again.status, 'unchanged');
 });
 
+function flatBundle(time = 100, content = 'Hello') {
+  const value = bundle('message-sync', time, content), native = JSON.parse(value.files[0].content);
+  native.messages = [native.mapping.a.message];
+  native.current_node = native.messages[0].id;
+  native.page_info = { start_cursor: native.messages[0].id, end_cursor: native.messages[0].id,
+    has_previous_page: false, has_next_page: false };
+  delete native.mapping;
+  value.files[0].content = json(native);
+  value.entry.contentHash = digest(value.files[0].content);
+  value.files.find(file => file.path === MANIFEST).content = json(value.manifest);
+  return value;
+}
+
+function receipt(fullReadAt, checkedAt = fullReadAt) {
+  const tail = checkedAt !== fullReadAt;
+  return { schemaVersion: 1, format: 'flat', scope: 'selected-branch', mode: tail ? 'tail-merge' : 'full',
+    fullReadAt, checkedAt, incrementalRuns: tail ? 1 : 0, pagesRead: 1,
+    fetchedMessages: 1, reusedMessages: tail ? 1 : 0, addedMessages: 1, updatedMessages: 0 };
+}
+
+function setReceipt(value, sync, assets) {
+  value.entry.messageSync = sync;
+  if (assets !== undefined) value.entry.assets = assets;
+  value.files.find(file => file.path === MANIFEST).content = json(value.manifest);
+  return value;
+}
+
+test('a newer flat snapshot cannot erase tree branches in either sync direction', async t => {
+  for (const treeIsRemote of [true, false]) await t.test(`tree is remote: ${treeIsRemote}`, async () => {
+    const tree = bundle('message-sync', 100, 'Tree with branches'), flat = flatBundle(200, 'Newer selected branch');
+    // Deliberately misleading hints must not override the actual source shape.
+    setReceipt(tree, receipt(500));
+    setReceipt(flat, { ...receipt(500), format: 'tree', scope: 'returned-tree' });
+    const [local, remote] = treeIsRemote ? [flat, tree] : [tree, flat];
+    const server = gitServer({ initial: fileMap(remote) });
+    const result = await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+    assert.equal(result.conflicts.length, 1);
+    assert.match(result.conflicts[0].reason, /消息树/);
+    assert.equal(result.remoteWinners.length, 0);
+    assert.equal(server.files()[remote.entry.jsonPath], remote.files[0].content);
+    assert.equal(server.files()[result.conflicts[0].path], local.files[0].content);
+    assert.equal(server.files()[result.conflicts[0].path.replace(/\.json$/, '.md')], local.files[1].content);
+  });
+});
+
+test('same native sync selects the latest full-history receipt with and without asset merging', async t => {
+  for (const mergeAssets of [true, false]) for (const newerFullIsLocal of [true, false]) {
+    await t.test(`assets: ${mergeAssets}; newer full is local: ${newerFullIsLocal}`, async () => {
+      const newerFull = setReceipt(flatBundle(), receipt(200), mergeAssets ? [] : undefined);
+      const olderFullNewerTail = setReceipt(flatBundle(), receipt(100, 300), mergeAssets ? [] : undefined);
+      const [local, remote] = newerFullIsLocal ? [newerFull, olderFullNewerTail] : [olderFullNewerTail, newerFull];
+      const server = gitServer({ initial: fileMap(remote) });
+      const result = await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+      assert.equal(result.conflicts.length, 0);
+      assert.deepEqual(JSON.parse(server.files()[MANIFEST]).conversations['message-sync'].messageSync, receipt(200));
+      assert.equal(server.files()[remote.entry.jsonPath], remote.files[0].content);
+      if (mergeAssets) assert.deepEqual(result.remoteWinners[0].entry.messageSync, receipt(200));
+      const replay = await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+      assert.equal(replay.status, 'unchanged');
+    });
+  }
+});
+
+test('same full-history time chooses the later valid receipt and discards incompatible formats', async () => {
+  const local = setReceipt(flatBundle(), receipt(100, 200), []);
+  const remote = setReceipt(flatBundle(), receipt(100, 300), []);
+  let server = gitServer({ initial: fileMap(remote) });
+  await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+  assert.deepEqual(JSON.parse(server.files()[MANIFEST]).conversations['message-sync'].messageSync, receipt(100, 300));
+  setReceipt(remote, { ...receipt(900), format: 'tree', scope: 'returned-tree' }, []);
+  server = gitServer({ initial: fileMap(remote) });
+  await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+  assert.deepEqual(JSON.parse(server.files()[MANIFEST]).conversations['message-sync'].messageSync, receipt(100, 200));
+});
+
+test('message receipts do not migrate to different native bytes during derivative merges', async () => {
+  const local = setReceipt(flatBundle(), receipt(300), []);
+  const remote = setReceipt(flatBundle(), receipt(100), []);
+  remote.files[0].content = JSON.stringify(JSON.parse(remote.files[0].content));
+  remote.entry.contentHash = digest(remote.files[0].content);
+  remote.files.find(file => file.path === MANIFEST).content = json(remote.manifest);
+  const server = gitServer({ initial: fileMap(remote) });
+  const result = await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+  assert.equal(server.files()[remote.entry.jsonPath], remote.files[0].content);
+  assert.deepEqual(result.remoteWinners[0].entry.messageSync, receipt(100));
+  assert.deepEqual(JSON.parse(server.files()[MANIFEST]).conversations['message-sync'].messageSync, receipt(100));
+});
+
+test('a changed native version cannot inherit an unrelated remote message receipt', async () => {
+  const local = flatBundle(200, 'Changed content'), remote = setReceipt(flatBundle(100), receipt(500));
+  const server = gitServer({ initial: fileMap(remote) });
+  await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+  assert.equal(JSON.parse(server.files()[MANIFEST]).conversations['message-sync'].messageSync, undefined);
+  assert.equal(server.files()[remote.entry.jsonPath], local.files[0].content);
+});
+
 test('external remote JSON edit is not overwritten even by newer source timestamp', async () => {
   const a = bundle('one', 100, 'remote'), b = bundle('one', 200, 'local');
   const custom = json({ ...JSON.parse(a.files[0].content), title: 'Manual edit' });

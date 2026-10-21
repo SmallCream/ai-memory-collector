@@ -4,6 +4,7 @@ import { createGitHubClient, inspectGitHubRepository, commitProbe, GitHubProbeEr
 import { formatLfsPointer } from './lfs.js';
 import { extractAssets, reconcileAssetCapturePolicy } from './assets.js';
 import { reconcileFileCitation } from './asset-reconciliation.js';
+import { selectMessageSync } from './message-sync-receipt.js';
 
 const MAX_BYTES = 32 * 1024 * 1024;
 const MAX_FILES = 512;
@@ -177,6 +178,14 @@ function stable(value) {
   return Object.fromEntries(Object.keys(value).sort().map(key => [key, stable(value[key])]));
 }
 function sameJSON(a, b) { return JSON.stringify(stable(a)) === JSON.stringify(stable(b)); }
+function hasTree(native) { return record(native?.mapping) && Object.keys(native.mapping).length > 0; }
+function isFlat(native) { return !hasTree(native) && Array.isArray(native?.messages); }
+function applyMessageSync(entry, native, ...receipts) {
+  const receipt = selectMessageSync(native, ...receipts);
+  if (receipt) entry.messageSync = receipt;
+  else delete entry.messageSync;
+  return entry;
+}
 function completeEntry(entry) {
   return entry.sourceCompleteness !== 'partial' && entry.coverage?.messages !== 'partial' && entry.coverage?.branches !== 'partial';
 }
@@ -268,9 +277,10 @@ async function plan(api, remote, bundles, assetPlan) {
       const jsonPath = previous?.jsonPath || localEntry.jsonPath;
       const markdownPath = previous?.markdownPath || localEntry.markdownPath;
       const remoteJSON = await read(jsonPath); let remoteMD = await read(markdownPath);
-      let reason = null, remoteWins = false, sameNative = false;
+      let reason = null, remoteWins = false, sameNative = false, remoteContentHash = null;
       if (remoteJSON !== null) {
-        const managedJSON = previous && await hash(remoteJSON) === previous.contentHash;
+        remoteContentHash = await hash(remoteJSON);
+        const managedJSON = previous && remoteContentHash === previous.contentHash;
         const managedMD = remoteMD === null || (previous && await hash(remoteMD) === previous.markdownHash);
         let remoteNative;
         try { remoteNative = JSON.parse(remoteJSON); } catch { /* Preserve malformed external edits. */ }
@@ -286,8 +296,12 @@ async function plan(api, remote, bundles, assetPlan) {
           reason = '远端快照不完整，未自动选为最新版';
         } else {
           const lt = sourceTime(native), rt = sourceTime(remoteNative);
-          if (lt !== null && rt !== null && lt > rt) { /* newer confirmed source version wins */ }
-          else if (lt !== null && rt !== null && lt < rt) remoteWins = true;
+          if (lt !== null && rt !== null && lt > rt) {
+            if (hasTree(remoteNative) && isFlat(native)) reason = '较新的当前分支快照不能覆盖远端消息树及历史分支';
+          } else if (lt !== null && rt !== null && lt < rt) {
+            if (hasTree(native) && isFlat(remoteNative)) reason = '较新的远端当前分支快照不能覆盖本地消息树及历史分支';
+            else remoteWins = true;
+          }
           else reason = '同一来源时间存在不同内容或缺少可靠来源时间';
         }
       } else if (remoteMD !== null && (!previous || await hash(remoteMD) !== previous.markdownHash)) {
@@ -314,9 +328,13 @@ async function plan(api, remote, bundles, assetPlan) {
           productionPrefix: prefix, assets: mergedAssets });
         const rebuiltMD = rebuilt.files.find(file => file.path === markdownPath)?.content;
         if (typeof rebuiltMD !== 'string') fail('REMOTE_DERIVATIVE_MISSING', '图片阅读文件无法重新生成，待同步任务已保留。');
-        const mergedEntry = { ...localEntry, ...previous, assets: mergedAssets, jsonPath, markdownPath,
-          contentHash: await hash(remoteJSON), markdownHash: await hash(rebuiltMD),
-          rendererVersion: rebuilt.manifest.conversations[id].rendererVersion };
+        // Receipts belong to exact native bytes. A derivative-only merge must
+        // retain the strongest full-history check rather than favoring a device.
+        const mergedEntry = applyMessageSync({ ...localEntry, ...previous, assets: mergedAssets, jsonPath, markdownPath,
+          contentHash: remoteContentHash, markdownHash: await hash(rebuiltMD),
+          rendererVersion: rebuilt.manifest.conversations[id].rendererVersion }, native,
+        remoteContentHash === localEntry.contentHash ? localEntry.messageSync : null,
+        remoteContentHash === previous?.contentHash ? previous.messageSync : null);
         Object.defineProperty(manifest.conversations, id, { value: mergedEntry, enumerable: true, writable: true, configurable: true });
         await put(markdownPath, rebuiltMD);
         // Preserve the native JSON bytes and return the richer version for guarded local import.
@@ -343,8 +361,10 @@ async function plan(api, remote, bundles, assetPlan) {
         continue;
       }
       await put(jsonPath, localJSON); await put(markdownPath, localMD);
-      const entry = { ...localEntry, jsonPath, markdownPath,
-        ...(previous ? { namingTime: previous.namingTime, pathTimeBasis: previous.pathTimeBasis, firstCapturedAt: previous.firstCapturedAt } : {}) };
+      const entry = applyMessageSync({ ...localEntry, jsonPath, markdownPath,
+        ...(previous ? { namingTime: previous.namingTime, pathTimeBasis: previous.pathTimeBasis, firstCapturedAt: previous.firstCapturedAt } : {}) },
+      native, localEntry.messageSync,
+      sameNative && remoteContentHash === localEntry.contentHash && remoteContentHash === previous?.contentHash ? previous.messageSync : null);
       Object.defineProperty(manifest.conversations, id, { value: entry, enumerable: true, writable: true, configurable: true });
     }
     if (manifestText === null || !sameJSON(parse(manifestText), manifest)) await put(manifestPath, json(manifest));

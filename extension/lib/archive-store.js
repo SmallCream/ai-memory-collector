@@ -1,6 +1,7 @@
 import { buildArchive } from './archive.js';
 import { extractAssets, reconcileAssetCapturePolicy } from './assets.js';
 import { getSetting, setSetting } from './storage.js';
+import { sanitizeMessageSync, selectMessageSync } from './message-sync-receipt.js';
 
 const MAX_FILE_BYTES = 24 * 1024 * 1024;
 const MAX_BATCH_BYTES = 48 * 1024 * 1024;
@@ -46,6 +47,9 @@ function sourceTime(value) {
   const date = new Date(Math.trunc(ms));
   return date.getUTCFullYear() >= 1970 && date.getUTCFullYear() <= 9999 ? date.toISOString() : null;
 }
+
+const hasTree = native => record(native?.mapping) && Object.keys(native.mapping).length > 0;
+
 function assertNativeNotPartial(native) {
   if (!record(native)) return; // The archive builder reports malformed outer data.
   const partial = () => fail('PARTIAL_DETAIL', '原始详情仍有未读取或生成中的内容，已有归档保持不变。');
@@ -136,6 +140,29 @@ export async function readAccountManifest(directory, account) {
   }
   const text = await read(directory, `${prefix}/archive/manifest.json`);
   return text === null ? null : validateManifest(parse(text), account);
+}
+
+/** Read only a verified complete source as the starting point for a tail merge. */
+export async function readConversationBaseline(directory, account, conversationId, { get = getSetting } = {}) {
+  accountPrefix(account);
+  if (!safeSegment(conversationId, 160)) fail('ARCHIVE_FORMAT', '对话标识无效，未读取增量基线。');
+  await ensurePermission(directory);
+  // A journal may have written the new JSON before the old manifest changed.
+  // Let saveConversation replay it rather than treating those bytes as edits.
+  if (await get(`archiveJournal:${account.platform}:${account.accountKey}`)) return null;
+  const manifest = await readAccountManifest(directory, account);
+  const entry = own(manifest?.conversations || {}, conversationId) ? manifest.conversations[conversationId] : null;
+  if (!entry || entry.sourceCompleteness !== 'complete') return null;
+  const text = await read(directory, entry.jsonPath);
+  if (text === null || !text.trim()) return null;
+  if (await digest(text) !== entry.contentHash) fail('LOCAL_CONFLICT', '本地对话 JSON 与归档清单不一致，未用作增量基线。');
+  const payload = parse(text);
+  if (!record(payload) || (!hasTree(payload) && !Array.isArray(payload.messages)) || (payload.conversation_id ?? payload.id) !== conversationId ||
+      (payload.conversation_id && payload.id && payload.conversation_id !== payload.id)) {
+    fail('ARCHIVE_FORMAT', '本地对话 ID 与清单不一致，未用作增量基线。');
+  }
+  assertNativeNotPartial(payload);
+  return { payload, entry };
 }
 
 /** Cheap presence check for incremental scans; it does not read or hash history. */
@@ -240,7 +267,7 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
     await set(journalKey, null);
     return { ...plan.result, files: plan.files };
   }
-  async function saveUnlocked({ directory, account, detail, preferredEntry, assets }) {
+  async function saveUnlocked({ directory, account, detail, preferredEntry, assets, remoteMessageSync }) {
     const prefix = accountPrefix(account);
     if (!detail?.identity || detail.identity.accountKey !== account.accountKey) {
       fail('ACCOUNT_MISMATCH', '采集结果与任务账号不一致，未写入文件。');
@@ -257,6 +284,17 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
     assertNativeNotPartial(native);
     const id = native?.conversation_id ?? native?.id;
     const prior = manifest && own(manifest.conversations, id) ? manifest.conversations[id] : null;
+    // A selected-branch array cannot replace a previously archived message tree:
+    // it would silently erase the other branches, even with a newer timestamp.
+    if (prior && !hasTree(native) && Array.isArray(native?.messages)) {
+      const text = await read(directory, prior.jsonPath);
+      if (text !== null && text !== '') {
+        if (await digest(text) !== prior.contentHash) fail('LOCAL_CONFLICT', '已有对话 JSON 与清单不一致，未覆盖原文件。');
+        if (hasTree(parse(text))) fail('PARTIAL_DETAIL', '分页结果仅包含当前分支，不能覆盖已有消息树及历史分支。');
+      } else if (prior.messageSync?.format === 'tree' || prior.renderMode === 'current-branch') {
+        fail('PARTIAL_DETAIL', '已有归档包含消息树，需要完整消息树恢复缺失文件。');
+      }
+    }
     // A remote import with no local copy keeps the canonical original filename.
     // Existing local names stay stable, even if another machine chose a different title.
     let builderManifest = manifest;
@@ -287,6 +325,31 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
     entry.sourceUpdatedAt = updatedAt;
     entry.sourceCompleteness = detail.completeness === 'complete' || (!contentChanged && prior?.sourceCompleteness === 'complete') ? 'complete' : 'unknown';
     entry.messageCount = built.summary.messageCount;
+    const priorReceipt = !contentChanged ? sanitizeMessageSync(prior?.messageSync, native) : null;
+    let receipt = sanitizeMessageSync(remoteMessageSync ?? detail.messageSync, native);
+    if (entry.sourceCompleteness !== 'complete') receipt = null;
+    if (detail.messageSync?.mode === 'tail-merge' && !remoteMessageSync) {
+      // An earlier verified prefix cannot overwrite an archive advanced by a
+      // different writer while the network request was in flight.
+      const replayingSameTail = recovered?.entry?.conversationId === id &&
+        pending?.expected?.[pending?.result?.entry?.jsonPath] === detail.baselineContentHash &&
+        recovered.entry.contentHash === entry.contentHash && prior?.contentHash === entry.contentHash &&
+        receipt !== null && json(sanitizeMessageSync(recovered.entry.messageSync, native)) === json(receipt);
+      if (!/^[a-f0-9]{64}$/.test(detail.baselineContentHash || '') ||
+          (prior?.contentHash !== detail.baselineContentHash && !replayingSameTail)) {
+        fail('LOCAL_CONFLICT', '增量读取期间已有归档发生变化，未用旧历史覆盖新版本。');
+      }
+      const previous = sanitizeMessageSync(prior?.messageSync, native);
+      if (!receipt || (!replayingSameTail && (!previous || receipt.fullReadAt !== previous.fullReadAt ||
+          receipt.checkedAt < previous.checkedAt || receipt.incrementalRuns !== previous.incrementalRuns + 1))) {
+        fail('PARTIAL_DETAIL', '增量核对记录无效或未继承全量基线，未保存本次合成结果。');
+      }
+    }
+    // Image-only rewrites preserve a valid receipt. A changed source without a
+    // new receipt cannot inherit an unrelated previous full-history check.
+    if (priorReceipt) receipt = remoteMessageSync ? selectMessageSync(native, priorReceipt, receipt) : receipt || priorReceipt;
+    if (receipt) entry.messageSync = receipt;
+    else delete entry.messageSync;
     const manifestFile = built.files.find(file => file.path.endsWith('/archive/manifest.json'));
     manifestFile.content = json(built.manifest);
     const accountFile = built.files.find(file => file.path.endsWith('/account.json'));
@@ -382,7 +445,8 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
       assets = [...merged.values()];
     }
     if (Array.isArray(assets)) assets = assets.map(asset => reconcileAssetCapturePolicy(asset, extracted.get(asset.id)));
-    const result = await saveConversation({ directory, account, preferredEntry: entry, assets, detail: {
+    const result = await saveConversation({ directory, account, preferredEntry: entry, assets,
+      remoteMessageSync: sanitizeMessageSync(entry.messageSync, native), detail: {
       identity: { accountKey: account.accountKey, displayName: account.displayName || remoteAccount.displayName || account.alias },
       payload: native, capturedAt, completeness: entry.sourceCompleteness === 'complete' ? 'complete' : 'unknown',
     } });
@@ -390,6 +454,7 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
   }
   return {
     readAccountManifest,
+    readConversationBaseline: (directory, account, conversationId) => readConversationBaseline(directory, account, conversationId, { get }),
     saveConversation,
     applyRemoteFiles,
   };

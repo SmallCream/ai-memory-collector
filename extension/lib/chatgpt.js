@@ -15,8 +15,15 @@ export async function probeChatGPT(request) {
       fail('REQUEST', '分页位置无效或超过本次采集范围。');
     }
     if (request.kind === 'detail' && (!/^[a-zA-Z0-9_-]{1,100}$/.test(request.conversationId || '') ||
-        !['auto', 'flat', 'tree'].includes(request.format))) {
+        !['auto', 'flat', 'tree', 'page'].includes(request.format))) {
       fail('REQUEST', '对话 ID 或详情接口类型无效。');
+    }
+    if (request.before !== undefined && (request.kind !== 'detail' || request.format !== 'page' ||
+        typeof request.before !== 'string' || !/^[a-zA-Z0-9_-]{1,160}$/.test(request.before))) {
+      fail('REQUEST', '消息分页游标无效，本次未读取。');
+    }
+    if (request.requireComplete !== undefined && typeof request.requireComplete !== 'boolean') {
+      fail('REQUEST', '详情完整度检查参数无效。');
     }
     async function getJSON(path, token) {
       const controller = new AbortController();
@@ -122,6 +129,31 @@ export async function probeChatGPT(request) {
       }
       return 'complete';
     }
+    function completePage(payload) {
+      const partial = () => fail('INCOMPLETE_DETAIL', '消息页边界或内容尚未确认，原归档保持不变。');
+      const page = payload.page_info;
+      if (!record(page) || typeof page.has_previous_page !== 'boolean' || typeof page.has_next_page !== 'boolean' ||
+          (!request.before && page.has_next_page !== false) || page.has_more === true ||
+          ['is_incomplete', 'has_more', 'has_more_messages', 'has_next_page', 'has_previous_page'].some(key => payload[key] === true) ||
+          payload.messages.length > 2000) partial();
+      const ids = [];
+      const seen = new Set();
+      for (const item of payload.messages) {
+        if (!record(item)) partial();
+        const message = own(item, 'message') ? item.message : item;
+        if (!record(message) || ['in_progress', 'streaming', 'pending'].includes(message.status)) partial();
+        const id = message.id ?? item.id;
+        if (typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,160}$/.test(id) || seen.has(id)) partial();
+        ids.push(id); seen.add(id);
+      }
+      if (!ids.length) {
+        if (page.has_previous_page || page.has_next_page ||
+            [page.start_cursor, page.end_cursor].some(cursor => cursor !== undefined && cursor !== null && cursor !== '')) partial();
+      } else if (page.start_cursor !== ids[0] || page.end_cursor !== ids[ids.length - 1]) partial();
+      // This verifies only one page. The adapter must join cursor pages or a
+      // verified local prefix before describing the conversation as complete.
+      return 'page';
+    }
     const before = await session();
     const identity = { platform: 'chatgpt', accountKey: before.accountKey, displayName: before.displayName, workspace: 'unverified' };
     if (request.expectedAccountKey && before.accountKey !== request.expectedAccountKey) fail('ACCOUNT_CHANGED', '账号已改变，请重新识别；本次结果未归档。');
@@ -152,9 +184,9 @@ export async function probeChatGPT(request) {
         updateTime: typeof x.update_time === 'string' || typeof x.update_time === 'number' ? x.update_time : null })),
         offset: request.offset, nextOffset, total, coverage: '当前会话的普通列表；项目、归档、临时会话未验证' };
     } else {
-      format = request.format === 'auto' ? 'tree' : request.format;
+      format = request.format === 'auto' ? 'tree' : request.format === 'page' ? 'flat' : request.format;
       const read = async type => {
-        const suffix = type === 'flat' ? `conversations/${request.conversationId}?num_turns=100` : `conversation/${request.conversationId}`;
+        const suffix = type === 'flat' ? `conversations/${request.conversationId}?num_turns=100${request.before ? `&before=${encodeURIComponent(request.before)}` : ''}` : `conversation/${request.conversationId}`;
         const value = await getJSON(`/backend-api/${suffix}`, before.token);
         detailShape(value, type);
         return value;
@@ -166,9 +198,10 @@ export async function probeChatGPT(request) {
         format = 'flat';
         payload = await read(format);
       }
-      // Preserve the original P0 probe's explicit formats for diagnostics only.
-      // The production adapter always requests auto and enforces completeness.
-      if (request.format === 'auto') completeness = completeDetail(payload, format);
+      // Explicit legacy formats remain useful for diagnostics. Page reads never
+      // claim full history; the production adapter assembles them separately.
+      if (request.format === 'page') completeness = completePage(payload);
+      else if (request.format === 'auto' || request.requireComplete === true) completeness = completeDetail(payload, format);
     }
     const after = await session();
     if (after.accountKey !== before.accountKey) fail('ACCOUNT_CHANGED', '请求期间账号发生变化，本次结果已丢弃。');

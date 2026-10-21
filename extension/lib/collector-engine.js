@@ -4,6 +4,7 @@
  * live here: the MV3 scheduler supplies those and may stop between any two ticks.
  */
 import { createActivityLog, activityLabel } from './activity-log.js';
+import { needsMessageFullCheck } from './message-sync.js';
 const MODES = new Set(['initial', 'incremental', 'full']);
 const LIVE = new Set(['running', 'paused', 'blocked']);
 const MAX_ITEMS = 100_000;
@@ -31,6 +32,9 @@ const ERROR_MESSAGES = {
   PARTIAL_DETAIL: '详情尚未完整取得或仍在生成，已有归档保持不变。',
   INCOMPLETE_DETAIL: '详情尚未完整取得，已有归档保持不变。',
   STALE_DETAIL: '线上返回的版本较旧，未覆盖已有归档。',
+  DETAIL_CHANGED: '读取消息分页时对话发生变化，保留原归档，稍后重新读取。',
+  DETAIL_PAGINATION: '消息分页未能可靠衔接，保留原归档，等待完整读取。',
+  COLLECTION_PAUSED: '采集已暂停，原归档保持不变。',
   LOCAL_CONFLICT: '本地文件被其他程序修改，已保留原文件。',
   LOCAL_WRITE: '本地文件写入未完成，已保留恢复记录。',
   LOCAL_VERIFY: '本地文件核对未完成，已保留恢复记录。',
@@ -57,7 +61,7 @@ function safeError(error) {
 }
 
 function transient(code) {
-  return ['NETWORK', 'TIMEOUT', 'HTTP_429', 'PARTIAL_DETAIL', 'INCOMPLETE_DETAIL', 'STALE_DETAIL', 'STORAGE'].includes(code) || /^HTTP_5\d\d$/.test(code);
+  return ['NETWORK', 'TIMEOUT', 'HTTP_429', 'PARTIAL_DETAIL', 'INCOMPLETE_DETAIL', 'STALE_DETAIL', 'DETAIL_CHANGED', 'DETAIL_PAGINATION', 'STORAGE'].includes(code) || /^HTTP_5\d\d$/.test(code);
 }
 
 function blocked(code) {
@@ -93,7 +97,7 @@ function baselines(manifest, index, unfinished = []) {
     Object.defineProperty(result, id, { enumerable: true, configurable: true, writable: true,
       value: { conversationId: id, title: entry.title, contentHash: entry.contentHash, markdownHash: entry.markdownHash,
         jsonPath: entry.jsonPath, markdownPath: entry.markdownPath,
-        sourceCompleteness: entry.sourceCompleteness, sourceUpdatedAt, listUpdateTime } });
+        sourceCompleteness: entry.sourceCompleteness, sourceUpdatedAt, listUpdateTime, messageSync: COPY(entry.messageSync) } });
   }
   return result;
 }
@@ -134,7 +138,16 @@ function queueDiagnostics(queue = []) {
 function stateOf(job) {
   if (!job) return null;
   const { queue, known, manifestIds, unfinishedIds, ...state } = job;
-  return COPY({ ...state, diagnostics: queueDiagnostics(queue) });
+  return COPY({ ...state, messageProgress: messageProgress(job.messageProgress), diagnostics: queueDiagnostics(queue) });
+}
+
+function messageProgress(value) {
+  if (!value || typeof value !== 'object') return null;
+  const result = { mode: ['full', 'tail-merge'].includes(value.mode) ? value.mode : 'reading' };
+  for (const name of ['pagesRead', 'fetchedMessages', 'reusedMessages', 'addedMessages', 'updatedMessages']) {
+    if (Number.isSafeInteger(value[name]) && value[name] >= 0) result[name] = value[name];
+  }
+  return result;
 }
 
 function counts(job) {
@@ -152,7 +165,8 @@ function counts(job) {
 /** Dependencies deliberately accept promises so IndexedDB and real file handles
  * can be replaced by in-memory stores in deterministic restart/failure tests. */
 export function createCollectorEngine({ getSetting, setSetting, getDirectory, readAccountManifest,
-  hasConversationFiles = async () => false, adapter, saveConversation, now = Date.now, onChange = () => {},
+  hasConversationFiles = async () => false, readConversationBaseline = async () => null,
+  adapter, saveConversation, now = Date.now, onChange = () => {},
   makeId = () => crypto.randomUUID() } = {}) {
   for (const dependency of [getSetting, setSetting, getDirectory, readAccountManifest, saveConversation]) {
     if (typeof dependency !== 'function') throw new TypeError('Missing collector engine dependency');
@@ -161,6 +175,7 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
     throw new TypeError('Missing platform adapter');
   }
   const locks = new Map();
+  const pauseRequests = new Set();
   const activity = createActivityLog({ getSetting, setSetting, now });
 
   function locked(accountKey, operation) {
@@ -202,6 +217,7 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
   }
 
   async function createJob(account, tabId, mode, previousJob = null) {
+    pauseRequests.delete(account.accountKey);
     const directory = await directoryFor(account);
     await verify(account, tabId);
     const manifest = await readAccountManifest(directory, account);
@@ -233,7 +249,7 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
     const known = job.known[item.id];
     // Old persisted jobs have no complete baseline. Continue their original
     // pending queue safely; the next newly started scan uses the new policy.
-    if (known.sourceCompleteness !== 'complete' ||
+    if (needsMessageFullCheck(known, now()) || known.sourceCompleteness !== 'complete' ||
         (known.listUpdateTime !== item.listUpdateTime && known.sourceUpdatedAt !== item.listUpdateTime) ||
         (typeof known.title === 'string' && known.title.slice(0, 200) !== item.title)) return false;
     return hasConversationFiles(directory, account, known);
@@ -279,6 +295,10 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
 
   async function handleError(job, error, item = null) {
     const info = safeError(error);
+    if (info.code === 'COLLECTION_PAUSED') {
+      job.status = 'paused'; job.error = null;
+      return publish(job);
+    }
     job.error = info;
     if (blocked(info.code)) {
       job.status = info.code === 'ACCOUNT_CHANGED' ? 'paused' : 'blocked';
@@ -402,21 +422,35 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
 
   async function detailStep(job, account, tabId, directory, item) {
     const info = { title: item.title, conversationId: item.id, completed: job.processed, total: job.discovered };
+    job.messageProgress = null;
+    await publish(job);
     const detail = await activity.run(account.accountKey, 'collection', { ...info, stage: 'detail' }, async () => {
-      const result = await adapter.detail(tabId, { accountKey: account.accountKey, conversationId: item.id });
+      const baseline = await readConversationBaseline(directory, account, item.id);
+      const result = await adapter.detail(tabId, { accountKey: account.accountKey, conversationId: item.id,
+        baseline, forceFull: job.mode === 'full' || needsMessageFullCheck(baseline?.entry, now()),
+        shouldPause: () => pauseRequests.has(account.accountKey),
+        onProgress: async progress => {
+          // Page receipt is a real progress event, not a heartbeat. Failure to
+          // persist display-only progress must not discard a valid capture.
+          job.messageProgress = messageProgress(progress);
+          try { await publish(job); } catch { /* Final write still requires its durable checkpoint. */ }
+        } });
       if (result?.identity?.accountKey !== account.accountKey) throw fail('ACCOUNT_CHANGED');
       if (result.completeness === 'partial') throw fail('PARTIAL_DETAIL');
       const conversationId = result.payload?.conversation_id ?? result.payload?.id;
       if (conversationId !== item.id) throw fail('FORMAT');
       const sourceUpdatedAt = timestamp(result.payload?.update_time);
       if (item.listUpdateTime !== null && sourceUpdatedAt !== null && sourceUpdatedAt < item.listUpdateTime) throw fail('STALE_DETAIL');
+      job.messageProgress = messageProgress(result.messageSync);
       return result;
     });
     // The adapter verifies before/after its network request. Recheck just before
     // handing off to the file writer so switching while the detail resolves does
     // not silently relabel another account's response.
     await verify(account, tabId);
+    if (pauseRequests.has(account.accountKey)) throw fail('COLLECTION_PAUSED');
     return activity.run(account.accountKey, 'collection', { ...info, stage: 'save' }, async () => {
+      if (pauseRequests.has(account.accountKey)) throw fail('COLLECTION_PAUSED');
       const saved = await saveConversation({ directory, account, detail, tabId });
       if (!saved || !['added', 'updated', 'unchanged'].includes(saved.status) || !Array.isArray(saved.files)) throw fail('STORAGE');
       if (saved.recovered?.files && saved.recovered.entry?.conversationId) {
@@ -458,6 +492,7 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
       return locked(account.accountKey, async () => {
         const job = await load(account);
         if (!job || job.status !== 'running') return stateOf(job);
+        if (pauseRequests.has(account.accountKey)) return handleError(job, fail('COLLECTION_PAUSED'));
         if (job.listRetryAt && job.listRetryAt > now()) return stateOf(job);
         if (job.phase === 'details' && !job.queue.some(entry => entry.status === 'pending' || entry.status === 'retry' && entry.nextRetryAt <= now()) &&
             job.queue.some(entry => entry.status === 'retry')) return stateOf(job);
@@ -482,6 +517,9 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
       });
     },
     pause(accountKey) {
+      // Signal an in-flight paged detail before waiting for its durable job lock.
+      // Once a file write has begun, let its archive/outbox checkpoint finish.
+      pauseRequests.add(accountKey);
       return locked(accountKey, async () => {
         const job = await getSetting(keys(accountKey).job);
         if (!job || !LIVE.has(job.status)) return stateOf(job);
@@ -491,6 +529,7 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
     resume({ account, tabId }) {
       validateAccount(account); validateTab(tabId);
       return locked(account.accountKey, async () => {
+        pauseRequests.delete(account.accountKey);
         const job = await load(account);
         if (!job) return createJob(account, tabId, account.initialized ? 'incremental' : 'initial');
         try { await directoryFor(account); await verify(account, tabId); }

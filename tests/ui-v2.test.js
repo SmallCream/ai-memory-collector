@@ -495,6 +495,19 @@ test('collection details show real current work, retry queue and recent steps wh
   assert.equal(app.elements.get('collection-queue').scrollTop, 72);
 });
 
+test('message progress distinguishes downloaded pages from locally reused history', async () => {
+  const state = initialState();
+  state.job = { status: 'running', phase: 'details', messageProgress: {
+    mode: 'tail-merge', pagesRead: 1, fetchedMessages: 5, reusedMessages: 100, addedMessages: 2, updatedMessages: 0,
+  } };
+  const app = await setup({ state });
+  assert.equal(app.elements.get('collection-message-progress').hidden, false);
+  assert.match(app.elements.get('collection-message-progress').textContent, /尾部增量（较早历史未重新核对）/);
+  assert.match(app.elements.get('collection-message-progress').textContent, /接收 5 条消息 · 复用 100 条历史消息/);
+  state.job.messageProgress = null; app.setState(state); await app.poll();
+  assert.equal(app.elements.get('collection-message-progress').hidden, true);
+});
+
 test('retry waiting and paused jobs never infer stalled work from an old completed step', async () => {
   const state = initialState(); state.job = { status: 'running', nextRetryAt: Date.now() + 600_000, discovered: 1, processed: 0 };
   state.activity = { collection: { current: logItem({ status: 'failed', code: 'HTTP_429', finishedAt: Date.now() - 90_000 }) } };

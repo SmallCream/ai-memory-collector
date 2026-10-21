@@ -81,6 +81,51 @@ async function complete(f) {
   throw new Error('Job did not complete');
 }
 
+test('pause reaches an in-flight detail between pages without waiting for the filesystem lock; resume retries it', async () => {
+  const f = fixture(), started = deferred(), page = deferred();
+  const original = f.dependencies.adapter.detail;
+  let checkPause, nextPages = 0;
+  f.dependencies.adapter.detail = async (tabId, request) => {
+    checkPause = request.shouldPause; started.resolve(); await page.promise;
+    if (request.shouldPause()) throw issue('COLLECTION_PAUSED');
+    nextPages++; return original(tabId, request);
+  };
+  await f.service.pump(); await f.service.pump();
+  const pumping = f.service.pump(); await started.promise;
+  const pausing = f.service.command({ type: 'collector:pause' }, 1);
+  for (let n = 0; n < 20 && !checkPause(); n++) await turn();
+  const signalled = checkPause();
+  page.resolve(); await Promise.all([pumping, pausing]);
+  assert.equal(signalled, true); assert.equal(nextPages, 0);
+  assert.equal(f.calls.saves.length, 0); assert.equal(f.root.entries.size, 0);
+  assert.equal((await f.service.engine.getOutbox(accountKey)).length, 0);
+  const paused = await f.service.engine.getState(accountKey);
+  assert.equal(paused.status, 'paused'); assert.equal(paused.failed, 0);
+  assert.equal(paused.diagnostics.items[0].attempt, 0);
+  await f.service.command({ type: 'collector:resume' }, 1);
+  assert.equal((await complete(f)).status, 'completed');
+  assert.equal(nextPages, 1); assert.equal(f.calls.saves.length, 1);
+});
+
+test('pause after detail resolution is checked again before any archive write', async () => {
+  const f = fixture(), verified = deferred(), release = deferred();
+  const originalIdentify = f.dependencies.adapter.identify;
+  const originalDetail = f.dependencies.adapter.detail;
+  let detailReturned = false;
+  f.dependencies.adapter.detail = async (...args) => { const result = await originalDetail(...args); detailReturned = true; return result; };
+  f.dependencies.adapter.identify = async (...args) => {
+    if (detailReturned) { verified.resolve(); await release.promise; }
+    return originalIdentify(...args);
+  };
+  await f.service.pump(); await f.service.pump();
+  const pumping = f.service.pump(); await verified.promise;
+  const pausing = f.service.engine.pause(accountKey);
+  release.resolve(); await Promise.all([pumping, pausing]);
+  assert.equal(f.calls.saves.length, 0);
+  assert.equal((await f.service.engine.getOutbox(accountKey)).length, 0);
+  assert.equal((await f.service.engine.getState(accountKey)).status, 'paused');
+});
+
 test('get-state shows actual GitHub request progress while the writer owns the command lock', async () => {
   const gate = deferred();
   const f = fixture({ syncGate: gate, github: { enabled: true, token: 'private-token', repository: 'owner/private' } });

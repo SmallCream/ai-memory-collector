@@ -1,7 +1,7 @@
 import { getSetting, setSetting } from './lib/storage.js';
 import { getAdapter } from './adapters/index.js';
 import { createCollectorEngine } from './lib/collector-engine.js';
-import { readAccountManifest, hasConversationFiles, saveConversation, applyRemoteFiles } from './lib/archive-store.js';
+import { readAccountManifest, hasConversationFiles, readConversationBaseline, saveConversation, applyRemoteFiles } from './lib/archive-store.js';
 import { syncArchives } from './lib/github-sync.js';
 import { probeRepository } from './lib/github.js';
 import { createCollectorService, ALARM_NAME } from './lib/collector-service.js';
@@ -24,7 +24,7 @@ const restore = createRestoreService({ getSetting, setSetting, fetchRepositorySn
   enqueueRecovered: ({ account, archive }) => service.engine.enqueueArchive({ account: { ...account, enabled: true }, archive }) });
 const service = createCollectorService({ browser: chrome, getSetting, setSetting,
   adapter, createEngine: createCollectorEngine,
-  readAccountManifest, hasConversationFiles, saveConversation: assets.save, applyRemoteFiles, syncArchives, probeRepository,
+  readAccountManifest, hasConversationFiles, readConversationBaseline, saveConversation: assets.save, applyRemoteFiles, syncArchives, probeRepository,
   assetService: assets, restoreService: restore });
 const extensionURL = new URL(chrome.runtime.getURL('/'));
 const ignore = promise => Promise.resolve(promise).catch(() => {});

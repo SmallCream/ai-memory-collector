@@ -1,4 +1,5 @@
 import { probeChatGPT } from '../lib/chatgpt.js';
+import { collectMessagePages, fullMessageSync } from '../lib/message-sync.js';
 
 export class AdapterError extends Error {
   constructor(code, message) { super(message); this.name = 'AdapterError'; this.code = code; }
@@ -15,7 +16,7 @@ function validIdentity(value) {
 }
 
 /** Injectable Chrome dependency supports tests without a live logged-in account. */
-export function createChatGPTAdapter(browser) {
+export function createChatGPTAdapter(browser, { now = Date.now } = {}) {
   async function run(tabId, request) {
     const api = browser ?? globalThis.chrome;
     if (!Number.isSafeInteger(tabId) || tabId < 0) throw new AdapterError('TAB_REQUIRED', '请打开已登录的 ChatGPT 标签页。');
@@ -62,11 +63,58 @@ export function createChatGPTAdapter(browser) {
       const result = await run(tabId, { kind: 'list', expectedAccountKey: accountKey, offset });
       return result.payload;
     },
-    async detail(tabId, { accountKey, conversationId } = {}) {
-      const result = await run(tabId, { kind: 'detail', expectedAccountKey: accountKey, conversationId, format: 'auto' });
-      if (result.completeness !== 'complete') throw new AdapterError('INCOMPLETE_DETAIL', '详情完整度未确认，原归档保持不变。');
-      return { payload: result.payload, capturedAt: result.capturedAt, identity: result.identity,
-        completeness: result.completeness, sourceFormat: result.sourceFormat, coverage: result.coverage };
+    async detail(tabId, { accountKey, conversationId, baseline = null, forceFull = false, onProgress, shouldPause = () => false } = {}) {
+      const request = { kind: 'detail', expectedAccountKey: accountKey, conversationId };
+      const checkPaused = () => {
+        if (shouldPause()) throw new AdapterError('COLLECTION_PAUSED', '采集已暂停，原归档保持不变。');
+      };
+      const readDetail = async extra => {
+        checkPaused();
+        try { return await run(tabId, { ...request, ...extra }); }
+        finally { checkPaused(); }
+      };
+      const treeBaseline = baseline?.payload?.mapping && Object.keys(baseline.payload.mapping).length > 0;
+      const flatBaseline = !treeBaseline && Array.isArray(baseline?.payload?.messages);
+      const tree = async () => {
+        const result = await readDetail({ format: 'tree', requireComplete: true });
+        if (result.completeness !== 'complete') throw new AdapterError('INCOMPLETE_DETAIL', '详情完整度未确认，原归档保持不变。');
+        if (!result.payload?.mapping || !Object.keys(result.payload.mapping).length) throw new AdapterError('FORMAT', '消息树结构无法确认，原归档保持不变。');
+        const messageSync = fullMessageSync(result.payload, baseline, now());
+        try { await onProgress?.({ pagesRead: 1, fetchedMessages: messageSync.fetchedMessages, reusedMessages: 0, mode: 'full' }); }
+        catch { /* Diagnostic updates are not capture acknowledgements. */ }
+        return { payload: result.payload, capturedAt: result.capturedAt, identity: result.identity,
+          completeness: 'complete', sourceFormat: result.sourceFormat, coverage: result.coverage, messageSync };
+      };
+      const flat = async () => {
+        let latest;
+        const captured = await collectMessagePages({ conversationId, baseline, forceFull, now: now(), onProgress,
+          readPage: async before => {
+            const result = await readDetail({ format: 'page', ...(before ? { before } : {}) });
+            if (result.completeness !== 'page') throw new AdapterError('INCOMPLETE_DETAIL', '分页结构完整度未确认，原归档保持不变。');
+            if (!before) latest = result;
+            return result.payload;
+          } });
+        return { ...captured, ...(captured.messageSync.mode === 'tail-merge' ? { baselineContentHash: baseline.entry.contentHash } : {}),
+          capturedAt: latest.capturedAt, identity: latest.identity, completeness: 'complete',
+          sourceFormat: latest.sourceFormat,
+          coverage: captured.messageSync.mode === 'tail-merge'
+            ? '当前分支尾部已核对；较早消息复用本地归档，未重新读取全部历史。'
+            : '已沿消息游标取得当前分支；其他分支覆盖范围未验证。' };
+      };
+      // A current-branch array cannot replace a tree containing abandoned branches.
+      if (treeBaseline) return tree();
+      if (!flatBaseline) {
+        try { return await tree(); }
+        catch (error) {
+          if (!['HTTP_404', 'FORMAT'].includes(error.code)) throw error;
+          return flat();
+        }
+      }
+      try { return await flat(); }
+      catch (error) {
+        if (!['HTTP_404', 'FORMAT', 'INCOMPLETE_DETAIL', 'DETAIL_PAGINATION', 'DETAIL_CHANGED'].includes(error.code)) throw error;
+        return tree();
+      }
     },
   });
 }

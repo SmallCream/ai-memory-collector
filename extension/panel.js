@@ -240,6 +240,9 @@ function renderDetailedProgress() {
   if (job?.status === 'running' && !liveCollection && Number(job?.nextRetryAt) > Date.now()) text('collection-details-status', '等待重试');
   text('collection-wait', collectionWait);
   text('collection-detail-counts', job ? `已发现 ${count(job.discovered)} 条 · 已处理 ${count(job.processed)} 条 · 未变化已跳过 ${count(diagnostics.skipped ?? job.skipped)} 条 · 待处理 ${count(diagnostics.remaining ?? Math.max(0, (job.discovered || 0) - (job.processed || 0)))} 条 · 失败／重试 ${count(diagnostics.failed !== undefined ? Number(diagnostics.failed) + Number(diagnostics.retrying || 0) : job.failed)} 条${job.pages ? ` · 已读 ${count(job.pages)} 页列表` : ''}` : '');
+  const messages = job?.messageProgress;
+  show('collection-message-progress', Boolean(messages));
+  text('collection-message-progress', messages ? `本条详情：${messages.mode === 'tail-merge' ? '尾部增量（较早历史未重新核对）' : messages.mode === 'full' ? '完整详情读取' : '正在分页读取'} · 已读 ${count(messages.pagesRead)} 页 · 接收 ${count(messages.fetchedMessages)} 条消息 · 复用 ${count(messages.reusedMessages)} 条历史消息${Number.isSafeInteger(messages.addedMessages) ? ` · 新发现 ${count(messages.addedMessages)} 条 · 修改 ${count(messages.updatedMessages)} 条` : ''}` : '');
   renderActivityCards('collection-current', [['采集', collection]]);
   renderTaskList('collection-queue', 'collection-queue-note', diagnostics.items, diagnostics.total,
     job?.phase === 'list' ? '正在获取列表，发现对话后显示队列。' : '暂无对话队列记录。');

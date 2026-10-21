@@ -6,7 +6,7 @@ const SCRIPT_ID = 'collector-chatgpt-entry';
 const matches = value => { try { return new URL(value).origin === 'https://chatgpt.com'; } catch { return false; } };
 
 export function createCollectorService({ browser, getSetting, setSetting, adapter, createEngine,
-  readAccountManifest, hasConversationFiles, saveConversation, applyRemoteFiles, syncArchives, probeRepository,
+  readAccountManifest, hasConversationFiles, readConversationBaseline, saveConversation, applyRemoteFiles, syncArchives, probeRepository,
   assetService, restoreService,
   now = Date.now, later = setTimeout }) {
   const settings = createConfigStore({ getSetting, setSetting });
@@ -23,7 +23,7 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
     return result;
   }
   const engine = createEngine({ getSetting, setSetting, getDirectory: () => getSetting('directory'),
-    readAccountManifest, hasConversationFiles, adapter, saveConversation, now });
+    readAccountManifest, hasConversationFiles, readConversationBaseline, adapter, saveConversation, now });
 
   async function directoryState() {
     const directory = await getSetting('directory');
@@ -429,7 +429,9 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
     return { ok: true, state: await state(tabId) };
   }
   function command(message, tabId) {
-    if (message.type === 'collector:get-state') return executeCommand(message, tabId);
+    // Pause signals the current page reader without waiting for the filesystem
+    // owner. Its durable job update still uses the engine's per-account lock.
+    if (['collector:get-state', 'collector:pause'].includes(message.type)) return executeCommand(message, tabId);
     return exclusive(() => executeCommand(message, tabId));
   }
   return { initialize, command, state, pump, enableTab, identify, engine,

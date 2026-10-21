@@ -22,10 +22,11 @@ test('registry supports only packaged ChatGPT adapter and exact HTTPS origin', (
   }
   assert.throws(() => getAdapter('gemini'), { code: 'UNSUPPORTED_PLATFORM' });
 });
-test('adapter targets only main frame in isolated world and requests auto detail', async () => {
-  const { adapter, calls } = fixture({ ok: true, identity, payload: { conversation_id: 'demo' }, completeness: 'complete', capturedAt: '2026-10-21T00:00:00Z' });
+test('adapter targets only main frame in isolated world and requests a complete tree detail', async () => {
+  const { adapter, calls } = fixture({ ok: true, identity, payload: { conversation_id: 'demo', mapping: { root: { message: null } } }, completeness: 'complete', capturedAt: '2026-10-21T00:00:00Z' });
   const result = await adapter.detail(12, { accountKey: identity.accountKey, conversationId: 'demo' });
-  assert.equal(calls[0].args[0].format, 'auto');
+  assert.equal(calls[0].args[0].format, 'tree');
+  assert.equal(calls[0].args[0].requireComplete, true);
   assert.equal(calls[0].world, 'ISOLATED');
   assert.deepEqual(calls[0].target, { tabId: 12, frameIds: [0] });
   assert.equal(result.completeness, 'complete');

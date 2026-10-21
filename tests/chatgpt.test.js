@@ -213,3 +213,129 @@ test('empty complete list and exact full final page terminate pagination honestl
     assert.equal(result.payload.nextOffset, null);
   }
 });
+
+const pageRequest = { kind: 'detail', format: 'page', conversationId: 'demo', expectedAccountKey: expectedKey };
+function messagePage(ids = ['message-a', 'message-b'], flags = {}) {
+  return { conversation_id: 'demo', title: 'Synthetic page', update_time: 1792569600,
+    messages: ids.map(id => ({ id, author: { role: 'user' }, content: { content_type: 'text', parts: [`Text ${id}`] },
+      status: 'finished_successfully' })),
+    page_info: { start_cursor: ids[0] ?? null, end_cursor: ids.at(-1) ?? null,
+      has_previous_page: true, has_next_page: false, ...flags } };
+}
+
+test('serialized page probe reads latest and older cursor pages without claiming full history', async () => {
+  for (const before of [undefined, 'message-after_123']) {
+    const payload = messagePage(['message-a', 'message-b'], { has_next_page: before !== undefined });
+    const { run, calls } = setup([session(), payload, session()]);
+    const result = await run({ ...pageRequest, ...(before ? { before } : {}) });
+    assert.equal(result.ok, true);
+    assert.equal(result.detailFormat, 'flat');
+    assert.equal(result.completeness, 'page');
+    assert.equal(result.payload.page_info.has_previous_page, true);
+    assert.equal(result.payload.messages.length, 2);
+    assert.equal(calls[1].path, `/backend-api/conversations/demo?num_turns=100${before ? `&before=${before}` : ''}`);
+    assert.equal(calls.length, 3);
+    assert.equal(calls[1].options.credentials, 'include');
+    assert.equal(calls[1].options.redirect, 'error');
+    assert.ok(!JSON.stringify(result).includes('synthetic-bearer-secret'));
+  }
+});
+
+test('message cursor input is bounded and cannot become an arbitrary path or query', async () => {
+  for (const before of [null, '', '../other', 'message&num_turns=999', 'message?x=1', 'message%2Fother',
+    'https://example.test', 'a'.repeat(161), 1, {}, ['message']]) {
+    const { run, calls } = setup([]);
+    const result = await run({ ...pageRequest, before });
+    assert.equal(result.error.code, 'REQUEST');
+    assert.equal(calls.length, 0);
+  }
+  for (const format of ['auto', 'flat', 'tree']) {
+    const { run, calls } = setup([]);
+    assert.equal((await run({ ...pageRequest, format, before: 'message-a' })).error.code, 'REQUEST');
+    assert.equal(calls.length, 0);
+  }
+});
+
+test('page probe requires explicit direction flags and coherent boundary IDs', async t => {
+  const changes = {
+    'missing page information': value => { delete value.page_info; },
+    'missing older flag': value => { delete value.page_info.has_previous_page; },
+    'missing newer flag': value => { delete value.page_info.has_next_page; },
+    'nonboolean older flag': value => { value.page_info.has_previous_page = 'true'; },
+    'nonboolean newer flag': value => { value.page_info.has_next_page = 0; },
+    'latest page has newer content': value => { value.page_info.has_next_page = true; },
+    'missing first cursor': value => { delete value.page_info.start_cursor; },
+    'missing last cursor': value => { delete value.page_info.end_cursor; },
+    'first cursor does not match': value => { value.page_info.start_cursor = 'elsewhere'; },
+    'last cursor does not match': value => { value.page_info.end_cursor = 'elsewhere'; },
+    'duplicate message ID': value => { value.messages[1].id = value.messages[0].id; value.page_info.end_cursor = value.messages[0].id; },
+    'missing stable ID': value => { delete value.messages[0].id; },
+    'unsafe stable ID': value => { value.messages[0].id = '../outside'; value.page_info.start_cursor = '../outside'; },
+    'null message': value => { value.messages[0] = { id: 'message-a', message: null }; },
+    'malformed message': value => { value.messages[0] = 'not a message'; },
+    'page has ambiguous more flag': value => { value.page_info.has_more = true; },
+    'top level incomplete': value => { value.is_incomplete = true; },
+    'top level extra content': value => { value.has_more_messages = true; },
+  };
+  for (const [name, mutate] of Object.entries(changes)) await t.test(name, async () => {
+    const payload = messagePage(); mutate(payload);
+    const { run, calls } = setup([session(), payload]);
+    const result = await run(pageRequest);
+    assert.equal(result.error.code, 'INCOMPLETE_DETAIL');
+    assert.equal(result.payload, undefined);
+    assert.equal(calls.length, 2, 'malformed pages never trigger another endpoint');
+  });
+});
+
+test('page probe accepts wrapped stable messages and rejects all known generation states', async () => {
+  const payload = messagePage();
+  payload.messages = payload.messages.map(message => ({ message, id: `node-${message.id}` }));
+  const accepted = setup([session(), payload, session()]);
+  assert.equal((await accepted.run(pageRequest)).completeness, 'page');
+  for (const status of ['pending', 'streaming', 'in_progress']) {
+    const unfinished = messagePage(); unfinished.messages[1].status = status;
+    const { run } = setup([session(), unfinished]);
+    assert.equal((await run(pageRequest)).error.code, 'INCOMPLETE_DETAIL');
+  }
+});
+
+test('page probe accepts only explicitly empty history and bounds page cardinality', async () => {
+  const empty = messagePage([], { has_previous_page: false, has_next_page: false });
+  const accepted = setup([session(), empty, session()]);
+  const result = await accepted.run(pageRequest);
+  assert.equal(result.ok, true); assert.equal(result.completeness, 'page');
+  for (const flags of [{ has_previous_page: true }, { has_next_page: true }, { start_cursor: 'missing' }, { end_cursor: 'missing' }]) {
+    const payload = messagePage([], { has_previous_page: false, has_next_page: false, ...flags });
+    const { run } = setup([session(), payload]);
+    assert.equal((await run(pageRequest)).error.code, 'INCOMPLETE_DETAIL');
+  }
+  const huge = messagePage(Array.from({ length: 2001 }, (_, i) => `message-${i}`));
+  const { run } = setup([session(), huge]);
+  assert.equal((await run(pageRequest)).error.code, 'INCOMPLETE_DETAIL');
+});
+
+test('page identity changes discard source content before and after the network read', async () => {
+  const before = setup([session('changed')]);
+  assert.equal((await before.run(pageRequest)).error.code, 'ACCOUNT_CHANGED');
+  assert.equal(before.calls.length, 1);
+  const after = setup([session(), messagePage(), session('changed')]);
+  const result = await after.run(pageRequest);
+  assert.equal(result.error.code, 'ACCOUNT_CHANGED');
+  assert.equal(result.payload, undefined);
+  assert.ok(!JSON.stringify(result).includes('Text message-a'));
+});
+
+test('explicit complete tree mode validates the whole tree without flat fallback', async () => {
+  const request = { ...autoRequest, format: 'tree', requireComplete: true };
+  const accepted = setup([session(), completeTree(), session()]);
+  assert.equal((await accepted.run(request)).completeness, 'complete');
+  const partial = completeTree(); partial.mapping.a.message.status = 'in_progress';
+  const rejected = setup([session(), partial]);
+  assert.equal((await rejected.run(request)).error.code, 'INCOMPLETE_DETAIL');
+  assert.equal(rejected.calls.length, 2);
+  const absent = setup([session(), new Response('', { status: 404 })]);
+  assert.equal((await absent.run(request)).error.code, 'HTTP_404');
+  assert.equal(absent.calls.length, 2);
+  const diagnostic = setup([session(), partial, session()]);
+  assert.equal((await diagnostic.run({ ...request, requireComplete: false })).completeness, 'unknown');
+});
