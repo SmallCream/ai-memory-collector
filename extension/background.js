@@ -6,10 +6,24 @@ import { syncArchives } from './lib/github-sync.js';
 import { probeRepository } from './lib/github.js';
 import { createCollectorService, ALARM_NAME } from './lib/collector-service.js';
 import { safeError } from './lib/config.js';
+import { createAssetService } from './lib/asset-service.js';
+import { createChatGPTAssetResolver } from './lib/chatgpt-assets.js';
+import { createRestoreService } from './lib/restore-service.js';
+import { fetchRepositorySnapshot, downloadRepositoryFile } from './lib/github-restore.js';
 
+const resolver = createChatGPTAssetResolver(chrome, { allowLibraryDownload: true });
+const assets = createAssetService({ getSetting, setSetting, readAccountManifest, saveConversation,
+  resolveAsset: resolver.resolve, downloadRepositoryFile,
+  enqueueArchive: input => service.engine.enqueueArchive(input) });
+const restore = createRestoreService({ getSetting, setSetting, fetchRepositorySnapshot, downloadRepositoryFile,
+  applyRemoteFiles, readLocalManifest: readAccountManifest, hydrateAssets: assets.hydrateAssets,
+  // Replayed local capture journals already carry authorized account ownership.
+  // Queue them without creating a binding; only enabled configured accounts upload.
+  enqueueRecovered: ({ account, archive }) => service.engine.enqueueArchive({ account: { ...account, enabled: true }, archive }) });
 const service = createCollectorService({ browser: chrome, getSetting, setSetting,
   adapter: getAdapter('chatgpt'), createEngine: createCollectorEngine,
-  readAccountManifest, saveConversation, applyRemoteFiles, syncArchives, probeRepository });
+  readAccountManifest, saveConversation: assets.save, applyRemoteFiles, syncArchives, probeRepository,
+  assetService: assets, restoreService: restore });
 const extensionURL = new URL(chrome.runtime.getURL('/'));
 const ignore = promise => Promise.resolve(promise).catch(() => {});
 const trustedUI = sender => {

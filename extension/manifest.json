@@ -1,17 +1,22 @@
 {
   "manifest_version": 3,
   "name": "AI Memory Collector",
-  "version": "0.2.0",
-  "description": "自动识别 ChatGPT 账号，初始化与定时采集对话，保存 JSON、Markdown 并同步到私有 GitHub。",
+  "version": "0.3.0",
+  "description": "按账号采集 ChatGPT 对话与图片，保存 JSON、Markdown，同步到私有 GitHub 并恢复本地备份。",
   "minimum_chrome_version": "120",
   "permissions": ["scripting", "sidePanel", "alarms", "activeTab"],
-  "optional_host_permissions": ["https://chatgpt.com/*", "https://api.github.com/*"],
+  "optional_host_permissions": [
+    "https://chatgpt.com/*", "https://api.github.com/*", "https://github.com/*",
+    "https://lfs.github.com/*", "https://github-cloud.githubusercontent.com/*",
+    "https://objects.githubusercontent.com/*", "https://media.githubusercontent.com/*",
+    "https://github-cloud.s3.amazonaws.com/*", "https://*.oaiusercontent.com/*", "https://*/*"
+  ],
   "background": { "service_worker": "background.js", "type": "module" },
   "action": { "default_title": "打开 AI Memory Collector" },
   "side_panel": { "default_path": "panel.html" },
   "options_ui": { "page": "panel.html", "open_in_tab": true },
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; connect-src https://api.github.com"
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; connect-src https:"
   }
 }
 

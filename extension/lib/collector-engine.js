@@ -333,7 +333,7 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
     // handing off to the file writer so switching while the detail resolves does
     // not silently relabel another account's response.
     await verify(account, tabId);
-    const saved = await saveConversation({ directory, account, detail });
+    const saved = await saveConversation({ directory, account, detail, tabId });
     if (!saved || !['added', 'updated', 'unchanged'].includes(saved.status) || !Array.isArray(saved.files)) throw fail('STORAGE');
     if (saved.recovered?.files && saved.recovered.entry?.conversationId) {
       await appendOutbox(account, { id: saved.recovered.entry.conversationId }, saved.recovered.files);
@@ -450,6 +450,13 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
       return locked(account.accountKey, async () => {
         const id = archive?.entry?.conversationId;
         if (!id || !Array.isArray(archive?.files)) throw fail('STORAGE');
+        // Recovery deliveries can outlive another successful capture/restore.
+        // Do not let an old derivative replace the newer queued snapshot for
+        // this conversation. The writer of the current manifest owns its receipt.
+        const directory = await directoryFor(account);
+        const current = (await readAccountManifest(directory, account))?.conversations?.[id];
+        if (current && ((current.contentHash && archive.entry.contentHash && current.contentHash !== archive.entry.contentHash) ||
+            (current.markdownHash && archive.entry.markdownHash && current.markdownHash !== archive.entry.markdownHash))) return;
         await appendOutbox(account, { id }, archive.files);
       });
     },

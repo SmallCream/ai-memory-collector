@@ -2,13 +2,13 @@ const CONFIG_KEY = 'collectorConfigV2';
 export const INTERVALS = [15, 30, 60];
 export const DEFAULT_CONFIG = Object.freeze({ schemaVersion: 2, setupComplete: false,
   autoEnabled: true, intervalMinutes: 30, accounts: {},
-  github: { enabled: false, repository: '', branch: '', token: '' } });
+  github: { enabled: false, repository: '', branch: '', token: '', lfsEnabled: true } });
 
 export function publicConfig(config) {
   return { setupComplete: config.setupComplete, autoEnabled: config.autoEnabled,
     intervalMinutes: config.intervalMinutes, github: {
       enabled: config.github.enabled, repository: config.github.repository,
-      branch: config.github.branch, hasToken: Boolean(config.github.token),
+      branch: config.github.branch, hasToken: Boolean(config.github.token), lfsEnabled: config.github.lfsEnabled !== false,
     } };
 }
 
@@ -16,7 +16,10 @@ export function createConfigStore({ getSetting, setSetting }) {
   let queue = Promise.resolve();
   async function read() {
     const saved = await getSetting(CONFIG_KEY);
-    if (saved?.schemaVersion === 2) return saved;
+    if (saved?.schemaVersion === 2) return {
+      ...structuredClone(DEFAULT_CONFIG), ...saved,
+      github: { ...DEFAULT_CONFIG.github, ...saved.github },
+    };
     const previous = await getSetting('formPreferences') || await getSetting('githubTarget') || {};
     const config = structuredClone(DEFAULT_CONFIG);
     // Keep the same IndexedDB origin/name and directory handle. Migration never

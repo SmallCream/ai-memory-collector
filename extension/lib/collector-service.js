@@ -6,6 +6,7 @@ const matches = value => { try { return new URL(value).origin === 'https://chatg
 
 export function createCollectorService({ browser, getSetting, setSetting, adapter, createEngine,
   readAccountManifest, saveConversation, applyRemoteFiles, syncArchives, probeRepository,
+  assetService, restoreService,
   now = Date.now, later = setTimeout }) {
   const settings = createConfigStore({ getSetting, setSetting });
   const identities = new Map(), syncLocks = new Map();
@@ -71,6 +72,8 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
       lastResult: account?.lastResult || null,
       nextRunAt: config.autoEnabled && account?.enabled ? account.nextRunAt || now() : null,
       githubStatus: account ? await getSetting(`githubStatus:${account.accountKey}`) || { status: 'idle' } : { status: 'idle' },
+      assetStatus: account ? await getSetting(`assetStatus:${account.accountKey}`) || null : null,
+      restoreStatus: restoreService ? await restoreService.state() : null,
       legacyPending: Boolean(await getSetting('pendingArchive')), error, tabId: current?.tab.id ?? null };
   }
   async function bind(alias, tabId) {
@@ -130,7 +133,8 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
       const repository = String(message.repository ?? previous.repository).trim().replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, '').replace(/\/$/, '');
       if (repository && !/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository)) throw collectorError('INVALID_REPOSITORY', '请输入 owner/repository 格式的仓库。');
       const token = typeof message.token === 'string' ? message.token.trim() : previous.token;
-      config.github = { repository, branch: String(message.branch ?? previous.branch).trim(), token,
+      config.github = { ...previous, repository, branch: String(message.branch ?? previous.branch).trim(), token,
+        lfsEnabled: typeof message.lfsEnabled === 'boolean' ? message.lfsEnabled : previous.lfsEnabled !== false,
         enabled: typeof message.enabled === 'boolean' ? message.enabled : previous.enabled };
       if (config.github.enabled && (!repository || !token)) throw collectorError('GITHUB_CONFIG', '启用 GitHub 同步需要仓库和 Token。');
       return config;
@@ -138,6 +142,10 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
     const after = await settings.read();
     if (before.github.repository !== after.github.repository || before.github.branch !== after.github.branch) {
       for (const account of Object.values(after.accounts)) {
+        await setSetting(`assetReceipts:${account.accountKey}`, null);
+        await setSetting(`assetUploads:${account.accountKey}`, null);
+        const assetStatus = await getSetting(`assetStatus:${account.accountKey}`);
+        if (assetStatus) await setSetting(`assetStatus:${account.accountKey}`, { ...assetStatus, uploaded: 0, pendingUpload: assetStatus.local || 0 });
         const job = await engine.getState(account.accountKey);
         const needsBackfill = account.initialized === true || Boolean(before.github.repository);
         await setSetting(`githubStatus:${account.accountKey}`, { status: 'pending', needsBackfill,
@@ -172,15 +180,24 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
       if (!force && previous?.nextRetryAt > now()) return;
       const pending = await engine.getOutbox(account.accountKey), outbox = [];
       let bytes = 0;
+      const pointerPaths = new Set();
       for (const bundle of pending) {
         const size = new TextEncoder().encode(JSON.stringify(bundle.files)).byteLength;
-        if (outbox.length && (outbox.length >= 10 || bytes + size > 24 * 1024 * 1024)) break;
+        const assets = new Set(pointerPaths);
+        for (const file of bundle.files) if (file.path.endsWith('/archive/manifest.json')) {
+          try { for (const entry of Object.values(JSON.parse(file.content).conversations || {})) {
+            for (const asset of entry.assets || []) if (asset.status === 'downloaded' && asset.localPath) assets.add(asset.localPath);
+          } } catch { /* Sync validation reports malformed bundles without discarding them. */ }
+        }
+        if (outbox.length && (outbox.length >= 10 || bytes + size > 24 * 1024 * 1024 || assets.size + (outbox.length + 1) * 4 > 480)) break;
+        for (const path of assets) pointerPaths.add(path);
         outbox.push(bundle); bytes += size;
       }
       if (!outbox.length) return;
       await setSetting(key, { ...previous, status: 'syncing', pending: pending.length });
       try {
-        const result = await syncArchives({ config: github, bundles: outbox });
+        const assetPointers = assetService ? await assetService.prepareUploads({ directory: await getSetting('directory'), account, config: github, bundles: outbox }) : [];
+        const result = await syncArchives({ config: github, bundles: outbox, assetPointers });
         const latest = (await settings.read()).github;
         if (latest.repository !== github.repository || latest.branch !== github.branch || latest.enabled !== github.enabled) {
           throw collectorError('GITHUB_TARGET_CHANGED', '同步目标已变化，待上传数据已保留，请重新同步。');
@@ -190,6 +207,7 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
           if (saved?.recovered) await engine.enqueueArchive({ account, archive: saved.recovered });
         }
         await engine.acknowledgeOutbox(account.accountKey, outbox.map(x => x.id));
+        if (assetService?.acknowledgeUploads) await assetService.acknowledgeUploads(account);
         const remaining = (await engine.getOutbox(account.accountKey)).length;
         const job = await engine.getState(account.accountKey);
         const needsBackfill = Boolean(previous?.needsBackfill) && !(job?.status === 'completed' && job.initializedComplete &&
@@ -201,6 +219,11 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
             result.conflicts?.length ? '不同版本已保留到冲突副本，原文没有丢弃。' : '' });
         if (remaining) continueSoon();
       } catch (error) {
+        if (error.code === 'LFS_UPLOAD_PENDING') {
+          await setSetting(key, { ...previous, status: 'pending', pending: pending.length,
+            message: '图片正在分批上传，完成后自动提交对话。', nextRetryAt: 0 });
+          continueSoon(); return;
+        }
         const attempt = (previous?.attempt || 0) + 1;
         await setSetting(key, { ...previous, status: 'pending', pending: pending.length, error: safeError(error), attempt,
           nextRetryAt: now() + Math.min(60, 2 ** Math.min(attempt, 6)) * 60000 });
@@ -255,6 +278,10 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
       await engine.start({ account, tabId: tab.id, mode: account.initialized ? 'incremental' : 'initial' });
       continueSoon();
     }
+    if (assetService && (await directoryState()).granted && job?.status !== 'paused') {
+      const work = await assetService.tick({ directory: await getSetting('directory'), account, tabId: tab.id });
+      if (work.runnable) continueSoon();
+    }
     if (job?.status !== 'running') await synchronize(account);
   }
   function pump() {
@@ -271,6 +298,19 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
       for (const account of Object.values(config.accounts)) if (account.enabled && !seen.has(account.accountKey)) {
         await engine.suspend(account.accountKey, 'SOURCE_UNAVAILABLE');
         await synchronize(account);
+      }
+      if (restoreService && config.github.repository && config.github.token && (await directoryState()).granted &&
+          await browser.permissions.contains({ origins: ['https://api.github.com/*'] })) {
+        try {
+          let restore = await restoreService.state();
+          const due = await getSetting('restoreNextRunAt') || 0;
+          if (config.github.enabled && !['running', 'pending'].includes(restore?.status) && due <= now()) {
+            await restoreService.start({ config: config.github, directory: await getSetting('directory') });
+            await setSetting('restoreNextRunAt', now() + config.intervalMinutes * 60000);
+          }
+          restore = await restoreService.tick({ config: config.github, directory: await getSetting('directory') });
+          if (restore?.status === 'running' && (!restore.nextRetryAt || restore.nextRetryAt <= now())) continueSoon();
+        } catch { /* restore has its own durable state; collection stays independent */ }
       }
     }).finally(() => { pumping = null; });
     return pumping;
@@ -315,6 +355,15 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
       case 'collector:directory-changed': await replaceDirectory(); break;
       case 'collector:github-config': await githubConfig(message); break;
       case 'collector:github-test': return { ok: true, result: await testGitHub(), state: await state(tabId) };
+      case 'collector:restore':
+      case 'collector:restore-retry': {
+        if (!restoreService) throw collectorError('RESTORE_UNAVAILABLE', '当前版本不支持恢复。');
+        const { github } = await settings.read();
+        if (!(await directoryState()).granted) throw collectorError('DIRECTORY_PERMISSION', '请先选择并授权本地保存目录。');
+        if (!await browser.permissions.contains({ origins: ['https://api.github.com/*'] })) throw collectorError('GITHUB_PERMISSION', '请先允许访问 GitHub。');
+        await restoreService.start({ config: github, directory: await getSetting('directory'), force: message.type === 'collector:restore-retry' });
+        continueSoon(); break;
+      }
       case 'collector:permissions-changed': await registerContent(); break;
       case 'collector:start': {
         const { account, tab, config } = await context(tabId, true);

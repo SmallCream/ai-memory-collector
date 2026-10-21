@@ -4,6 +4,7 @@ import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
 import { createCollectorService } from '../extension/lib/collector-service.js';
 import { safeError } from '../extension/lib/config.js';
+import { GITHUB_LFS_HOSTS } from '../extension/lib/lfs.js';
 
 const raw = await readFile(new URL('../extension/background.js', import.meta.url), 'utf8');
 const source = raw.replace(/^import[\s\S]*?;\s*$/gm, '');
@@ -47,6 +48,9 @@ function background({ command, open } = {}) {
   vm.runInNewContext(source, { chrome, URL, Promise, console,
     createCollectorService: () => service, getAdapter: () => ({}), safeError, ALARM_NAME: 'collector-work',
     getSetting: noop, setSetting: noop, createCollectorEngine: noop,
+    createChatGPTAssetResolver: () => ({ resolve: noop }),
+    createAssetService: () => ({ save: noop, hydrateAssets: noop }), createRestoreService: () => ({}),
+    fetchRepositorySnapshot: noop, downloadRepositoryFile: noop,
     readAccountManifest: noop, saveConversation: noop, applyRemoteFiles: noop, syncArchives: noop, probeRepository: noop });
   function message(value, sender = UI) {
     const replies = [];
@@ -70,6 +74,7 @@ test('content script cannot configure, bind, capture, sync, or fetch private UI 
   const app = background(); app.calls.length = 0;
   for (const type of ['collector:get-state', 'collector:configure', 'collector:github-config', 'collector:github-test',
     'collector:start', 'collector:bind', 'collector:resume', 'collector:pause', 'collector:retry-github',
+    'collector:restore', 'collector:restore-retry',
     'collector:directory-changed', 'collector:permissions-changed', 'collector:close-panel']) {
     const response = app.message({ type, token: 'untrusted', mode: 'full' }, PAGE);
     assert.equal(response.keepAlive, false);
@@ -102,6 +107,14 @@ test('trusted extension UI can send commands even though chrome-extension URL or
   await tick();
   assert.equal(response.replies[0].ok, true);
   assert.deepEqual(app.calls, [['command', { type: 'collector:configure', intervalMinutes: 30, tabId: 7 }, 7]]);
+});
+
+test('trusted extension UI can request repository restore without a ChatGPT tab', async () => {
+  const app = background(); app.calls.length = 0;
+  const response = app.message({ type: 'collector:restore' }, { ...UI, url: 'chrome-extension://collector-id/panel.html' });
+  await tick();
+  assert.equal(response.replies[0].ok, true);
+  assert.deepEqual(app.calls, [['command', { type: 'collector:restore' }, undefined]]);
 });
 
 test('floating click calls native sidePanel.open synchronously with sender tab before async work', async () => {
@@ -187,10 +200,15 @@ test('manifest exposes no external messages, executable remote code or web-acces
   const manifest = JSON.parse(await readFile(new URL('../extension/manifest.json', import.meta.url), 'utf8'));
   assert.equal(manifest.externally_connectable, undefined);
   assert.equal(manifest.web_accessible_resources, undefined);
-  assert.deepEqual(manifest.optional_host_permissions, ['https://chatgpt.com/*', 'https://api.github.com/*']);
+  assert.deepEqual([...manifest.optional_host_permissions].sort(), [
+    'https://chatgpt.com/*', 'https://*.oaiusercontent.com/*', 'https://*/*',
+    ...GITHUB_LFS_HOSTS.map(host => `https://${host}/*`),
+  ].sort());
+  assert.equal(manifest.host_permissions, undefined, 'All site access remains optional and gesture-authorized');
   assert.equal(manifest.content_scripts, undefined);
   assert.ok(manifest.permissions.includes('sidePanel'));
   assert.ok(!manifest.permissions.includes('cookies'));
   assert.ok(!manifest.permissions.includes('debugger'));
   assert.ok(!manifest.content_security_policy.extension_pages.includes('unsafe-eval'));
+  assert.match(manifest.content_security_policy.extension_pages, /script-src 'self';/);
 });

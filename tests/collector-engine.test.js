@@ -307,3 +307,18 @@ test('pending bundle keeps its own manifest hash after another local capture adv
   assert.equal(bManifest.conversations.b.contentHash, 'hash-b');
   assert.deepEqual(Object.keys(bManifest.conversations), ['b']);
 });
+
+test('delayed recovery delivery cannot replace a newer queued conversation or image derivative', async () => {
+  const f = setup();
+  await f.engine.start({ account, tabId: 1, mode: 'initial' }); await complete(f.engine);
+  const before = (await f.engine.getOutbox(account.accountKey)).find(bundle => bundle.conversationId === 'a');
+  f.local.get('a').entry.markdownHash = 'new-images';
+  await f.engine.enqueueArchive({ account, archive: {
+    entry: { conversationId: 'a', contentHash: 'old-native', markdownHash: 'old-images' }, files: before.files,
+  } });
+  await f.engine.enqueueArchive({ account, archive: {
+    entry: { conversationId: 'a', contentHash: 'hash-a', markdownHash: 'old-images' }, files: before.files,
+  } });
+  const after = (await f.engine.getOutbox(account.accountKey)).find(bundle => bundle.conversationId === 'a');
+  assert.equal(after.id, before.id);
+});

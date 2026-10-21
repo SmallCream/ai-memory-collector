@@ -75,6 +75,21 @@ function setup() {
   };
 }
 
+test('restoring an older derivative cannot erase downloaded assets from the identical native conversation', async () => {
+  const fs = setup(), source = detail('image', '![Screenshot](sediment://file_image)');
+  const id = '1'.repeat(64), oid = '2'.repeat(64);
+  const pending = { id, sourceRef: 'sediment://file_image', sourceType: 'platform', fileId: 'file_image', kind: 'image', status: 'pending' };
+  const remote = await fs.store.saveConversation({ directory: fs.directory, account, detail: source, assets: [pending] });
+  const local = await fs.store.saveConversation({ directory: fs.directory, account, detail: source,
+    assets: [{ ...pending, status: 'downloaded', oid, size: 20, localPath: `${accountPrefix(account)}/assets/${oid}.png` }] });
+  assert.equal(remote.entry.contentHash, local.entry.contentHash);
+  assert.notEqual(remote.entry.markdownHash, local.entry.markdownHash);
+  const restored = await fs.store.applyRemoteFiles({ directory: fs.directory, account, files: remote.files });
+  assert.equal(restored.entry.assets[0].status, 'downloaded');
+  assert.equal(restored.entry.assets[0].oid, oid);
+  assert.equal(restored.entry.markdownHash, local.entry.markdownHash);
+});
+
 test('multiple conversations share one directory, stable filenames update, identical content does not rewrite', async () => {
   const fs = setup();
   const a = await fs.save(detail());

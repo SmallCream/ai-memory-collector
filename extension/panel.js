@@ -14,6 +14,10 @@ let wizardGithubVerified = false;
 let settingsLoaded = false;
 let stateRevision = 0;
 let activeAliasKey = null;
+let externalImagePermission = false;
+const githubOrigins = ['https://api.github.com/*', 'https://github.com/*', 'https://lfs.github.com/*',
+  'https://github-cloud.githubusercontent.com/*', 'https://objects.githubusercontent.com/*',
+  'https://media.githubusercontent.com/*', 'https://github-cloud.s3.amazonaws.com/*'];
 const runningStatuses = new Set(['running', 'scanning', 'collecting', 'saving', 'syncing']);
 const pausedStatuses = new Set(['paused', 'blocked', 'waiting', 'retrying', 'interrupted', 'waiting-source', 'waiting-permission', 'partial']);
 const controls = () => document.querySelectorAll('button,input,select');
@@ -70,6 +74,7 @@ function fillSettings() {
   $('auto-enabled').checked = config.autoEnabled !== false;
   $('interval-minutes').value = String([15, 30, 60].includes(config.intervalMinutes) ? config.intervalMinutes : 30);
   $('github-enabled').checked = config.github?.enabled === true;
+  $('lfs-enabled').checked = config.github?.lfsEnabled !== false;
   $('repository').value = config.github?.repository || '';
   $('branch').value = config.github?.branch || '';
   $('github-token').value = '';
@@ -85,16 +90,19 @@ function render() {
   const isRunning = runningStatuses.has(job?.status);
   const isPaused = pausedStatuses.has(job?.status);
   const isPartial = job?.status === 'partial';
-  const isWizard = !config.setupComplete;
+  const isWizard = !config.setupComplete && screen !== 'settings';
   show('legacy-notice', current.legacyPending === true);
   show('context-error', Boolean(current.error?.message) && (screen === 'settings' || !current.identity));
-  text('context-error', current.error?.message ? safeMessage(current.error) : '');
+  text('context-error', current.error?.message ? safeMessage(current.error) +
+    (screen === 'settings' && !identity && /^(?:SITE_|SOURCE_|ACCOUNT_|CHATGPT_|HTTP_401$|HTTP_403$)/.test(current.error?.code || '') ?
+      ' 此登录状态不影响从 GitHub 恢复备份。' : '') : '');
   if (isWizard && step > 0 && !account?.enabled) step = 0;
   document.body.classList.toggle('setup-page', setupPage && isWizard);
   show('wizard', isWizard);
   show('home', !isWizard && screen === 'home');
-  show('settings', !isWizard && screen === 'settings');
-  show('open-settings', !isWizard && screen !== 'settings');
+  show('settings', screen === 'settings');
+  show('open-settings', screen !== 'settings');
+  text('back-home', config.setupComplete ? '‹ 返回采集' : '‹ 返回首次设置');
   const selectedName = account?.alias || identity?.displayName || '尚未识别账号';
   text('account-name', selectedName);
   text('account-avatar', identity ? Array.from(selectedName).slice(0, 2).join('').toUpperCase() : 'AI');
@@ -155,6 +163,45 @@ function render() {
   text('github-detail', safeMessage(githubDetail));
   show('github-detail', Boolean(githubDetail));
   $('github-detail').classList.toggle('warning-text', current.githubStatus?.status === 'conflicts');
+  const assets = current.assetStatus || {};
+  const assetParts = [];
+  if (Number(assets.local) > 0) assetParts.push(`本地图片 ${count(assets.local)}`);
+  if (Number(assets.uploaded) > 0) assetParts.push(`已上传 ${count(assets.uploaded)}`);
+  if (Number(assets.downloaded) > 0) assetParts.push(`已恢复 ${count(assets.downloaded)}`);
+  if (Number(assets.external) > 0) assetParts.push(`外链 ${count(assets.external)}`);
+  if (Number(assets.pendingCapture) > 0) assetParts.push(`待采集 ${count(assets.pendingCapture)}`);
+  if (Number(assets.pendingUpload) > 0) assetParts.push(`待上传 ${count(assets.pendingUpload)}`);
+  if (Number(assets.failed) > 0) assetParts.push(`失败 ${count(assets.failed)}`);
+  text('asset-summary-text', assetParts.join(' · ')); show('asset-summary', assetParts.length > 0);
+  const imagePermissionNeeded = assets.needsPermission || current.githubStatus?.needsPermission ||
+    /PERMISSION/.test(assets.error?.code || current.githubStatus?.error?.code || '');
+  show('grant-github-images', Boolean(config.github?.enabled && config.github?.lfsEnabled !== false && imagePermissionNeeded));
+  const restore = current.restoreStatus;
+  const restoreRunning = ['running', 'restoring', 'scanning', 'downloading', 'saving'].includes(restore?.status);
+  const restoreProgress = restore?.progress || restore || {};
+  const restoreTotal = Number(restoreProgress.total) || 0;
+  const restoreCompleted = Number(restoreProgress.completed ?? restoreProgress.processed) || 0;
+  const restoreFailed = Number(restoreProgress.failed) || 0;
+  const restoreNeedsRetry = restoreFailed > 0 || ['failed', 'error', 'partial', 'paused', 'blocked', 'interrupted', 'waiting-permission', 'needsPermission'].includes(restore?.status);
+  const restoreReady = Boolean(config.github?.repository && config.github?.hasToken && granted);
+  const requirements = [];
+  if (!config.github?.repository || !config.github?.hasToken) requirements.push('请先填写并保存 GitHub 仓库与 Token。');
+  if (!granted) requirements.push('请选择保存目录或恢复目录权限。');
+  text('restore-requirements', requirements.join(' '));
+  show('restore-progress', Boolean(restore && restore.status !== 'idle'));
+  const restoreLabels = { completed: '恢复完成', complete: '恢复完成', success: '恢复完成',
+    partial: '部分恢复完成', failed: '恢复未完成', error: '恢复未完成', paused: '恢复已暂停',
+    blocked: '恢复需要处理', interrupted: '恢复已中断', 'waiting-permission': '等待权限', needsPermission: '等待权限', empty: '仓库暂无可恢复内容' };
+  text('restore-phase', restoreRunning ? '正在恢复对话与图片' : restoreLabels[restore?.status] || '恢复进度已保留');
+  text('restore-count', restoreTotal ? `${restoreCompleted} / ${restoreTotal}` : '');
+  if (restoreTotal > 0) { $('restore-meter').max = Math.max(restoreTotal, restoreCompleted, 1); $('restore-meter').value = restoreCompleted; }
+  else $('restore-meter').removeAttribute('value');
+  show('restore-meter', restoreRunning || restoreTotal > 0);
+  text('restore-detail', safeMessage(restore?.message || restore?.error?.message ||
+    (restoreFailed ? `${restoreFailed} 项未完成，已恢复的文件会保留。` : restoreRunning ? '收起面板不会主动暂停恢复。' : '')));
+  show('restore-retry', restoreNeedsRetry && !restoreRunning);
+  text('external-images-status', externalImagePermission ? '已允许匿名检测。可在浏览器扩展设置中撤销网站访问权限。' : '尚未授权，外链图片保留为链接。');
+  text('grant-external-images', externalImagePermission ? '已允许检测外链图片' : '允许检测外链图片');
   const result = current.lastResult || (['completed', 'complete', 'done', 'partial', 'failed'].includes(job?.status) ? job : null);
   show('last-result', Boolean(result));
   if (result) {
@@ -184,6 +231,9 @@ function render() {
   $('start-capture').disabled = busy || !account?.enabled || !granted;
   $('full-capture').disabled = busy || !account?.enabled || !granted;
   $('resume-capture').disabled = busy || !account?.enabled || !granted;
+  $('restore-github').disabled = busy || !restoreReady || restoreRunning;
+  $('restore-retry').disabled = busy || !restoreReady || restoreRunning;
+  $('grant-external-images').disabled = busy || externalImagePermission;
   if (!started) { started = true; window.dispatchEvent(new Event('collector:ready')); }
 }
 async function refresh() {
@@ -192,6 +242,11 @@ async function refresh() {
   if (!reply?.ok) throw errorObject(reply?.error || '暂时无法读取后台状态。');
   if (revision !== stateRevision) return;
   current = reply.state;
+  if (chrome.permissions.contains) {
+    try { externalImagePermission = await chrome.permissions.contains({ origins: ['https://*/*'] }); }
+    catch { externalImagePermission = false; }
+    if (revision !== stateRevision) return;
+  }
   render();
 }
 function action(id, handler) {
@@ -224,18 +279,26 @@ async function restoreDirectory() {
   if (await directory.requestPermission({ mode: 'readwrite' }) !== 'granted') throw new Error('目录权限未恢复；已有采集进度会保留。');
   await send('collector:directory-changed');
 }
+async function grantGithub(lfs = false) {
+  const granted = await chrome.permissions.request({ origins: lfs ? githubOrigins : ['https://api.github.com/*'] });
+  if (!granted) throw new Error('未获得 GitHub 访问权限。已有数据会保留，可再次点击授权或关闭图片同步后保存配置。');
+}
+async function restoreGithub(retry = false) {
+  // Start the permission request directly from this click, before any network await.
+  await grantGithub(true);
+  await send(retry ? 'collector:restore-retry' : 'collector:restore');
+}
 async function saveGithub(wizard = false) {
   const repository = $(wizard ? 'wizard-repository' : 'repository').value.trim();
   const branch = $(wizard ? 'wizard-branch' : 'branch').value.trim();
   const tokenInput = $(wizard ? 'wizard-token' : 'github-token');
   const token = tokenInput.value.trim();
   const enabled = wizard || $('github-enabled').checked;
-  if (enabled) {
-    const granted = await chrome.permissions.request({ origins: ['https://api.github.com/*'] });
-    if (!granted) throw new Error('未获得 GitHub 访问权限，配置尚未启用。');
-  }
-  await send('collector:github-config', { repository, branch, enabled, ...(token ? { token } : {}) });
-  if (enabled) await send('collector:github-test');
+  const lfsEnabled = $(wizard ? 'wizard-lfs-enabled' : 'lfs-enabled').checked;
+  const verify = enabled || Boolean(repository && (token || current?.config?.github?.hasToken));
+  if (verify) await grantGithub(lfsEnabled);
+  await send('collector:github-config', { repository, branch, enabled, lfsEnabled, ...(token ? { token } : {}) });
+  if (verify) await send('collector:github-test');
   tokenInput.value = '';
   if (wizard) { wizardGithubVerified = true; text('wizard-github-status', '私有仓库连接验证成功。'); }
   else settingsLoaded = false;
@@ -245,6 +308,7 @@ function populateWizardGithub() {
   $('wizard-repository').value = github.repository || '';
   $('wizard-branch').value = github.branch || '';
   $('wizard-token').value = '';
+  $('wizard-lfs-enabled').checked = github.lfsEnabled !== false;
   $('wizard-token').placeholder = github.hasToken ? '已保存 Token，留空沿用' : '粘贴仅授权此仓库的 Token';
   wizardGithubVerified = false;
   text('wizard-github-status', '');
@@ -274,7 +338,17 @@ action('start-capture', () => send('collector:start', { mode: current?.account?.
 action('full-capture', () => send('collector:start', { mode: 'full' }));
 action('pause-capture', () => send('collector:pause'));
 action('resume-capture', () => send('collector:resume'));
-action('retry-github', () => send('collector:retry-github'));
+action('retry-github', async () => { await grantGithub(current?.config?.github?.lfsEnabled !== false); await send('collector:retry-github'); });
+action('grant-github-images', async () => { await grantGithub(true); await send('collector:retry-github'); });
+for (const id of ['open-restore', 'wizard-open-restore']) action(id, () => { screen = 'settings'; settingsLoaded = false; });
+action('restore-github', () => restoreGithub(false));
+action('restore-retry', () => restoreGithub(true));
+action('grant-external-images', async () => {
+  const granted = await chrome.permissions.request({ origins: ['https://*/*'] });
+  if (!granted) throw new Error('未获得外链图片检测权限。对话与链接仍可正常归档。');
+  externalImagePermission = true;
+  await send('collector:permissions-changed');
+});
 action('open-settings', () => { screen = 'settings'; settingsLoaded = false; });
 action('back-home', () => { screen = 'home'; });
 action('save-schedule', () => send('collector:configure', { autoEnabled: $('auto-enabled').checked, intervalMinutes: Number($('interval-minutes').value) }));
@@ -283,7 +357,7 @@ action('forget-token', async () => { await send('collector:github-config', { tok
 action('collapse-panel', () => closePanel(false));
 action('hide-panel', () => closePanel(true));
 action('settings-hide', () => closePanel(true));
-for (const id of ['wizard-repository', 'wizard-branch', 'wizard-token']) $(id).addEventListener('input', () => {
+for (const id of ['wizard-repository', 'wizard-branch', 'wizard-token', 'wizard-lfs-enabled']) $(id).addEventListener('input', () => {
   wizardGithubVerified = false; $('wizard-next-2').disabled = true; text('wizard-github-status', '配置已改变，请重新验证。');
 });
 window.addEventListener('focus', () => { if (!busy) refresh().catch(error => feedback(safeMessage(error), true)); });

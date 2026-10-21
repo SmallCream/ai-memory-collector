@@ -121,14 +121,14 @@ test('manifest traversal rejected, unknown fields such as __proto__ remain inert
   assert.equal({}.injected, undefined);
 });
 
-test('Markdown keeps code literal while making prose HTML and image embeds passive', async () => {
+test('Markdown keeps code literal while blocking active HTML and unresolved images', async () => {
   const source = fixture(); source.title = '<img src=x onerror=alert(1)>';
   const body = '<script>alert(1)</script>\n![track](https://example.test/pixel)\n`<span>inline</span>`\n```html\n<img src=x onerror=alert(1)>\n```';
   source.mapping.reply2.message.content.parts = [body];
   const result = await build(source);
   assert.match(result.files[1].content, /&lt;img/);
-  assert.match(result.files[1].content, /&lt;script>alert\(1\)&lt;\/script>/);
-  assert.ok(result.files[1].content.includes('\\![track](https://example.test/pixel)'));
+  assert.match(result.files[1].content, /script 动态内容未执行/);
+  assert.ok(result.files[1].content.includes('〔图片：track，待补采〕'));
   assert.ok(result.files[1].content.includes('`<span>inline</span>`'));
   assert.ok(result.files[1].content.includes('```html\n<img src=x onerror=alert(1)>\n```'));
   assert.equal(JSON.parse(result.files[0].content).mapping.reply2.message.content.parts[0], body);
@@ -188,7 +188,7 @@ test('readable Markdown contains just title, speakers and normally formatted con
   assert.deepEqual(JSON.parse(result.files[0].content), source);
   assert.equal(result.summary.coverage.messages, 'partial');
   assert.ok(result.manifest.conversations['reading-demo'].warnings.length);
-  assert.equal(result.manifest.conversations['reading-demo'].rendererVersion, 'p0-2');
+  assert.equal(result.manifest.conversations['reading-demo'].rendererVersion, 'rich-1');
 });
 
 test('internal and hidden messages stay in JSON but do not clutter the reading view', async () => {

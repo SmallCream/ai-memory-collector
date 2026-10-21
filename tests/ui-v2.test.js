@@ -38,7 +38,8 @@ async function setup(options = {}) {
   const steps = Array.from({ length: 4 }, () => new Element('li'));
   const windowListeners = new Map();
   const all = [...elements.values()].filter(e => ['button', 'input', 'select'].includes(e.tagName));
-  const events = [], messages = [], intervalCallbacks = [], settings = new Map();
+  const events = [], messages = [], permissionRequests = [], intervalCallbacks = [], settings = new Map();
+  const permissions = new Set(options.origins || []);
   const directory = { name: 'archive', requestPermission: async () => { events.push('directory-permission'); return 'granted'; } };
   settings.set('directory', directory);
   const body = new Element();
@@ -61,13 +62,20 @@ async function setup(options = {}) {
         if (message.type === 'collector:directory-changed') state.directory = { name: directory.name, granted: true };
         return { ok: true, state: structuredClone(state) };
       } },
-      permissions: { request: async request => { events.push(`permission:${request.origins[0]}`); return options.grant !== false; } },
+      permissions: {
+        contains: async request => request.origins.every(origin => permissions.has(origin)),
+        request: async request => {
+          events.push(`permission:${request.origins[0]}`); permissionRequests.push([...request.origins]);
+          if (options.grant === false) return false;
+          request.origins.forEach(origin => permissions.add(origin)); return true;
+        },
+      },
       tabs: { create: async () => ({ id: 11 }) },
     },
   });
   const run = script.replace(/^import .*;\n/m, '');
   await vm.runInContext(`(async()=>{${run}\n})()`, context);
-  return { elements, messages, events, state: () => state, setState: value => { state = value; }, context,
+  return { elements, messages, events, permissionRequests, state: () => state, setState: value => { state = value; }, context,
     click: id => elements.get(id).click(), poll: () => intervalCallbacks[0]() };
 }
 
@@ -218,4 +226,72 @@ test('startup success clears its loading message while polling preserves action 
   assert.match(error, /未获得 GitHub/);
   app.poll(); await new Promise(resolve => setImmediate(resolve));
   assert.equal(app.elements.get('global-status').textContent, error);
+});
+
+test('a new device can restore without ChatGPT identity, completed setup or automatic uploading', async () => {
+  const state = initialState(); state.identity = null; state.account = null;
+  state.config.setupComplete = false; state.config.github.hasToken = true;
+  state.error = { code: 'SOURCE_UNAVAILABLE', message: '未打开 ChatGPT。' };
+  const app = await setup({ state, url: 'chrome-extension://test/panel.html?setup=1' });
+  await app.click('wizard-open-restore');
+  assert.equal(app.elements.get('wizard').hidden, true);
+  assert.equal(app.elements.get('settings').hidden, false);
+  assert.equal(app.elements.get('restore-github').disabled, false);
+  const before = app.events.length;
+  await app.click('restore-github');
+  assert.equal(app.events[before], 'permission:https://api.github.com/*');
+  assert(app.messages.some(message => message.type === 'collector:restore'));
+  assert(!app.messages.some(message => ['collector:bind', 'collector:configure', 'collector:start'].includes(message.type)));
+  assert.equal(app.permissionRequests[0].includes('https://*/*'), false);
+  assert(app.permissionRequests[0].includes('https://github-cloud.s3.amazonaws.com/*'));
+  await app.click('back-home'); assert.equal(app.elements.get('wizard').hidden, false);
+});
+
+test('restore permission denial does not start a job and an incomplete restore exposes retry', async () => {
+  const state = initialState(); state.identity = null; state.account = null; state.config.github.hasToken = true;
+  state.restoreStatus = { status: 'partial', progress: { total: 12, completed: 10, failed: 2 } };
+  const denied = await setup({ state, grant: false }); await denied.click('open-restore');
+  assert.equal(denied.elements.get('restore-retry').hidden, false);
+  assert.equal(denied.elements.get('restore-count').textContent, '10 / 12');
+  await denied.click('restore-retry');
+  assert(!denied.messages.some(message => message.type === 'collector:restore-retry'));
+  assert.match(denied.elements.get('global-status').textContent, /未获得 GitHub/);
+  const allowed = await setup({ state }); await allowed.click('open-restore'); await allowed.click('restore-retry');
+  assert(allowed.messages.some(message => message.type === 'collector:restore-retry'));
+});
+
+test('restoring requires saved credentials and a granted destination; in-progress restore cannot start twice', async () => {
+  const state = initialState(); state.config.github.hasToken = true; state.directory.granted = false;
+  const app = await setup({ state }); await app.click('open-restore');
+  assert.equal(app.elements.get('restore-github').disabled, true);
+  state.directory.granted = true; state.restoreStatus = { status: 'running', total: 10, processed: 2 };
+  app.setState(state); app.poll(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.elements.get('restore-github').disabled, true);
+  assert.equal(app.elements.get('restore-count').textContent, '2 / 10');
+});
+
+test('LFS default is preserved on save and restoring-only configuration is verified without enabling uploads', async () => {
+  const state = initialState(); state.config.github.hasToken = true;
+  const app = await setup({ state }); await app.click('open-settings'); await app.click('save-github');
+  const message = app.messages.find(item => item.type === 'collector:github-config');
+  assert.equal(message.enabled, false); assert.equal(message.lfsEnabled, true);
+  assert(app.messages.some(item => item.type === 'collector:github-test'));
+  assert(app.permissionRequests[0].includes('https://lfs.github.com/*'));
+  assert.equal(app.permissionRequests.flat().includes('https://*/*'), false);
+});
+
+test('broad HTTPS access is requested only by the optional external-image action', async () => {
+  const app = await setup(); await app.click('open-settings');
+  assert.deepEqual(app.permissionRequests, []);
+  await app.click('grant-external-images');
+  assert.deepEqual(app.permissionRequests, [['https://*/*']]);
+  assert.equal(app.elements.get('grant-external-images').disabled, true);
+  assert.match(app.elements.get('external-images-status').textContent, /已允许匿名检测/);
+});
+
+test('asset summary distinguishes pending images from successful uploads', async () => {
+  const state = initialState(); state.assetStatus = { local: 5, uploaded: 3, pendingUpload: 2, pendingCapture: 1, failed: 1 };
+  const app = await setup({ state });
+  assert.equal(app.elements.get('asset-summary').hidden, false);
+  assert.match(app.elements.get('asset-summary-text').textContent, /本地图片 5.*已上传 3.*待采集 1.*待上传 2.*失败 1/);
 });

@@ -1,6 +1,7 @@
 /** Atomic, private-repository archive sync. No page/session credentials enter this module. */
 import { buildArchive } from './archive.js';
 import { createGitHubClient, inspectGitHubRepository, commitProbe, GitHubProbeError } from './github.js';
+import { formatLfsPointer } from './lfs.js';
 
 const MAX_BYTES = 32 * 1024 * 1024;
 const MAX_FILES = 512;
@@ -9,6 +10,8 @@ const record = value => value !== null && typeof value === 'object' && !Array.is
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40,64}$/i.test(value);
 const accountKeyPattern = /^acct-[a-f0-9]{24}$/;
 const idPattern = /^[A-Za-z0-9][A-Za-z0-9_-]{0,159}$/;
+const READY_ASSETS = new Set(['downloaded', 'ready', 'local', 'synced']);
+const LFS_RULE = 'assets/** filter=lfs diff=lfs merge=lfs -text';
 function fail(code, message) { throw new GitHubProbeError(code, message); }
 function json(value) { return JSON.stringify(value, null, 2) + '\n'; }
 function parse(text, code = 'ARCHIVE_FORMAT') {
@@ -32,6 +35,60 @@ function safePath(path) {
   }
   return path.split('/').slice(0, 4).join('/');
 }
+function assetsOf(entry, prefix) {
+  if (entry.assets === undefined) return [];
+  if (!Array.isArray(entry.assets) || entry.assets.length > 4096) fail('ARCHIVE_ASSET', '对话资源清单无效。');
+  const ids = new Set();
+  for (const asset of entry.assets) {
+    if (!record(asset) || !/^[a-f0-9]{64}$/.test(asset.id || '') || ids.has(asset.id)) fail('ARCHIVE_ASSET', '对话资源标识无效或重复。');
+    ids.add(asset.id);
+    if (asset.localPath !== undefined && (safePath(asset.localPath) !== prefix || !asset.localPath.startsWith(`${prefix}/assets/`))) {
+      fail('ACCOUNT_OWNERSHIP', '资源路径超出当前账号目录。');
+    }
+    if (READY_ASSETS.has(asset.status)) {
+      if (!/^[a-f0-9]{64}$/.test(asset.oid || '') || !Number.isSafeInteger(asset.size) || asset.size < 0 ||
+          typeof asset.localPath !== 'string' ||
+          !new RegExp(`^${asset.oid}\\.(png|jpg|gif|webp|avif|bin)$`).test(asset.localPath.slice(prefix.length + '/assets/'.length))) {
+        fail('ARCHIVE_ASSET', '已保存图片缺少有效的路径、内容摘要或大小。');
+      }
+    }
+  }
+  return entry.assets;
+}
+function validatePointers(bundles, supplied) {
+  if (!Array.isArray(supplied) || supplied.length > MAX_FILES) fail('ARCHIVE_ASSET', 'LFS 指针列表无效或过多。');
+  const references = new Map(), pointers = new Map();
+  for (const bundle of bundles) for (const entry of bundle.entries) for (const asset of assetsOf(entry, bundle.prefix)) {
+    if (!READY_ASSETS.has(asset.status)) continue;
+    const expected = { accountKey: bundle.accountKey, path: asset.localPath, oid: asset.oid, size: asset.size,
+      content: formatLfsPointer(asset) };
+    const previous = references.get(asset.localPath);
+    if (previous && !sameJSON(previous, expected)) fail('ARCHIVE_ASSET', '同一资源路径对应了不同内容。');
+    references.set(asset.localPath, expected);
+  }
+  for (const pointer of supplied) {
+    const reference = references.get(pointer?.path);
+    if (!reference || pointer.accountKey !== reference.accountKey || pointer.oid !== reference.oid ||
+        pointer.size !== reference.size || pointer.content !== reference.content) {
+      fail('ACCOUNT_OWNERSHIP', 'LFS 指针不属于本批账号和对话资源，未提交。');
+    }
+    if (pointers.has(pointer.path) && pointers.get(pointer.path).content !== pointer.content) fail('ARCHIVE_ASSET', 'LFS 指针路径重复且内容不同。');
+    pointers.set(pointer.path, { ...reference });
+  }
+  return { references, pointers };
+}
+function mergeSameNativeAssets(localEntry, remoteEntry, prefix) {
+  if (localEntry.assets === undefined && remoteEntry?.assets === undefined) return undefined;
+  const result = new Map(assetsOf(localEntry, prefix).map(asset => [asset.id, asset]));
+  for (const remoteAsset of assetsOf(remoteEntry || {}, prefix)) {
+    const localAsset = result.get(remoteAsset.id);
+    // A stable source resource already saved remotely must not become pending again.
+    if (!localAsset || READY_ASSETS.has(remoteAsset.status) || !READY_ASSETS.has(localAsset.status)) {
+      result.set(remoteAsset.id, remoteAsset);
+    }
+  }
+  return [...result.values()];
+}
 function validateManifest(value, prefix, accountKey, platform) {
   if (!record(value) || value.schemaVersion !== 1 || value.accountKey !== accountKey || value.platform !== platform || !record(value.conversations)) {
     fail('ACCOUNT_OWNERSHIP', '远端或本地清单的账号归属不匹配，未覆盖。');
@@ -49,6 +106,7 @@ function validateManifest(value, prefix, accountKey, platform) {
       if (safePath(path) !== prefix || seen.has(path)) fail('ARCHIVE_PATH', '归档清单存在重复或越界路径。');
       seen.add(path);
     }
+    assetsOf(entry, prefix);
   }
   return value;
 }
@@ -140,12 +198,29 @@ async function snapshot(api, head) {
   }
   return { head, treeSha: commit.tree.sha, entries, read, assertAncestors };
 }
-async function plan(api, remote, bundles) {
+async function plan(api, remote, bundles, assetPlan) {
   const changes = new Map(), conflicts = [], remoteWinners = [];
   async function read(path) { return changes.has(path) ? changes.get(path) : remote.read(path); }
   async function put(path, content) {
     safePath(path); remote.assertAncestors(path);
     if (await remote.read(path) === content) changes.delete(path); else changes.set(path, content);
+  }
+  const assetPrefixes = new Set();
+  async function ensureAsset(asset, prefix) {
+    if (!READY_ASSETS.has(asset.status)) return;
+    const expected = formatLfsPointer(asset);
+    const current = await read(asset.localPath);
+    if (current !== null && current !== expected) fail('ASSET_IMMUTABLE_CONFLICT', '远端图片路径已有不同内容，已保留原文件。');
+    if (current === null) {
+      const pointer = assetPlan.pointers.get(asset.localPath);
+      if (!pointer || pointer.content !== expected) fail('LFS_ASSET_MISSING', '图片尚未上传 LFS，暂不提交引用该图片的归档。');
+      await put(asset.localPath, pointer.content);
+    }
+    assetPrefixes.add(prefix);
+  }
+  // Validate every local ready reference, even if a newer remote conversation wins.
+  for (const bundle of bundles) for (const entry of bundle.entries) for (const asset of assetsOf(entry, bundle.prefix)) {
+    await ensureAsset(asset, bundle.prefix);
   }
   for (const bundle of bundles) {
     const { prefix, platform, accountKey, files, manifestPath, accountPath } = bundle;
@@ -169,7 +244,7 @@ async function plan(api, remote, bundles) {
       const jsonPath = previous?.jsonPath || localEntry.jsonPath;
       const markdownPath = previous?.markdownPath || localEntry.markdownPath;
       const remoteJSON = await read(jsonPath); let remoteMD = await read(markdownPath);
-      let reason = null, remoteWins = false;
+      let reason = null, remoteWins = false, sameNative = false;
       if (remoteJSON !== null) {
         const managedJSON = previous && await hash(remoteJSON) === previous.contentHash;
         const managedMD = remoteMD === null || (previous && await hash(remoteMD) === previous.markdownHash);
@@ -177,6 +252,7 @@ async function plan(api, remote, bundles) {
         try { remoteNative = JSON.parse(remoteJSON); } catch { /* Preserve malformed external edits. */ }
         if (!record(remoteNative)) reason = '远端 JSON 有人工修改或格式损坏';
         else if (remoteJSON === localJSON || sameJSON(remoteNative, native)) {
+          sameNative = true;
           if (!managedMD && remoteMD !== localMD) reason = '远端 Markdown 有人工修改';
           // Preserve byte-stable native JSON if only whitespace/key ordering differs.
           else if (remoteJSON !== localJSON && previous) remoteWins = true;
@@ -204,13 +280,34 @@ async function plan(api, remote, bundles) {
         conflicts.push({ conversationId: id, reason, path: conflictPath });
         continue;
       }
+      if (sameNative && (localEntry.assets !== undefined || previous?.assets !== undefined)) {
+        const mergedAssets = mergeSameNativeAssets(localEntry, previous, prefix);
+        for (const asset of mergedAssets) await ensureAsset(asset, prefix);
+        const rebuilt = await buildArchive({ conversation: parse(remoteJSON),
+          identity: { accountKey, displayName: bundle.account.displayName },
+          capturedAt: previous?.lastChangedAt || previous?.firstCapturedAt || localEntry.firstCapturedAt || new Date().toISOString(),
+          existingManifest: { ...manifest, conversations: { ...manifest.conversations, [id]: previous || localEntry } },
+          productionPrefix: prefix, assets: mergedAssets });
+        const rebuiltMD = rebuilt.files.find(file => file.path === markdownPath)?.content;
+        if (typeof rebuiltMD !== 'string') fail('REMOTE_DERIVATIVE_MISSING', '图片阅读文件无法重新生成，待同步任务已保留。');
+        const mergedEntry = { ...localEntry, ...previous, assets: mergedAssets, jsonPath, markdownPath,
+          contentHash: await hash(remoteJSON), markdownHash: await hash(rebuiltMD),
+          rendererVersion: rebuilt.manifest.conversations[id].rendererVersion };
+        Object.defineProperty(manifest.conversations, id, { value: mergedEntry, enumerable: true, writable: true, configurable: true });
+        await put(markdownPath, rebuiltMD);
+        // Preserve the native JSON bytes and return the richer version for guarded local import.
+        remoteWinners.push({ conversationId: id, accountKey, entry: mergedEntry,
+          files: [{ path: jsonPath, content: remoteJSON }, { path: markdownPath, content: rebuiltMD }] });
+        continue;
+      }
       if (remoteWins) {
+        for (const asset of assetsOf(previous, prefix)) await ensureAsset(asset, prefix);
         if (remoteMD === null) {
           // Rebuild from the selected remote native version, never from the stale local copy.
           const regenerated = await buildArchive({ conversation: parse(remoteJSON),
             identity: { accountKey, displayName: bundle.account.displayName },
             capturedAt: previous.lastChangedAt || previous.firstCapturedAt || new Date().toISOString(),
-            existingManifest: manifest, productionPrefix: prefix });
+            existingManifest: manifest, productionPrefix: prefix, assets: previous.assets });
           remoteMD = regenerated.files.find(file => file.path === markdownPath)?.content;
           if (typeof remoteMD !== 'string') fail('REMOTE_DERIVATIVE_MISSING', '远端阅读文件暂时无法恢复，待同步任务已保留。');
           await put(markdownPath, remoteMD);
@@ -229,10 +326,30 @@ async function plan(api, remote, bundles) {
     if (manifestText === null || !sameJSON(parse(manifestText), manifest)) await put(manifestPath, json(manifest));
     if (accountText === null) await put(accountPath, files.get(accountPath));
   }
+  for (const prefix of assetPrefixes) {
+    const attributesPath = `${prefix}/.gitattributes`;
+    // A more specific attributes file can override the account rule. Do not guess
+    // Git's full pattern/macro semantics or silently rewrite user-owned rules.
+    for (const path of remote.entries.keys()) if (path.startsWith(`${prefix}/assets/`) && path.endsWith('/.gitattributes')) {
+      const text = await read(path);
+      if (text?.split(/\r?\n/).some(line => line.trim() && !line.trimStart().startsWith('#'))) {
+        fail('LFS_ATTRIBUTES_CONFLICT', '图片目录包含自定义 Git 属性规则，请先处理后再启用 LFS。');
+      }
+    }
+    const previous = await read(attributesPath);
+    const lines = (previous || '').split(/\r?\n/).filter(line => line.trim() && !line.trimStart().startsWith('#'));
+    // At this directory level the final rule takes precedence, preserving every existing line.
+    if (lines.at(-1)?.trim() !== LFS_RULE) {
+      await put(attributesPath, (previous ? previous + (previous.endsWith('\n') ? '' : '\n') : '') + LFS_RULE + '\n');
+    }
+  }
   for (const winner of remoteWinners) {
     const prefix = safePath(winner.files[0].path);
     winner.files.push({ path: `${prefix}/archive/manifest.json`, content: await read(`${prefix}/archive/manifest.json`) },
       { path: `${prefix}/account.json`, content: await read(`${prefix}/account.json`) });
+  }
+  if (changes.size > MAX_FILES || [...changes.values()].reduce((total, text) => total + encoder.encode(text).byteLength, 0) > MAX_BYTES) {
+    fail('ARCHIVE_SIZE', '包含图片指针的本批同步内容过多，请分批重试。');
   }
   return { changes, conflicts, remoteWinners };
 }
@@ -262,8 +379,9 @@ async function verifyCommit(api, branch, commitSha, treeSha, changes) {
  * Conflicting snapshots are preserved under conflicts/, never forcibly merged.
  * Remote winners are returned for optional guarded local reconciliation.
  */
-export async function syncArchives({ config, bundles, fetchImpl = globalThis.fetch } = {}) {
+export async function syncArchives({ config, bundles, assetPointers = [], fetchImpl = globalThis.fetch } = {}) {
   const checked = validateBundles(bundles);
+  const assetPlan = validatePointers(checked, assetPointers);
   const parts = typeof config?.repository === 'string' ? config.repository.split('/') : [];
   if (parts.length !== 2) fail('INVALID_REPOSITORY', '仓库格式应为 owner/repository。');
   const input = { owner: parts[0], repo: parts[1], branch: config.branch, token: config.token, fetchImpl };
@@ -279,7 +397,7 @@ export async function syncArchives({ config, bundles, fetchImpl = globalThis.fet
   for (let attempt = 0; attempt < 3; attempt++) {
     const head = attempt === 0 ? info.headSha : await headOf(api, info.branch);
     const remote = await snapshot(api, head);
-    const { changes, conflicts, remoteWinners } = await plan(api, remote, checked);
+    const { changes, conflicts, remoteWinners } = await plan(api, remote, checked, assetPlan);
     if (!changes.size) return { status: 'unchanged', commitSha: head, branch: info.branch, filesChanged: 0, conflicts, remoteWinners };
     const tree = (await api.request('/git/trees', { method: 'POST', body: { base_tree: remote.treeSha,
       tree: [...changes].map(([path, content]) => ({ path, mode: '100644', type: 'blob', content })) } })).data;

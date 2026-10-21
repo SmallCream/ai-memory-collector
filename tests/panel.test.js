@@ -81,6 +81,55 @@ async function complete(f) {
   throw new Error('Job did not complete');
 }
 
+test('manual restore runs without a source tab, account binding or automatic upload', async () => {
+  const f = fixture({ config: { setupComplete: false, accounts: {} }, github: { repository: 'owner/data', token: 'secret', enabled: false } });
+  f.tabs.length = 0; f.permissions.delete(site);
+  const calls = [];
+  let restoreState = { status: 'idle' };
+  f.dependencies.restoreService = {
+    state: async () => restoreState,
+    start: async input => { calls.push(input); restoreState = { status: 'running', total: 1 }; },
+    tick: async () => { restoreState = { status: 'completed', total: 1, processed: 1 }; return restoreState; },
+  };
+  f.service = createCollectorService(f.dependencies);
+  const result = await f.service.command({ type: 'collector:restore' });
+  assert.equal(result.ok, true); assert.equal(calls.length, 1);
+  assert.equal(calls[0].config.repository, 'owner/data'); assert.equal(calls[0].directory, f.root);
+  await f.service.pump();
+  assert.equal((await f.service.state()).restoreStatus.status, 'completed');
+  assert.equal(f.calls.details, 0); assert.deepEqual(f.config().accounts, {});
+});
+
+test('scheduled remote checks run without pending uploads or ChatGPT tabs and respect interval', async () => {
+  const f = fixture({ config: { accounts: {} }, github: { repository: 'owner/data', token: 'secret', enabled: true } });
+  f.tabs.length = 0; let starts = 0;
+  f.dependencies.restoreService = {
+    state: async () => ({ status: 'completed' }),
+    start: async () => { starts++; }, tick: async () => ({ status: 'completed' }),
+  };
+  f.service = createCollectorService(f.dependencies);
+  await f.service.pump(); await f.service.pump();
+  assert.equal(starts, 1); assert.equal(f.calls.uploads.length, 0);
+  f.advance(30 * 60000); await f.service.pump(); assert.equal(starts, 2);
+});
+
+test('pending LFS work retains text outbox and only commits after upload preparation', async () => {
+  const f = fixture({ github: { repository: 'owner/data', token: 'secret', enabled: true } });
+  let prepared = false, acknowledged = 0;
+  f.dependencies.assetService = {
+    tick: async () => ({ pending: 0 }),
+    prepareUploads: async () => { if (!prepared) throw issue('LFS_UPLOAD_PENDING'); return [{ path: 'verified-pointer' }]; },
+    acknowledgeUploads: async () => { acknowledged++; },
+  };
+  f.service = createCollectorService(f.dependencies);
+  await complete(f);
+  assert.equal(f.calls.uploads.length, 0); assert.equal((await f.service.engine.getOutbox(accountKey)).length, 1);
+  assert.equal(f.store.get(`githubStatus:${accountKey}`).nextRetryAt, 0);
+  prepared = true; await f.service.pump();
+  assert.equal(f.calls.uploads.length, 1); assert.equal(f.calls.uploads[0].assetPointers[0].path, 'verified-pointer');
+  assert.equal(acknowledged, 1); assert.equal((await f.service.engine.getOutbox(accountKey)).length, 0);
+});
+
 test('automatic collection requires bound enabled account, setup and scheduling; state excludes token', async () => {
   for (const config of [{ setupComplete: false }, { autoEnabled: false }, { accounts: {} }, { accounts: { [accountKey]: { ...account, enabled: false } } }]) {
     const f = fixture({ config }); await f.service.pump();

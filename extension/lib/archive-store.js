@@ -215,7 +215,7 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
     await set(journalKey, null);
     return { ...plan.result, files: plan.files };
   }
-  async function saveUnlocked({ directory, account, detail, preferredEntry }) {
+  async function saveUnlocked({ directory, account, detail, preferredEntry, assets }) {
     const prefix = accountPrefix(account);
     if (!detail?.identity || detail.identity.accountKey !== account.accountKey) {
       fail('ACCOUNT_MISMATCH', '采集结果与任务账号不一致，未写入文件。');
@@ -241,7 +241,7 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
       validateManifest(builderManifest, account);
     }
     const built = await buildArchive({ conversation: native, identity: detail.identity, capturedAt: detail.capturedAt,
-      existingManifest: builderManifest, productionPrefix: prefix });
+      existingManifest: builderManifest, productionPrefix: prefix, assets: assets ?? prior?.assets ?? preferredEntry?.assets });
     const entry = built.manifest.conversations[id];
     if (detail.completeness === 'partial' || built.summary.coverage.messages === 'partial') {
       fail('PARTIAL_DETAIL', '这条对话尚未完整读取或仍在生成，已保留原归档，稍后重试。');
@@ -337,7 +337,19 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
       fail('REMOTE_ARCHIVE', '远端对话 ID 与清单不一致，未写入本地。');
     }
     const capturedAt = sourceTime(entry.lastChangedAt) || sourceTime(entry.firstCapturedAt) || new Date().toISOString();
-    const result = await saveConversation({ directory, account, preferredEntry: entry, detail: {
+    const localManifest = await readAccountManifest(directory, account);
+    const localEntry = localManifest?.conversations?.[entry.conversationId];
+    let assets = entry.assets;
+    if (localEntry?.contentHash === entry.contentHash && Array.isArray(localEntry.assets)) {
+      const merged = new Map((entry.assets || []).map(asset => [asset.id, asset]));
+      for (const asset of localEntry.assets) {
+        const remote = merged.get(asset.id);
+        if (!remote || (asset.status === 'downloaded' && remote.status !== 'downloaded') ||
+            (asset.status === 'external' && remote.status === 'pending')) merged.set(asset.id, asset);
+      }
+      assets = [...merged.values()];
+    }
+    const result = await saveConversation({ directory, account, preferredEntry: entry, assets, detail: {
       identity: { accountKey: account.accountKey, displayName: account.displayName || remoteAccount.displayName || account.alias },
       payload: native, capturedAt, completeness: entry.sourceCompleteness === 'complete' ? 'complete' : 'unknown',
     } });
