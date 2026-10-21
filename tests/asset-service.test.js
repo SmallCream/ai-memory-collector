@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import vm from 'node:vm';
+import { webcrypto } from 'node:crypto';
+import { createChatGPTAssetResolver } from '../extension/lib/chatgpt-assets.js';
 import { createAssetService } from '../extension/lib/asset-service.js';
 import { createArchiveStore, readAccountManifest } from '../extension/lib/archive-store.js';
 import { assetPath } from '../extension/lib/asset-store.js';
@@ -76,6 +79,78 @@ test('capture persists exact image, regenerates Markdown and enqueues archive wh
   assert.match(env.fs.text(entry.markdownPath), /assets\/[a-f0-9]{64}\.png/);
   assert.equal(env.enqueued.length, 1); assert.equal(env.captures.length, 1);
   assert.ok(!JSON.stringify(await env.fs.getSetting(`assetJobs:${account.accountKey}`)).includes('retrieval'));
+});
+
+test('bare generated pointer reaches authenticated file download, local image, Markdown and LFS preparation after restart', async t => {
+  for (const mode of ['json-link', 'opaque-follow']) await t.test(mode, async () => {
+    const fs = memoryBinaryFs(), store = createArchiveStore({ get: fs.getSetting, set: fs.setSetting });
+    const user = 'synthetic-generated-user';
+    const owner = { ...account, accountKey: `acct-${(await hashBytes(new TextEncoder().encode(`chatgpt:${user}`))).slice(0, 24)}` };
+    const conversationId = 'synthetic-generated-conversation';
+    const source = detail([{ content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_generated',
+      width: 1, height: 1, size_bytes: PNG.length, metadata: { asset_pointer_link: null } }]);
+    source.identity.accountKey = owner.accountKey; source.payload.conversation_id = conversationId;
+    const entryURL = `https://chatgpt.com/backend-api/files/download/file_generated?conversation_id=${conversationId}&download_intent=false&inline=true`;
+    const contentURL = 'https://chatgpt.com/backend-api/estuary/content?id=file_generated&sig=synthetic-generated-signature';
+    const sessionURL = 'https://chatgpt.com/api/auth/session';
+    const calls = [], injected = [], enqueued = [], uploaded = [];
+    const png = () => new Response(PNG, { headers: { 'content-type': 'image/png' } });
+    const fetch = async (url, options) => {
+      calls.push({ url, options });
+      if (url === sessionURL) return new Response(JSON.stringify({ user: { id: user }, accessToken: 'synthetic-session-secret' }),
+        { headers: { 'content-type': 'application/json' } });
+      if (url === entryURL) {
+        if (mode === 'json-link') return new Response(JSON.stringify({ download_url: contentURL }),
+          { headers: { 'content-type': 'application/json' } });
+        return options.redirect === 'manual' ? { type: 'opaqueredirect' } : Object.defineProperty(png(), 'url', { value: contentURL });
+      }
+      if (url === contentURL) return png();
+      throw new Error('Unexpected synthetic request');
+    };
+    const browser = { tabs: { get: async () => ({ url: 'https://chatgpt.com/c/different-open-conversation' }) },
+      scripting: { executeScript: async options => {
+        injected.push(options.args[0]);
+        const context = vm.createContext({ URL, crypto: webcrypto, TextEncoder, TextDecoder, Uint8Array, DataView,
+          AbortController, setTimeout, clearTimeout, btoa, atob, location: { origin: 'https://chatgpt.com' },
+          document: { querySelectorAll: () => [] }, fetch });
+        const probe = vm.runInContext(`(${options.func.toString()})`, context);
+        return [{ frameId: 0, result: await probe(...options.args) }];
+      } } };
+    const resolver = createChatGPTAssetResolver(browser, { allowFileDownload: true });
+    const dependencies = { getSetting: fs.getSetting, setSetting: fs.setSetting, readAccountManifest,
+      saveConversation: store.saveConversation, resolveAsset: resolver.resolve, refreshConversation: async () => source,
+      enqueueArchive: async input => enqueued.push(input),
+      lfsFactory: () => ({ upload: async input => uploaded.push(input) }) };
+    let service = createAssetService(dependencies);
+    const saved = await service.save({ directory: fs.directory, account: owner, detail: source });
+    const original = fs.text(saved.entry.jsonPath);
+    const queueKey = `assetJobs:${owner.accountKey}`, state = await fs.getSetting(queueKey);
+    state.tasks[0].error = { code: 'ASSET_PENDING', message: 'synthetic earlier version' };
+    state.tasks[0].retryAt = Date.now() + 60000; await fs.setSetting(queueKey, state);
+    service = createAssetService(dependencies);
+    await service.retryFailed({ account: owner });
+    const tick = await service.tick({ directory: fs.directory, account: owner, tabId: 7, manualOnly: true });
+    assert.equal(tick.pending, 0, JSON.stringify(await service.diagnostics({ account: owner })));
+    assert.equal(injected[0].conversationId, conversationId);
+    assert.equal(injected[0].allowFileDownload, true);
+    for (const call of calls.filter(c => c.url !== sessionURL)) {
+      assert.equal(call.options.headers.Authorization, 'Bearer synthetic-session-secret');
+      assert.ok(['include', 'same-origin'].includes(call.options.credentials));
+    }
+    const entry = (await readAccountManifest(fs.directory, owner)).conversations[conversationId];
+    assert.deepEqual(fs.files.get(entry.assets[0].localPath), PNG);
+    assert.equal(entry.assets[0].quality, 'original');
+    assert.equal(fs.text(entry.jsonPath), original);
+    assert.match(fs.text(entry.markdownPath), /assets\/[a-f0-9]{64}\.png/);
+    assert.equal(enqueued.length, 1);
+    const pointers = await service.prepareUploads({ directory: fs.directory, account: owner, config, bundles: [enqueued[0].archive] });
+    assert.equal(uploaded.length, 1); assert.deepEqual(uploaded[0].bytes, PNG);
+    assert.equal(parseLfsPointer(pointers[0].content).oid, entry.assets[0].oid);
+    const persisted = [...fs.files.values()].map(bytes => new TextDecoder().decode(bytes)).join('\n') +
+      JSON.stringify([...fs.settings.entries()]) + JSON.stringify(enqueued);
+    assert.ok(!persisted.includes('synthetic-generated-signature'));
+    assert.ok(!persisted.includes('synthetic-session-secret'));
+  });
 });
 
 test('failure diagnostics immediately reflect durable queue and never expose raw error URLs or tokens', async () => {

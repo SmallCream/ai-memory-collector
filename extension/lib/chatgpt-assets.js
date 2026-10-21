@@ -3,6 +3,7 @@ export const DEFAULT_ASSET_LIMIT = 16 * 1024 * 1024;
 const ACCOUNT = /^acct-[a-f0-9]{24}$/;
 const FILE = /^file[-_][A-Za-z0-9_-]{1,160}$/;
 const LIBRARY = /^libfile_[A-Za-z0-9_-]{1,160}$/;
+const CONVERSATION = /^[a-zA-Z0-9_-]{1,100}$/;
 
 export class ChatGPTAssetError extends Error {
   constructor(code, message, state = 'pending') {
@@ -36,20 +37,24 @@ function descriptor(input) {
 }
 
 /**
- * Library download remains opt-in until verified in the installed browser.
- * Only the observed /api/library/files/{library_file_id}/download route is tried.
+ * Library and file download routes remain opt-in. File download uses the
+ * observed route with a task-owned conversation ID, never the current tab URL.
  * DOM fallback requires an exact matching resource ID; filenames are not ownership evidence.
  */
-export function createChatGPTAssetResolver(browser, { allowLibraryDownload = false, maxBytes = DEFAULT_ASSET_LIMIT } = {}) {
+export function createChatGPTAssetResolver(browser, { allowLibraryDownload = false, allowFileDownload = false,
+  maxBytes = DEFAULT_ASSET_LIMIT } = {}) {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > DEFAULT_ASSET_LIMIT) {
     failure('ASSET_INPUT', '图片大小上限必须介于 1 字节和 16 MiB。', 'unavailable');
   }
-  async function resolve({ tabId, account, asset }) {
+  async function resolve({ tabId, account, asset, conversationId }) {
     const api = browser ?? globalThis.chrome;
     if (!Number.isSafeInteger(tabId) || tabId < 0) failure('TAB_REQUIRED', '请打开对应账号的 ChatGPT 页面。');
     const accountKey = typeof account === 'string' ? account : account?.accountKey;
     if (!ACCOUNT.test(accountKey || '') || (account?.platform && account.platform !== 'chatgpt')) {
       failure('IDENTITY', '缺少经过核验的 ChatGPT 账号。');
+    }
+    if (conversationId != null && (typeof conversationId !== 'string' || !CONVERSATION.test(conversationId))) {
+      failure('ASSET_INPUT', '图片所属对话标识不合法。', 'unavailable');
     }
     const source = descriptor(asset);
     if (source.size > maxBytes) failure('ASSET_TOO_LARGE', '图片超过本次自动获取的大小上限。');
@@ -62,8 +67,8 @@ export function createChatGPTAssetResolver(browser, { allowLibraryDownload = fal
     let result;
     try {
       const values = await api.scripting.executeScript({ target: { tabId, frameIds: [0] }, world: 'ISOLATED',
-        func: probeChatGPTAsset, args: [{ expectedAccountKey: accountKey, asset: source,
-          allowLibraryDownload: allowLibraryDownload === true, maxBytes }] });
+        func: probeChatGPTAsset, args: [{ expectedAccountKey: accountKey, asset: source, conversationId: conversationId ?? null,
+          allowLibraryDownload: allowLibraryDownload === true, allowFileDownload: allowFileDownload === true, maxBytes }] });
       result = values?.find(item => item.frameId === 0)?.result;
     } catch { failure('TAB_UNAVAILABLE', '无法读取图片来源页面，请检查站点权限和登录状态。'); }
     await tabCheck();
@@ -101,8 +106,9 @@ export function createChatGPTAssetResolver(browser, { allowLibraryDownload = fal
   return Object.freeze({ resolve });
 }
 
-export async function resolveChatGPTAsset({ browser, allowLibraryDownload = false, maxBytes = DEFAULT_ASSET_LIMIT, ...request }) {
-  return createChatGPTAssetResolver(browser, { allowLibraryDownload, maxBytes }).resolve(request);
+export async function resolveChatGPTAsset({ browser, allowLibraryDownload = false, allowFileDownload = false,
+  maxBytes = DEFAULT_ASSET_LIMIT, ...request }) {
+  return createChatGPTAssetResolver(browser, { allowLibraryDownload, allowFileDownload, maxBytes }).resolve(request);
 }
 
 /**
@@ -172,7 +178,8 @@ export async function probeChatGPTAsset(request) {
   const maxAllowed = 16 * 1024 * 1024;
   const filePattern = /^file[-_][A-Za-z0-9_-]{1,160}$/;
   const libraryPattern = /^libfile_[A-Za-z0-9_-]{1,160}$/;
-  let asset, maximum;
+  const conversationPattern = /^[a-zA-Z0-9_-]{1,100}$/;
+  let asset, maximum, fileDownloadURL;
   function safeURL(value, { blob = false } = {}) {
     let url; try { url = new URL(value, 'https://chatgpt.com'); } catch { fail('ASSET_URL', '图片地址无法识别。'); }
     if (blob && url.protocol === 'blob:' && /^blob:https:\/\/chatgpt\.com\/[A-Za-z0-9-]+$/.test(url.href)) return url;
@@ -212,7 +219,7 @@ export async function probeChatGPTAsset(request) {
     for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.byteLength; }
     return result;
   }
-  async function requestData(url, token, limit, sessionRequest = false, allowLibraryRedirectFollow = false) {
+  async function requestData(url, token, limit, sessionRequest = false, allowNativeRedirectFollow = false) {
     const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 20000);
     try {
       const sameOrigin = new URL(url, 'https://chatgpt.com').origin === 'https://chatgpt.com' && !String(url).startsWith('blob:');
@@ -220,10 +227,11 @@ export async function probeChatGPTAsset(request) {
         cache: 'no-store', redirect: sessionRequest ? 'error' : 'manual', referrerPolicy: 'no-referrer',
         headers: token && sameOrigin ? { Authorization: `Bearer ${token}` } : {}, signal: controller.signal };
       let response = await fetch(url, options);
-      if (response.type === 'opaqueredirect' && !sessionRequest && allowLibraryRedirectFollow && asset.libraryFileId &&
-          url === `https://chatgpt.com/api/library/files/${asset.libraryFileId}/download`) {
-        // Browser fetch hides Location on manual redirects. Only this canonical
-        // platform download entry may delegate one redirect chain to the browser.
+      if (response.type === 'opaqueredirect' && !sessionRequest && allowNativeRedirectFollow &&
+          ((asset.libraryFileId && url === `https://chatgpt.com/api/library/files/${asset.libraryFileId}/download`) ||
+            (fileDownloadURL && url === fileDownloadURL))) {
+        // Browser fetch hides Location on manual redirects. Only these canonical
+        // platform download entries may delegate a redirect chain to the browser.
         // Fetch removes Authorization on cross-origin redirects; same-origin
         // credentials keep cookies off the CDN. Intermediate anonymous requests
         // are not prevalidated; the final destination is checked before reading.
@@ -305,7 +313,8 @@ export async function probeChatGPTAsset(request) {
     for (let attempt = 0; attempt < 4; attempt++) {
       if (seen.has(url)) fail('ASSET_REDIRECT', '图片地址发生循环跳转。');
       seen.add(url);
-      const result = await requestData(url, token, maximum, false, via === 'library-download' && attempt === 0);
+      const result = await requestData(url, token, maximum, false,
+        (via === 'library-download' || via === 'file-download') && attempt === 0);
       let next = result.redirect;
       if (result.mime === 'application/json') {
         let payload; try { payload = JSON.parse(new TextDecoder().decode(result.bytes)); } catch { fail('ASSET_PROTOCOL', '图片下载响应无法解析。'); }
@@ -360,13 +369,17 @@ export async function probeChatGPTAsset(request) {
     if (location.origin !== 'https://chatgpt.com') fail('ORIGIN', '请在已登录的 ChatGPT 页面中读取图片。');
     if (!record(request) || !/^acct-[a-f0-9]{24}$/.test(request.expectedAccountKey || '') || !record(request.asset)) fail('ASSET_INPUT', '图片请求缺少有效账号和资源信息。', 'unavailable');
     asset = request.asset; maximum = request.maxBytes;
-    if ((!asset.fileId && !asset.libraryFileId && !asset.retrievalURL) || (asset.fileId && !filePattern.test(asset.fileId)) ||
+    if ((request.conversationId != null && (typeof request.conversationId !== 'string' || !conversationPattern.test(request.conversationId))) ||
+        (!asset.fileId && !asset.libraryFileId && !asset.retrievalURL) || (asset.fileId && !filePattern.test(asset.fileId)) ||
         (asset.libraryFileId && !libraryPattern.test(asset.libraryFileId)) || !Number.isSafeInteger(maximum) || maximum < 1 || maximum > maxAllowed ||
         (asset.expectedHash && !/^[a-f0-9]{64}$/.test(asset.expectedHash)) ||
         ['size', 'width', 'height'].some(key => asset[key] != null && (!Number.isSafeInteger(asset[key]) || asset[key] < 1))) {
       fail('ASSET_INPUT', '图片请求参数不合法。', 'unavailable');
     }
     if (asset.size > maximum) fail('ASSET_TOO_LARGE', '图片超过本次自动获取的大小上限。');
+    if (request.allowFileDownload === true && asset.fileId && request.conversationId) {
+      fileDownloadURL = `https://chatgpt.com/backend-api/files/download/${asset.fileId}?conversation_id=${request.conversationId}&download_intent=false&inline=true`;
+    }
     // The transient URL comes from the captured attachment, never from a guessed endpoint.
     if (asset.retrievalURL) safeURL(asset.retrievalURL, { blob: true });
     const before = await session();
@@ -378,6 +391,10 @@ export async function probeChatGPTAsset(request) {
     }
     if (!binary && request.allowLibraryDownload === true && asset.libraryFileId) {
       try { binary = await download(`https://chatgpt.com/api/library/files/${asset.libraryFileId}/download`, before.token, 'library-download'); }
+      catch (error) { lastError = error; }
+    }
+    if (!binary && fileDownloadURL) {
+      try { binary = await download(fileDownloadURL, before.token, 'file-download'); }
       catch (error) { lastError = error; }
     }
     if (!binary) {

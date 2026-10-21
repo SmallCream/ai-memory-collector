@@ -12,6 +12,8 @@ const asset = { fileId: 'file_testA', libraryFileId: 'libfile_testA', fileName: 
   size: PNG.byteLength, width: 1, height: 1, mimeType: 'image/png' };
 const libraryURL = 'https://chatgpt.com/api/library/files/libfile_testA/download';
 const estuaryURL = 'https://chatgpt.com/backend-api/estuary/content?id=file_testA&fn=synthetic-image.png&cd=attachment&ts=2000000000&p=fs&cid=1&sig=synthetic-estuary-secret&v=0';
+const conversationId = 'synthetic-conversation_A';
+const fileDownloadURL = `https://chatgpt.com/backend-api/files/download/file_testA?conversation_id=${conversationId}&download_intent=false&inline=true`;
 const sessionURL = 'https://chatgpt.com/api/auth/session';
 const pngResponse = (bytes = PNG, headers = {}) => new Response(bytes, { headers: { 'content-type': 'image/png', ...headers } });
 const locatedResponse = (response, url) => Object.defineProperty(response, 'url', { value: url });
@@ -88,6 +90,136 @@ test('Library route is opt-in, while a visible exact-ID blob can be fetched in t
   const blob = h.calls.find(call => call.url.startsWith('blob:'));
   assert.equal(blob.options.credentials, 'omit');
   assert.equal(blob.options.headers.Authorization, undefined);
+});
+
+test('a bare generated-image pointer uses the observed file-download route with its task conversation and authenticated native follow', async () => {
+  const h = harness({ serve: (_, options) => options.redirect === 'manual' ? { type: 'opaqueredirect' } :
+    locatedResponse(pngResponse(), estuaryURL) });
+  let probeResult;
+  const resolver = createChatGPTAssetResolver(browserFor(h, { mutate: result => { probeResult = result; return result; } }),
+    { allowFileDownload: true });
+  const result = await resolver.resolve({ tabId: 3, account: ACCOUNT, conversationId,
+    asset: { ...asset, libraryFileId: undefined, sourceRef: 'sediment://file_testA' } });
+  assert.deepEqual(result.bytes, PNG); assert.equal(result.sha256, await hash(PNG));
+  assert.equal(result.via, 'file-download'); assert.equal(result.quality, 'original');
+  assert.deepEqual(h.calls.map(call => call.url), [sessionURL, fileDownloadURL, fileDownloadURL, sessionURL]);
+  assert.equal(h.calls[1].options.credentials, 'include');
+  assert.equal(h.calls[1].options.headers.Authorization, 'Bearer synthetic-secret-token');
+  assert.equal(h.calls[2].options.redirect, 'follow'); assert.equal(h.calls[2].options.credentials, 'same-origin');
+  assert.equal(h.calls[2].options.headers.Authorization, 'Bearer synthetic-secret-token');
+  assert.equal(h.calls[2].options.referrerPolicy, 'no-referrer');
+  assert.equal(h.calls[2].options.signal, h.calls[1].options.signal);
+  for (const value of [probeResult, result]) {
+    assert.doesNotMatch(JSON.stringify(value), /https:\/\/|synthetic-estuary-secret|synthetic-secret-token/);
+  }
+});
+
+test('file download accepts direct bytes, a JSON download URL, and a readable redirect without native follow', async t => {
+  for (const value of [
+    { name: 'direct bytes', response: () => pngResponse(), urls: [fileDownloadURL] },
+    { name: 'JSON link', response: () => jsonResponse({ download_url: estuaryURL }), urls: [fileDownloadURL, estuaryURL] },
+    { name: 'readable Location', response: () => new Response(null, { status: 302, headers: { location: estuaryURL } }),
+      urls: [fileDownloadURL, estuaryURL] },
+  ]) await t.test(value.name, async () => {
+    const h = harness({ serve: url => url === fileDownloadURL ? value.response() : pngResponse() });
+    const result = await h.run({ asset: { ...asset, libraryFileId: null }, allowFileDownload: true, conversationId });
+    assert.equal(result.ok, true); assert.equal(result.binary.via, 'file-download');
+    assert.equal(result.binary.sha256, await hash(PNG));
+    assert.deepEqual(h.calls.map(call => call.url), [sessionURL, ...value.urls, sessionURL]);
+    for (const call of h.calls.filter(call => call.url !== sessionURL)) {
+      assert.equal(call.options.redirect, 'manual'); assert.equal(call.options.credentials, 'include');
+      assert.equal(call.options.headers.Authorization, 'Bearer synthetic-secret-token');
+    }
+    assert.doesNotMatch(JSON.stringify(result), /https:\/\/|synthetic-estuary-secret|synthetic-secret-token/);
+  });
+});
+
+test('file download requires explicit opt-in, a file ID and a task conversation instead of inferring the current tab', async t => {
+  for (const value of [
+    { name: 'default disabled', request: { conversationId } },
+    { name: 'missing task conversation', request: { allowFileDownload: true } },
+    { name: 'null task conversation', request: { allowFileDownload: true, conversationId: null } },
+    { name: 'missing file ID', request: { allowFileDownload: true, conversationId, asset: { libraryFileId: asset.libraryFileId } } },
+  ]) await t.test(value.name, async () => {
+    const h = harness();
+    const result = await h.run({ asset: { ...asset, libraryFileId: null }, allowLibraryDownload: false, ...value.request });
+    assert.equal(result.error.code, 'ASSET_PENDING');
+    assert.deepEqual(h.calls.map(call => call.url), [sessionURL, sessionURL]);
+  });
+  const h = harness();
+  const resolver = createChatGPTAssetResolver(browserFor(h));
+  await assert.rejects(resolver.resolve({ tabId: 3, account: ACCOUNT, conversationId,
+    asset: { ...asset, libraryFileId: undefined } }), { code: 'ASSET_PENDING' });
+  assert.deepEqual(h.calls.map(call => call.url), [sessionURL, sessionURL]);
+});
+
+test('invalid task conversation IDs are rejected by both resolver and injected probe before network access', async t => {
+  for (const value of ['', '../other', 'conversation?extra=1', 'conversation/other', 'x'.repeat(101), 123, {}]) {
+    await t.test(JSON.stringify(value), async () => {
+      const h = harness();
+      const resolver = createChatGPTAssetResolver(browserFor(h), { allowFileDownload: true });
+      await assert.rejects(resolver.resolve({ tabId: 3, account: ACCOUNT, conversationId: value, asset }), { code: 'ASSET_INPUT' });
+      const result = await h.run({ allowFileDownload: true, conversationId: value });
+      assert.equal(result.error.code, 'ASSET_INPUT'); assert.equal(h.calls.length, 0);
+    });
+  }
+});
+
+test('file download runs after captured and Library failures, while arbitrary captured URLs do not gain native follow', async () => {
+  const captured = `${fileDownloadURL}&include_library_file_state=true`;
+  const h = harness({ images: [image()], serve: (url, options) => {
+    if (url === captured) return { type: 'opaqueredirect' };
+    if (url === libraryURL) return new Response('', { status: 404 });
+    if (url === fileDownloadURL) return options.redirect === 'manual' ? { type: 'opaqueredirect' } : locatedResponse(pngResponse(), estuaryURL);
+    throw new Error('unexpected request');
+  } });
+  const result = await h.run({ asset: { ...asset, retrievalURL: captured }, allowFileDownload: true, conversationId });
+  assert.equal(result.ok, true); assert.equal(result.binary.via, 'file-download');
+  assert.deepEqual(h.calls.map(call => call.url), [sessionURL, captured, libraryURL, fileDownloadURL, fileDownloadURL, sessionURL]);
+  assert.equal(h.calls[1].options.redirect, 'manual');
+  assert.deepEqual(h.calls.filter(call => call.options.redirect === 'follow').map(call => call.url), [fileDownloadURL]);
+});
+
+test('file download preserves errors and byte/account constraints when the DOM has no usable image', async t => {
+  for (const value of [
+    { name: 'HTTP 403', response: () => new Response('', { status: 403 }), code: 'HTTP_403' },
+    { name: 'unknown JSON', response: () => jsonResponse({ unexpected: true }), code: 'ASSET_PROTOCOL' },
+    { name: 'HTML', response: () => new Response('<html>login</html>', { headers: { 'content-type': 'text/html' } }), code: 'ASSET_FORMAT' },
+    { name: 'opaque follow', response: () => ({ type: 'opaqueredirect' }), code: 'ASSET_REDIRECT' },
+    { name: 'network failure', response: () => { throw new TypeError('synthetic-private-url-secret'); }, code: 'ASSET_NETWORK' },
+    { name: 'initial wrong account', sessions: ['synthetic-user-B'], code: 'ACCOUNT_CHANGED', noDownload: true },
+    { name: 'account changed', sessions: ['synthetic-user-A', 'synthetic-user-B'], code: 'ACCOUNT_CHANGED' },
+    { name: 'wrong dimensions', source: { width: 2 }, code: 'ASSET_VARIANT' },
+    { name: 'wrong size', source: { size: PNG.length + 1 }, code: 'ASSET_VARIANT' },
+    { name: 'wrong hash', source: { expectedHash: '0'.repeat(64) }, code: 'ASSET_HASH_MISMATCH' },
+    { name: 'wrong MIME', response: () => pngResponse(PNG, { 'content-type': 'image/jpeg' }), code: 'ASSET_FORMAT' },
+    { name: 'invalid bytes', response: () => pngResponse(new TextEncoder().encode('not an image')), code: 'ASSET_FORMAT' },
+    { name: 'declared limit', response: () => pngResponse(PNG, { 'content-length': '99999999' }), code: 'ASSET_TOO_LARGE' },
+    { name: 'stream limit', source: { size: null }, maxBytes: 32, code: 'ASSET_TOO_LARGE' },
+  ]) await t.test(value.name, async () => {
+    const h = harness({ sessions: value.sessions, serve: (_, options) => options.redirect === 'manual' ? { type: 'opaqueredirect' } :
+      locatedResponse((value.response || pngResponse)(), estuaryURL) });
+    const result = await h.run({ asset: { ...asset, libraryFileId: null, ...value.source },
+      conversationId, allowFileDownload: true, maxBytes: value.maxBytes || 16 * 1024 * 1024 });
+    assert.equal(result.error.code, value.code); assert.equal(result.binary, undefined);
+    if (value.noDownload) assert.deepEqual(h.calls.map(call => call.url), [sessionURL]);
+    assert.doesNotMatch(JSON.stringify(result), /https:\/\/|synthetic-.*secret/);
+  });
+});
+
+test('file-download native follow rejects an unrelated final file before reading response bytes', async t => {
+  for (const url of [estuaryURL.replace('file_testA', 'file_other'), `${estuaryURL}&id=file_testA`,
+    'https://chatgpt.com/backend-api/files/download/file_other?conversation_id=synthetic-other',
+    'https://attacker.example/image.png', undefined]) await t.test(String(url), async () => {
+    let reads = 0;
+    const h = harness({ serve: (_, options) => options.redirect === 'manual' ? { type: 'opaqueredirect' } : {
+      type: 'basic', url, ok: true, status: 200, headers: new Headers({ 'content-type': 'image/png' }),
+      get body() { reads++; return null; },
+    } });
+    const result = await h.run({ asset: { ...asset, libraryFileId: null }, conversationId, allowFileDownload: true });
+    assert.equal(result.error.code, 'ASSET_URL'); assert.equal(reads, 0); assert.equal(result.binary, undefined);
+    assert.doesNotMatch(JSON.stringify(result), /https:\/\/|synthetic-estuary-secret/);
+  });
 });
 
 test('legacy file- IDs are inferred from native references and accepted by the injected page probe', async () => {
@@ -250,7 +382,7 @@ test('Library follow validates the final HTTPS destination before reading its bo
 
 test('captured URLs, queried Library URLs and anonymous CDN requests never opt into native follow', async t => {
   for (const url of [libraryURL, `${libraryURL}?download=true`, `${libraryURL}#download`,
-    'https://chatgpt.com/backend-api/files/file_testA/download', estuaryURL, 'https://sdmntprtest.oaiusercontent.com/a.png',
+    'https://chatgpt.com/backend-api/files/file_testA/download', fileDownloadURL, estuaryURL, 'https://sdmntprtest.oaiusercontent.com/a.png',
     'blob:https://chatgpt.com/1111-2222']) {
     await t.test(url, async () => {
       const h = harness({ serve: () => ({ type: 'opaqueredirect' }) });

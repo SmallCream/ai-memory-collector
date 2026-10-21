@@ -150,7 +150,8 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
         // A newly resolved Library ID is a location hint. Keep original byte
         // size/dimension/hash constraints and message anchors from the archive.
         const completed = ready(asset) || asset.status === 'external' ? asset : await capture({ ...fresh, ...asset,
-          ...(fresh?.libraryFileId ? { libraryFileId: fresh.libraryFileId } : {}), retrieval }, { directory, account, tabId });
+          ...(fresh?.libraryFileId ? { libraryFileId: fresh.libraryFileId } : {}), retrieval },
+        { directory, account, tabId, conversationId: task.conversationId });
         const updated = entry.assets.map(a => a.id === asset.id ? completed : a);
         const saved = await saveConversation({ directory, account, assets: sanitizeAssetRecords(updated), detail: {
           payload: native, identity: { accountKey: account.accountKey, displayName: account.displayName },

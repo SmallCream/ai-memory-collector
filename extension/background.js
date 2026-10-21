@@ -11,7 +11,7 @@ import { createChatGPTAssetResolver } from './lib/chatgpt-assets.js';
 import { createRestoreService } from './lib/restore-service.js';
 import { fetchRepositorySnapshot, downloadRepositoryFile } from './lib/github-restore.js';
 
-const resolver = createChatGPTAssetResolver(chrome, { allowLibraryDownload: true });
+const resolver = createChatGPTAssetResolver(chrome, { allowLibraryDownload: true, allowFileDownload: true });
 const adapter = getAdapter('chatgpt');
 const assets = createAssetService({ getSetting, setSetting, readAccountManifest, saveConversation,
   resolveAsset: resolver.resolve, downloadRepositoryFile,
