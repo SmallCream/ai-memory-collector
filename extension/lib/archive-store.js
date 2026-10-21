@@ -35,10 +35,15 @@ async function digest(text) {
   return [...new Uint8Array(bytes)].map(x => x.toString(16).padStart(2, '0')).join('');
 }
 function sourceTime(value) {
-  if (value === null || value === undefined || value === '') return null;
+  if (typeof value === 'string') {
+    value = value.trim();
+    if (!value) return null;
+    if (/^[+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(value)) value = Number(value);
+  }
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
   const ms = typeof value === 'number' ? value * (value >= 1e12 ? 1 : 1000) : Date.parse(value);
   if (!Number.isFinite(ms)) return null;
-  const date = new Date(ms);
+  const date = new Date(Math.trunc(ms));
   return date.getUTCFullYear() >= 1970 && date.getUTCFullYear() <= 9999 ? date.toISOString() : null;
 }
 function assertNativeNotPartial(native) {
@@ -131,6 +136,25 @@ export async function readAccountManifest(directory, account) {
   }
   const text = await read(directory, `${prefix}/archive/manifest.json`);
   return text === null ? null : validateManifest(parse(text), account);
+}
+
+/** Cheap presence check for incremental scans; it does not read or hash history. */
+export async function hasConversationFiles(directory, account, entry) {
+  // Reuse the writer's ownership/path rules before touching either file.
+  validateManifest({ schemaVersion: 1, platform: account?.platform, accountKey: account?.accountKey,
+    conversations: { [entry?.conversationId]: entry } }, account);
+  await ensurePermission(directory);
+  for (const path of [entry.jsonPath, entry.markdownPath]) {
+    try {
+      const target = await parent(directory, path);
+      const file = await (await target.directory.getFileHandle(target.name)).getFile();
+      if (!Number.isFinite(file.size) || file.size <= 0) return false;
+    } catch (error) {
+      if (error?.name === 'NotFoundError') return false;
+      throw error;
+    }
+  }
+  return true;
 }
 
 function withLock(directory, key, operation) {

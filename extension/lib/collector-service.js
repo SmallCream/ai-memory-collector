@@ -6,7 +6,7 @@ const SCRIPT_ID = 'collector-chatgpt-entry';
 const matches = value => { try { return new URL(value).origin === 'https://chatgpt.com'; } catch { return false; } };
 
 export function createCollectorService({ browser, getSetting, setSetting, adapter, createEngine,
-  readAccountManifest, saveConversation, applyRemoteFiles, syncArchives, probeRepository,
+  readAccountManifest, hasConversationFiles, saveConversation, applyRemoteFiles, syncArchives, probeRepository,
   assetService, restoreService,
   now = Date.now, later = setTimeout }) {
   const settings = createConfigStore({ getSetting, setSetting });
@@ -23,7 +23,7 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
     return result;
   }
   const engine = createEngine({ getSetting, setSetting, getDirectory: () => getSetting('directory'),
-    readAccountManifest, adapter, saveConversation, now });
+    readAccountManifest, hasConversationFiles, adapter, saveConversation, now });
 
   async function directoryState() {
     const directory = await getSetting('directory');

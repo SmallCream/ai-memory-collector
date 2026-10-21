@@ -9,7 +9,6 @@ const LIVE = new Set(['running', 'paused', 'blocked']);
 const MAX_ITEMS = 100_000;
 const MAX_PAGES = 5_000;
 const MAX_ATTEMPTS = 3;
-const OVERLAP_MS = 5 * 60_000;
 const COPY = value => value == null ? value : structuredClone(value);
 const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 const keys = accountKey => ({ job: `collectorJob:${accountKey}`, index: `collectorIndex:${accountKey}`, outbox: `collectorOutbox:${accountKey}` });
@@ -58,7 +57,7 @@ function safeError(error) {
 }
 
 function transient(code) {
-  return ['NETWORK', 'TIMEOUT', 'HTTP_429', 'PARTIAL_DETAIL', 'INCOMPLETE_DETAIL', 'STORAGE'].includes(code) || /^HTTP_5\d\d$/.test(code);
+  return ['NETWORK', 'TIMEOUT', 'HTTP_429', 'PARTIAL_DETAIL', 'INCOMPLETE_DETAIL', 'STALE_DETAIL', 'STORAGE'].includes(code) || /^HTTP_5\d\d$/.test(code);
 }
 
 function blocked(code) {
@@ -66,12 +65,37 @@ function blocked(code) {
 }
 
 function timestamp(value) {
-  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value < 1e12 ? value * 1000 : value;
-  if (typeof value === 'string' && value) {
-    const time = Date.parse(value);
-    if (Number.isFinite(time)) return time;
+  if (typeof value === 'string') {
+    value = value.trim();
+    if (!value) return null;
+    // Date.parse returns milliseconds, including dates close to the Unix epoch.
+    if (!/^[+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(value)) return milliseconds(Date.parse(value));
+    value = Number(value);
   }
-  return null;
+  return typeof value === 'number' ? milliseconds(value < 1e12 ? value * 1000 : value) : null;
+}
+
+function milliseconds(value) {
+  return Number.isFinite(value) && value >= 0 && value <= 253402300799999 ? Math.trunc(value) : null;
+}
+
+function baselines(manifest, index, unfinished = []) {
+  const retry = new Set(unfinished), result = {};
+  for (const [id, entry] of Object.entries(manifest?.conversations || {})) {
+    if (retry.has(id) || entry.sourceCompleteness !== 'complete' || !entry.contentHash) continue;
+    const indexed = own(index, id) ? index[id] : null;
+    const sourceUpdatedAt = timestamp(entry.sourceUpdatedAt);
+    const indexedTime = milliseconds(indexed?.listUpdateTime);
+    // A remote restore/merge can change the archive independently of this
+    // browser's index. Only reuse an index tied to the same native JSON bytes.
+    const listUpdateTime = indexed?.contentHash === entry.contentHash &&
+      (sourceUpdatedAt === null || indexedTime <= sourceUpdatedAt) ? indexedTime : null;
+    Object.defineProperty(result, id, { enumerable: true, configurable: true, writable: true,
+      value: { conversationId: id, title: entry.title, contentHash: entry.contentHash, markdownHash: entry.markdownHash,
+        jsonPath: entry.jsonPath, markdownPath: entry.markdownPath,
+        sourceCompleteness: entry.sourceCompleteness, sourceUpdatedAt, listUpdateTime } });
+  }
+  return result;
 }
 
 function validateAccount(account) {
@@ -109,7 +133,7 @@ function queueDiagnostics(queue = []) {
 
 function stateOf(job) {
   if (!job) return null;
-  const { queue, known, manifestIds, ...state } = job;
+  const { queue, known, manifestIds, unfinishedIds, ...state } = job;
   return COPY({ ...state, diagnostics: queueDiagnostics(queue) });
 }
 
@@ -128,7 +152,7 @@ function counts(job) {
 /** Dependencies deliberately accept promises so IndexedDB and real file handles
  * can be replaced by in-memory stores in deterministic restart/failure tests. */
 export function createCollectorEngine({ getSetting, setSetting, getDirectory, readAccountManifest,
-  adapter, saveConversation, now = Date.now, onChange = () => {},
+  hasConversationFiles = async () => false, adapter, saveConversation, now = Date.now, onChange = () => {},
   makeId = () => crypto.randomUUID() } = {}) {
   for (const dependency of [getSetting, setSetting, getDirectory, readAccountManifest, saveConversation]) {
     if (typeof dependency !== 'function') throw new TypeError('Missing collector engine dependency');
@@ -177,26 +201,42 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
     });
   }
 
-  async function createJob(account, tabId, mode) {
+  async function createJob(account, tabId, mode, previousJob = null) {
     const directory = await directoryFor(account);
     await verify(account, tabId);
     const manifest = await readAccountManifest(directory, account);
     const index = await getSetting(keys(account.accountKey).index);
-    const known = index?.schemaVersion === 1 && index.accountKey === account.accountKey && index.storageKey === account.storageKey
+    const indexed = index?.schemaVersion === 1 && index.accountKey === account.accountKey && index.storageKey === account.storageKey
       ? index.items || {} : {};
     // The disk manifest remains canonical. An IndexedDB index alone must never
     // make a new/replaced directory look fully populated.
     const manifestIds = Object.keys(manifest?.conversations || {});
+    // Saving the files precedes outbox/index acknowledgement. Never let a
+    // manifest fallback swallow a crashed or failed delivery from the last run.
+    const unfinished = [...new Set([...(previousJob?.unfinishedIds || []),
+      ...(previousJob?.queue || []).filter(item => !['saved', 'skipped'].includes(item.status)).map(item => item.id)])];
+    const known = baselines(manifest, indexed, unfinished);
     const actualMode = mode === 'incremental' && !account.initialized ? 'initial' : mode;
     const job = {
       schemaVersion: 1, id: makeId(), platform: account.platform, accountKey: account.accountKey,
       storageKey: account.storageKey, tabId, mode: actualMode, status: 'running', phase: 'list',
       startedAt: now(), updatedAt: now(), completedAt: null, offset: 0, pages: 0,
       discovered: 0, processed: 0, added: 0, updated: 0, unchanged: 0, failed: 0, skipped: 0,
-      total: null, queue: [], known: COPY(known), manifestIds, enumerationComplete: false,
+      total: null, queue: [], known: COPY(known), manifestIds, unfinishedIds: unfinished, enumerationComplete: false,
       initializedComplete: false, listAttempts: 0, listRetryAt: null, nextRetryAt: null, error: null,
     };
     return publish(job);
+  }
+
+  async function canSkip(job, account, directory, item) {
+    if (job.mode === 'full' || item.listUpdateTime === null || !own(job.known, item.id)) return false;
+    const known = job.known[item.id];
+    // Old persisted jobs have no complete baseline. Continue their original
+    // pending queue safely; the next newly started scan uses the new policy.
+    if (known.sourceCompleteness !== 'complete' ||
+        (known.listUpdateTime !== item.listUpdateTime && known.sourceUpdatedAt !== item.listUpdateTime) ||
+        (typeof known.title === 'string' && known.title.slice(0, 200) !== item.title)) return false;
+    return hasConversationFiles(directory, account, known);
   }
 
   async function load(account) {
@@ -258,7 +298,7 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
     return publish(job);
   }
 
-  async function listStep(job, account, tabId) {
+  async function listStep(job, account, tabId, directory) {
     const page = await adapter.list(tabId, { accountKey: account.accountKey, offset: job.offset });
     if (!page || !Array.isArray(page.items) || page.items.some(item => !/^[A-Za-z0-9_-]{1,160}$/.test(item?.id || ''))) throw fail('FORMAT');
     if (!(page.nextOffset === null || Number.isSafeInteger(page.nextOffset) && page.nextOffset > job.offset)) throw fail('PAGINATION_STALLED');
@@ -269,14 +309,26 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
     // again after conversations move within the website's update-sorted listing.
     let added = 0;
     for (const source of page.items) {
-      if (seen.has(source.id)) continue;
-      added++;
       const updated = timestamp(source.updateTime);
-      const known = own(job.known, source.id) ? job.known[source.id] : null;
-      const skip = job.mode === 'incremental' && job.manifestIds.includes(source.id) && known &&
-        updated !== null && known.listUpdateTime === updated && updated < job.startedAt - OVERLAP_MS;
-      const item = { id: source.id, title: typeof source.title === 'string' ? source.title.slice(0, 200) : '未命名对话',
-        listUpdateTime: updated, status: skip ? 'skipped' : 'pending', attempts: 0, nextRetryAt: null, error: null };
+      const title = typeof source.title === 'string' ? source.title.slice(0, 200) : '未命名对话';
+      const seenItem = seen.get(source.id);
+      if (seenItem) {
+        // Update-sorted pages can move while scanning. A changed duplicate must
+        // invalidate an earlier skip rather than hide a just-observed update.
+        if (seenItem.listUpdateTime !== updated || seenItem.title !== title) {
+          if (seenItem.status === 'skipped') job.skipped--;
+          seenItem.status = 'pending';
+          seenItem.listUpdateTime = updated === null || seenItem.listUpdateTime === null
+            ? null : Math.max(updated, seenItem.listUpdateTime);
+          seenItem.title = title;
+        }
+        continue;
+      }
+      added++;
+      const item = { id: source.id, title,
+        listUpdateTime: updated, status: 'pending', attempts: 0, nextRetryAt: null, error: null };
+      const skip = await canSkip(job, account, directory, item);
+      if (skip) item.status = 'skipped';
       job.queue.push(item); seen.set(source.id, item);
       if (skip) job.skipped++;
     }
@@ -356,6 +408,8 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
       if (result.completeness === 'partial') throw fail('PARTIAL_DETAIL');
       const conversationId = result.payload?.conversation_id ?? result.payload?.id;
       if (conversationId !== item.id) throw fail('FORMAT');
+      const sourceUpdatedAt = timestamp(result.payload?.update_time);
+      if (item.listUpdateTime !== null && sourceUpdatedAt !== null && sourceUpdatedAt < item.listUpdateTime) throw fail('STALE_DETAIL');
       return result;
     });
     // The adapter verifies before/after its network request. Recheck just before
@@ -377,6 +431,7 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
         value: { listUpdateTime: item.listUpdateTime, checkedAt: now(), contentHash: saved.entry?.contentHash || null } });
       await store(indexKey, { schemaVersion: 1, accountKey: account.accountKey, storageKey: account.storageKey, items });
       item.status = 'saved'; item.result = saved.status; item.error = null; item.nextRetryAt = null;
+      job.unfinishedIds = (job.unfinishedIds || []).filter(id => id !== item.id);
       job.error = null;
       return publish(job);
     });
@@ -395,7 +450,7 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
         // A new scheduled/manual scan must discover newly created conversations
         // even when an earlier scan ended partially. Only explicit resume()
         // retries that old queue without rediscovering the account.
-        return createJob(account, tabId, mode);
+        return createJob(account, tabId, mode, job);
       });
     },
     tick({ account, tabId }) {
@@ -413,7 +468,7 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
         if (job.phase === 'list') {
           try { return await activity.run(account.accountKey, 'collection', {
             stage: 'list', title: `对话列表 · 第 ${job.pages + 1} 页`, completed: job.pages,
-          }, () => listStep(job, account, tabId)); }
+          }, () => listStep(job, account, tabId, directory)); }
           catch (error) { return handleError(job, error); }
         }
         job.listAttempts = 0; job.listRetryAt = null;

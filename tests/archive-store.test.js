@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildArchive } from '../extension/lib/archive.js';
 import { extractAssets } from '../extension/lib/assets.js';
-import { createArchiveStore, readAccountManifest, accountPrefix } from '../extension/lib/archive-store.js';
+import { createArchiveStore, readAccountManifest, hasConversationFiles, accountPrefix } from '../extension/lib/archive-store.js';
 
 const account = { platform: 'chatgpt', accountKey: 'acct-0123456789abcdef01234567', alias: 'demo', storageKey: 'demo-01234567' };
 const identity = { accountKey: account.accountKey, displayName: 'Demo' };
@@ -75,6 +75,75 @@ function setup() {
     save: value => store.saveConversation({ directory, account, detail: value }),
   };
 }
+
+test('incremental presence checks require both nonempty archive files without reading their contents', async () => {
+  const fs = setup(), saved = await fs.save(detail());
+  const metadataOnly = directory => ({ ...directory,
+    getDirectoryHandle: async (...args) => metadataOnly(await directory.getDirectoryHandle(...args)),
+    getFileHandle: async (...args) => {
+      const handle = await directory.getFileHandle(...args);
+      return { getFile: async () => ({ ...(await handle.getFile()),
+        text: () => { throw new Error('Presence checks must not read conversation text'); },
+      }) };
+    },
+  });
+  const directory = metadataOnly(fs.directory), writes = fs.writes.length;
+  assert.equal(await hasConversationFiles(directory, account, saved.entry), true);
+  for (const path of [saved.entry.jsonPath, saved.entry.markdownPath]) {
+    const content = fs.files.get(path);
+    fs.files.delete(path);
+    assert.equal(await hasConversationFiles(directory, account, saved.entry), false);
+    fs.files.set(path, '');
+    assert.equal(await hasConversationFiles(directory, account, saved.entry), false);
+    fs.files.set(path, content);
+  }
+  assert.equal(fs.writes.length, writes);
+});
+
+test('incremental presence checks reject foreign or unsafe paths and propagate permission/read errors', async () => {
+  const fs = setup(), { entry } = await fs.save(detail());
+  const other = { ...account, storageKey: 'another-account' };
+  await assert.rejects(hasConversationFiles(fs.directory, other, entry), { code: 'ARCHIVE_FORMAT' });
+  await assert.rejects(hasConversationFiles(fs.directory, account, { ...entry,
+    jsonPath: `${accountPrefix(account)}/conversations/../outside__one.json`,
+    markdownPath: `${accountPrefix(account)}/conversations/../outside__one.md`,
+  }), { code: 'ARCHIVE_PATH' });
+  fs.permission('denied');
+  await assert.rejects(hasConversationFiles(fs.directory, account, entry), { code: 'DIRECTORY_PERMISSION' });
+  fs.permission('granted');
+  const denied = new DOMException('permission expired', 'NotAllowedError');
+  await assert.rejects(hasConversationFiles({ ...fs.directory,
+    getDirectoryHandle: async () => { throw denied; },
+  }, account, entry), error => error === denied);
+  const unreadable = new DOMException('unreadable file', 'NotReadableError');
+  const broken = directory => ({ ...directory,
+    getDirectoryHandle: async (...args) => broken(await directory.getDirectoryHandle(...args)),
+    getFileHandle: async () => ({ getFile: async () => { throw unreadable; } }),
+  });
+  await assert.rejects(hasConversationFiles(broken(fs.directory), account, entry), error => error === unreadable);
+});
+
+test('source timestamps normalize Unix seconds, milliseconds, numeric strings and ISO to integer milliseconds', async () => {
+  const values = [1792569600.1234, 1792569600123.4, '1792569600.1234', ' 1792569600123.4 ',
+    '1.7925696001234e9', '2026-10-21T16:00:00.123+08:00'];
+  for (const value of values) {
+    const fs = setup(), saved = await fs.save(detail('one', 'first', value));
+    assert.equal(saved.entry.sourceUpdatedAt, '2026-10-21T08:00:00.123Z', String(value));
+  }
+  const fs = setup();
+  await fs.save(detail('one', 'newer', '1792569600'));
+  await assert.rejects(fs.save(detail('one', 'older', '1792483200000')), { code: 'STALE_DETAIL' });
+});
+
+test('source timestamps reject invalid values and out-of-range years without throwing Invalid Date', async () => {
+  for (const value of [null, '', '   ', 'not-a-date', -1, '-1', '1969-12-31T23:59:59Z',
+    '10000-01-01T00:00:00Z', 1e308, '1e999']) {
+    const fs = setup(), saved = await fs.save(detail('one', 'first', value));
+    assert.equal(saved.entry.sourceUpdatedAt, null, String(value));
+  }
+  const fs = setup(), saved = await fs.save(detail('one', 'first', '0'));
+  assert.equal(saved.entry.sourceUpdatedAt, '1970-01-01T00:00:00.000Z');
+});
 
 test('restoring an older derivative cannot erase downloaded assets from the identical native conversation', async () => {
   const fs = setup(), source = detail('image', '![Screenshot](sediment://file_image)');

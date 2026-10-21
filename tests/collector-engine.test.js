@@ -7,12 +7,15 @@ const account = { platform: 'chatgpt', accountKey: 'acct-demo', storageKey: 'dem
 const key = name => `collector${name}:${account.accountKey}`;
 const issue = code => Object.assign(new Error('Untrusted error containing secrets must not appear in state'), { code });
 const source = (id, updateTime = 1000) => ({ id, title: `Title ${id}`, updateTime });
+const isoTime = value => value == null ? null : new Date(typeof value === 'number' || /^\d+(?:\.\d+)?$/.test(value)
+  ? Number(value) * (Number(value) < 1e12 ? 1000 : 1) : Date.parse(value)).toISOString();
 
 function setup(options = {}) {
   const store = options.store || new Map();
   let clock = 2_000_000_000_000, sequence = 0, identity = account.accountKey, permission = 'granted';
   const calls = { identify: 0, pages: [], details: [], saves: [] };
   const local = options.local || new Map();
+  const latestSources = new Map();
   let list = options.list || (async () => ({ items: [source('a'), source('b')], nextOffset: null, total: 2 }));
   let detailError = options.detailError;
   const directory = { kind: 'directory', queryPermission: async () => permission };
@@ -24,15 +27,24 @@ function setup(options = {}) {
     },
     getDirectory: async () => directory,
     readAccountManifest: async () => ({ conversations: Object.fromEntries([...local].map(([id, value]) => [id, value.entry])) }),
+    hasConversationFiles: async (directory, target, entry) => options.filesPresent?.(entry.conversationId) ?? true,
     adapter: {
       identify: async () => { calls.identify++; return { accountKey: identity, platform: 'chatgpt' }; },
-      list: async (tabId, { offset }) => { calls.pages.push(offset); return list(offset); },
+      list: async (tabId, { offset }) => {
+        calls.pages.push(offset);
+        const page = await list(offset);
+        for (const item of page.items || []) latestSources.set(item.id, item);
+        return page;
+      },
       detail: async (tabId, { conversationId }) => {
         calls.details.push(conversationId);
         const error = typeof detailError === 'function' ? detailError(conversationId, calls.details.length) : detailError;
         if (error) throw issue(error);
         if (options.afterDetail) options.afterDetail({ setIdentity: value => identity = value });
-        return { identity: { accountKey: account.accountKey, platform: 'chatgpt' }, payload: { conversation_id: conversationId, messages: [], update_time: 1000 }, capturedAt: '2033-05-18T03:33:20Z', completeness: 'complete' };
+        return { identity: { accountKey: account.accountKey, platform: 'chatgpt' }, payload: {
+          conversation_id: conversationId, title: options.detailTitle?.(conversationId) ?? latestSources.get(conversationId)?.title ?? `Title ${conversationId}`,
+          messages: [], update_time: options.detailTime ? options.detailTime(conversationId) : latestSources.get(conversationId)?.updateTime ?? 1000,
+        }, capturedAt: '2033-05-18T03:33:20Z', completeness: 'complete' };
       },
     },
     saveConversation: async ({ detail }) => {
@@ -40,7 +52,8 @@ function setup(options = {}) {
       calls.saves.push(id);
       if (options.saveError) throw issue(options.saveError);
       const status = local.has(id) ? 'unchanged' : 'added';
-      const entry = { conversationId: id, contentHash: `hash-${id}` };
+      const entry = { conversationId: id, contentHash: `hash-${id}`, title: detail.payload.title,
+        sourceCompleteness: detail.completeness, sourceUpdatedAt: isoTime(detail.payload.update_time) };
       local.set(id, { entry });
       const prefix = `data/web/chatgpt/${account.storageKey}`;
       const manifest = { accountKey: account.accountKey, conversations: Object.fromEntries([...local].map(([key, value]) => [key, value.entry])) };
@@ -65,7 +78,7 @@ function setup(options = {}) {
 }
 
 async function complete(engine, target = account) {
-  for (let count = 0; count < 30; count++) {
+  for (let count = 0; count < 300; count++) {
     const state = await engine.tick({ account: target, tabId: 1 });
     if (state.status !== 'running' || state.nextRetryAt) return state;
   }
@@ -418,4 +431,228 @@ test('outbox summaries show only bounded metadata without reading conversation b
   assert.equal(result.total, 60); assert.equal(result.items.length, 50);
   assert.equal(result.items[0].conversationId, 'item-0'); assert.ok(result.items[0].createdAt);
   assert.doesNotMatch(JSON.stringify(result), /private-path|conversation body|sig=|synthetic-token|manifestEntry|files/);
+});
+
+test('unchanged conversations from the last five minutes skip detail requests in every non-full mode', async () => {
+  const time = 2_000_000_000_000 - 30_000;
+  const f = setup({ list: async () => ({ items: [source('recent', time)], nextOffset: null, total: 1 }) });
+  await f.engine.start({ account, tabId: 1, mode: 'initial' }); await complete(f.engine);
+  for (const mode of ['initial', 'incremental']) {
+    f.calls.details.length = 0;
+    await f.engine.start({ account, tabId: 1, mode });
+    const state = await complete(f.engine);
+    assert.deepEqual(f.calls.details, [], mode);
+    assert.equal(state.unchanged, 1);
+    assert.equal(state.diagnostics.skipped, 1);
+  }
+});
+
+test('a metadata scan of 102 conversations requests only the new and changed detail, including an older unknown ID', async () => {
+  const original = Array.from({ length: 101 }, (_, index) => source(`id-${index}`, 1790000000 + index));
+  let items = original;
+  const f = setup({ list: async offset => ({ items: items.slice(offset, offset + 25),
+    nextOffset: offset + 25 < items.length ? offset + 25 : null, total: items.length }) });
+  await f.engine.start({ account, tabId: 1, mode: 'initial' }); await complete(f.engine);
+  f.calls.details.length = 0; f.calls.pages.length = 0;
+  items = [source('id-100', 1790000500), ...original.slice(0, 100), source('mobile-old', 1000)];
+  await f.engine.start({ account: { ...account, initialized: true }, tabId: 1 });
+  const state = await complete(f.engine, { ...account, initialized: true });
+  assert.deepEqual(f.calls.details, ['id-100', 'mobile-old']);
+  assert.deepEqual(f.calls.pages, [0, 25, 50, 75, 100]);
+  assert.equal(state.diagnostics.skipped, 100);
+  assert.equal(state.diagnostics.saved, 2);
+  assert.equal(state.processed, 102);
+});
+
+test('numeric seconds, milliseconds, numeric strings and ISO time share the same successful baseline', async () => {
+  const seconds = 1792656000.1234, milliseconds = 1792656000123;
+  let time = seconds;
+  const f = setup({ list: async () => ({ items: [source('a', time)], nextOffset: null, total: 1 }) });
+  await f.engine.start({ account, tabId: 1, mode: 'initial' }); await complete(f.engine);
+  for (const equivalent of [milliseconds, String(seconds), String(milliseconds), new Date(milliseconds).toISOString()]) {
+    time = equivalent; f.calls.details.length = 0;
+    await f.engine.start({ account, tabId: 1, mode: 'incremental' });
+    const state = await complete(f.engine);
+    assert.deepEqual(f.calls.details, [], `timestamp ${equivalent}`);
+    assert.equal(state.diagnostics.skipped, 1);
+  }
+});
+
+test('restored complete archives reuse source timestamps without a browser collection index', async () => {
+  const f = setup();
+  await f.engine.start({ account, tabId: 1, mode: 'initial' }); await complete(f.engine);
+  const restored = setup({ local: structuredClone(f.local) });
+  assert.equal(restored.store.get(key('Index')), undefined);
+  await restored.engine.start({ account, tabId: 1, mode: 'incremental' });
+  const state = await complete(restored.engine);
+  assert.deepEqual(restored.calls.details, []);
+  assert.equal(state.initializedComplete, true);
+  assert.equal(state.diagnostics.skipped, 2);
+  assert.deepEqual(await restored.engine.getOutbox(account.accountKey), []);
+});
+
+test('missing local files, incomplete archives and missing manifest entries stay eligible despite matching index', async t => {
+  for (const condition of ['missing-files', 'incomplete', 'missing-entry']) await t.test(condition, async () => {
+    let available = true;
+    const f = setup({ filesPresent: id => id !== 'a' || available });
+    await f.engine.start({ account, tabId: 1, mode: 'initial' }); await complete(f.engine);
+    if (condition === 'missing-files') available = false;
+    if (condition === 'incomplete') f.local.get('a').entry.sourceCompleteness = 'unknown';
+    if (condition === 'missing-entry') f.local.delete('a');
+    f.calls.details.length = 0;
+    await f.engine.start({ account: { ...account, initialized: true }, tabId: 1 });
+    await complete(f.engine, { ...account, initialized: true });
+    assert.deepEqual(f.calls.details, ['a']);
+  });
+});
+
+test('an index hash mismatch cannot hide a different archived version, but a complete matching archive is reusable', async t => {
+  for (const sourceMatches of [false, true]) await t.test(`source matches: ${sourceMatches}`, async () => {
+    const f = setup();
+    await f.engine.start({ account, tabId: 1, mode: 'initial' }); await complete(f.engine);
+    f.local.get('a').entry.contentHash = 'remote-other-version';
+    f.local.get('a').entry.sourceUpdatedAt = isoTime(sourceMatches ? 1000 : 999);
+    f.calls.details.length = 0;
+    await f.engine.start({ account: { ...account, initialized: true }, tabId: 1 });
+    await complete(f.engine, { ...account, initialized: true });
+    assert.deepEqual(f.calls.details, sourceMatches ? [] : ['a']);
+  });
+});
+
+test('a partial initial scan retries only unfinished details and newly discovered IDs', async () => {
+  const f = setup({ detailError: id => id === 'a' ? 'HTTP_404' : null });
+  await f.engine.start({ account, tabId: 1, mode: 'initial' });
+  assert.equal((await complete(f.engine)).status, 'partial');
+  f.setDetailError(null);
+  f.setList(async () => ({ items: [source('a'), source('b'), source('new')], nextOffset: null, total: 3 }));
+  f.calls.details.length = 0;
+  await f.engine.start({ account, tabId: 1, mode: 'initial' });
+  const state = await complete(f.engine);
+  assert.deepEqual(f.calls.details, ['a', 'new']);
+  assert.equal(state.status, 'completed');
+  assert.equal(state.initializedComplete, true);
+  assert.equal(state.diagnostics.skipped, 1);
+});
+
+test('a failed full recheck remains retryable in the next incremental scan even with an unchanged complete archive', async () => {
+  const f = setup();
+  await f.engine.start({ account, tabId: 1, mode: 'initial' }); await complete(f.engine);
+  f.setDetailError(id => id === 'a' ? 'HTTP_404' : null);
+  await f.engine.start({ account, tabId: 1, mode: 'full' });
+  assert.equal((await complete(f.engine)).status, 'partial');
+  f.setDetailError(null); f.calls.details.length = 0;
+  await f.engine.start({ account, tabId: 1, mode: 'incremental' });
+  const state = await complete(f.engine);
+  assert.deepEqual(f.calls.details, ['a']);
+  assert.equal(state.status, 'completed');
+});
+
+test('exhausted outbox failures cannot be skipped by the next scan using the already-written manifest', async () => {
+  let reject = true;
+  const f = setup({ list: async () => ({ items: [source('a')], nextOffset: null, total: 1 }),
+    rejectStore: name => name === key('Outbox') && reject });
+  await f.engine.start({ account, tabId: 1, mode: 'initial' });
+  await complete(f.engine);
+  f.advance(61_000); await complete(f.engine);
+  f.advance(121_000);
+  const partial = await complete(f.engine);
+  assert.equal(partial.status, 'partial');
+  assert.equal(partial.failed, 1);
+  assert.ok(f.local.has('a'));
+  assert.deepEqual(await f.engine.getOutbox(account.accountKey), []);
+  reject = false; f.calls.details.length = 0;
+  await f.engine.start({ account, tabId: 1, mode: 'incremental' });
+  const state = await complete(f.engine);
+  assert.deepEqual(f.calls.details, ['a']);
+  assert.equal(state.status, 'completed');
+  assert.equal((await f.engine.getOutbox(account.accountKey)).length, 1);
+});
+
+test('a detail older than the observed list version never advances the incremental baseline', async () => {
+  let returnedTime = 1000;
+  const f = setup({ list: async () => ({ items: [source('a', 1001)], nextOffset: null, total: 1 }),
+    detailTime: () => returnedTime });
+  await f.engine.start({ account, tabId: 1, mode: 'initial' });
+  const stale = await complete(f.engine);
+  assert.equal(stale.error.code, 'STALE_DETAIL');
+  assert.deepEqual(f.calls.saves, []);
+  assert.equal(f.store.get(key('Index')), undefined);
+  returnedTime = 1001; f.advance(61_000);
+  const state = await complete(f.engine);
+  assert.equal(state.status, 'completed');
+  assert.deepEqual(f.calls.saves, ['a']);
+});
+
+test('an unfinished discovery checkpoint keeps pending IDs eligible in a fresh scan despite complete local copies', async () => {
+  const f = setup();
+  await f.engine.start({ account, tabId: 1, mode: 'initial' }); await complete(f.engine);
+  f.setList(async offset => offset === 0 ? { items: [source('a')], nextOffset: 1, total: 2 }
+    : { items: [], nextOffset: null, total: 2 });
+  await f.engine.start({ account, tabId: 1, mode: 'full' });
+  const partial = await complete(f.engine);
+  assert.equal(partial.status, 'partial');
+  assert.equal(partial.error.code, 'ENUMERATION_INCOMPLETE');
+  f.setList(async () => ({ items: [source('a'), source('b')], nextOffset: null, total: 2 }));
+  f.calls.details.length = 0;
+  await f.engine.start({ account: { ...account, initialized: true }, tabId: 1 });
+  const state = await complete(f.engine, { ...account, initialized: true });
+  assert.deepEqual(f.calls.details, ['a']);
+  assert.equal(state.status, 'completed');
+  assert.equal(state.diagnostics.skipped, 1);
+});
+
+test('a renamed conversation is refreshed even when its list timestamp is unchanged', async () => {
+  const f = setup();
+  await f.engine.start({ account, tabId: 1, mode: 'initial' }); await complete(f.engine);
+  f.setList(async () => ({ items: [{ ...source('a'), title: 'Renamed conversation' }, source('b')], nextOffset: null, total: 2 }));
+  f.calls.details.length = 0;
+  await f.engine.start({ account: { ...account, initialized: true }, tabId: 1 });
+  await complete(f.engine, { ...account, initialized: true });
+  assert.deepEqual(f.calls.details, ['a']);
+  assert.equal(f.local.get('a').entry.title, 'Renamed conversation');
+  f.calls.details.length = 0;
+  await f.engine.start({ account: { ...account, initialized: true }, tabId: 1 });
+  await complete(f.engine, { ...account, initialized: true });
+  assert.deepEqual(f.calls.details, []);
+});
+
+test('unfinished local-save delivery survives an intervening scan that never observes the conversation', async t => {
+  for (const missing of ['list-failure', 'temporarily-absent']) await t.test(missing, async () => {
+    let reject = true;
+    const f = setup({ list: async () => ({ items: [source('a')], nextOffset: null, total: 1 }),
+      rejectStore: name => name === key('Outbox') && reject });
+    await f.engine.start({ account, tabId: 1, mode: 'initial' });
+    await complete(f.engine);
+    f.advance(61_000); await complete(f.engine);
+    f.advance(121_000);
+    assert.equal((await complete(f.engine)).status, 'partial');
+    assert.ok(f.local.has('a'));
+    reject = false;
+    f.setList(missing === 'list-failure' ? async () => { throw issue('FORMAT'); }
+      : async () => ({ items: [source('b')], nextOffset: null, total: 1 }));
+    await f.engine.start({ account, tabId: 1, mode: 'incremental' });
+    assert.equal((await complete(f.engine)).status, missing === 'list-failure' ? 'partial' : 'completed');
+    assert.equal((await f.engine.getOutbox(account.accountKey)).some(item => item.conversationId === 'a'), false);
+    f.setList(async () => ({ items: [source('a'), source('b')], nextOffset: null, total: 2 }));
+    f.calls.details.length = 0;
+    await f.engine.start({ account, tabId: 1, mode: 'incremental' });
+    const state = await complete(f.engine);
+    assert.equal(state.status, 'completed');
+    assert.deepEqual(f.calls.details, missing === 'list-failure' ? ['a', 'b'] : ['a']);
+    assert.equal((await f.engine.getOutbox(account.accountKey)).some(item => item.conversationId === 'a'), true);
+  });
+});
+
+test('a duplicate ID with a later timestamp on another page cancels an earlier unchanged skip', async () => {
+  const f = setup({ list: async () => ({ items: [source('a')], nextOffset: null, total: 1 }) });
+  await f.engine.start({ account, tabId: 1, mode: 'initial' }); await complete(f.engine);
+  f.setList(async offset => offset === 0 ? { items: [source('a')], nextOffset: 1, total: null }
+    : { items: [source('a', 1001), source('b')], nextOffset: null, total: null });
+  f.calls.details.length = 0;
+  await f.engine.start({ account: { ...account, initialized: true }, tabId: 1 });
+  const state = await complete(f.engine, { ...account, initialized: true });
+  assert.equal(state.status, 'completed');
+  assert.deepEqual(f.calls.details, ['a', 'b']);
+  assert.equal(state.diagnostics.skipped, 0);
+  assert.equal(state.processed, 2);
 });

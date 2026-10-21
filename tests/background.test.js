@@ -51,7 +51,7 @@ function background({ command, open } = {}) {
     createChatGPTAssetResolver: () => ({ resolve: noop }),
     createAssetService: () => ({ save: noop, hydrateAssets: noop }), createRestoreService: () => ({}),
     fetchRepositorySnapshot: noop, downloadRepositoryFile: noop,
-    readAccountManifest: noop, saveConversation: noop, applyRemoteFiles: noop, syncArchives: noop, probeRepository: noop });
+    readAccountManifest: noop, hasConversationFiles: noop, saveConversation: noop, applyRemoteFiles: noop, syncArchives: noop, probeRepository: noop });
   function message(value, sender = UI) {
     const replies = [];
     const keepAlive = events.message(value, sender, reply => replies.push(reply));
