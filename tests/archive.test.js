@@ -17,7 +17,7 @@ function fixture() {
         id: 'message-a1', author: { role: 'assistant' }, content: { content_type: 'text', parts: ['未选中的回复'] },
       } },
       reply2: { id: 'reply2', parent: 'question', children: [], message: {
-        id: 'message-a2', author: { role: 'tool' }, content: { content_type: 'multimodal_text', parts: ['选中的回复', { content_type: 'image_asset_pointer', asset_pointer: 'asset-demo' }] },
+        id: 'message-a2', author: { role: 'assistant' }, content: { content_type: 'multimodal_text', parts: ['选中的回复', { content_type: 'image_asset_pointer', asset_pointer: 'asset-demo' }] },
       } },
     },
   };
@@ -30,7 +30,8 @@ test('native object keeps unknown fields, null root and unselected branch; MD fo
   assert.deepEqual(JSON.parse(files[0].content), source);
   assert.match(files[1].content, /选中的回复/);
   assert.doesNotMatch(files[1].content, /未选中的回复/);
-  assert.match(files[1].content, /image_asset_pointer/);
+  assert.match(files[1].content, /〔图片〕/);
+  assert.doesNotMatch(files[1].content, /image_asset_pointer|消息 ID|msg-|SHA-256|采集说明|渲染器/);
   assert.equal(summary.messageCount, 3);
   assert.equal(summary.currentBranchMessageCount, 2);
   assert.equal(summary.coverage.messages, 'unknown');
@@ -120,12 +121,17 @@ test('manifest traversal rejected, unknown fields such as __proto__ remain inert
   assert.equal({}.injected, undefined);
 });
 
-test('Markdown fences neutralize source HTML and embedded fence terminators', async () => {
+test('Markdown keeps code literal while making prose HTML and image embeds passive', async () => {
   const source = fixture(); source.title = '<img src=x onerror=alert(1)>';
-  source.mapping.reply2.message.content.parts = ['<script>alert(1)</script>\n````\n![track](https://example.test/pixel)'];
+  const body = '<script>alert(1)</script>\n![track](https://example.test/pixel)\n`<span>inline</span>`\n```html\n<img src=x onerror=alert(1)>\n```';
+  source.mapping.reply2.message.content.parts = [body];
   const result = await build(source);
   assert.match(result.files[1].content, /&lt;img/);
-  assert.match(result.files[1].content, /`````text\n<script>/);
+  assert.match(result.files[1].content, /&lt;script>alert\(1\)&lt;\/script>/);
+  assert.ok(result.files[1].content.includes('\\![track](https://example.test/pixel)'));
+  assert.ok(result.files[1].content.includes('`<span>inline</span>`'));
+  assert.ok(result.files[1].content.includes('```html\n<img src=x onerror=alert(1)>\n```'));
+  assert.equal(JSON.parse(result.files[0].content).mapping.reply2.message.content.parts[0], body);
 });
 
 test('flat messages stay native and are displayed as unverified source order, not a proven branch', async () => {
@@ -143,7 +149,8 @@ test('flat messages stay native and are displayed as unverified source order, no
   assert.equal(result.summary.messageCount, 2);
   assert.equal(result.summary.currentBranchMessageCount, null);
   assert.equal(result.summary.coverage.messages, 'partial');
-  assert.match(result.files[1].content, /接口返回顺序（未验证分支）/);
+  assert.ok(result.manifest.conversations['flat-demo'].warnings.some(warning => warning.includes('按返回顺序')));
+  assert.doesNotMatch(result.files[1].content, /接口返回顺序|采集说明/);
   assert.match(result.files[1].content, /你好，世界/);
   assert.doesNotMatch(result.files[1].content, /## 当前分支/);
 });
@@ -168,4 +175,52 @@ test('flat string content URLs remain exact authored prose', async () => {
   const result = await build({ id: 'flat-prose', messages: [{ id: 'm1', role: 'user', content }] });
   assert.equal(JSON.parse(result.files[0].content).messages[0].content, content);
   assert.equal(result.summary.redactionCount, 0);
+});
+
+test('readable Markdown contains just title, speakers and normally formatted conversation', async () => {
+  const body = '**结论**\n\n- 先保存 JSON\n- 再生成 Markdown\n\n| 格式 | 用途 |\n| --- | --- |\n| JSON | 原始数据 |\n\n```js\nconst html = "<div>example</div>";\n```';
+  const source = { id: 'reading-demo', title: '归档格式', messages: [
+    { id: 'q', role: 'user', content: '怎样保存？' },
+    { id: 'a', role: 'assistant', content: { content_type: 'text', parts: [body] } },
+  ], page_info: { has_next_page: true } };
+  const result = await build(source);
+  assert.equal(result.files[1].content, `# 归档格式\n\n**你：**\n\n怎样保存？\n\n---\n\n**ChatGPT：**\n\n${body}\n`);
+  assert.deepEqual(JSON.parse(result.files[0].content), source);
+  assert.equal(result.summary.coverage.messages, 'partial');
+  assert.ok(result.manifest.conversations['reading-demo'].warnings.length);
+  assert.equal(result.manifest.conversations['reading-demo'].rendererVersion, 'p0-2');
+});
+
+test('internal and hidden messages stay in JSON but do not clutter the reading view', async () => {
+  const source = { id: 'visible-demo', messages: [
+    { id: 's', role: 'system', content: 'system-only' },
+    { id: 'd', role: 'developer', content: 'developer-only' },
+    { id: 'q', role: 'user', content: 'question-visible' },
+    { id: 'reason', role: 'assistant', channel: 'analysis', content: 'analysis-only' },
+    { id: 'call', role: 'assistant', recipient: 'browser', content: 'tool-call-only' },
+    { id: 'tool', role: 'tool', content: 'tool-result-only' },
+    { id: 'hidden', role: 'assistant', metadata: { is_visually_hidden_from_conversation: true }, content: 'hidden-only' },
+    { id: 'a', role: 'assistant', channel: 'final', recipient: 'all', content: [{ type: 'text', text: 'answer-visible' }] },
+    { id: 'empty', role: 'assistant', content: { parts: [''] } },
+  ] };
+  const result = await build(source);
+  assert.deepEqual(JSON.parse(result.files[0].content), source);
+  assert.equal(result.summary.messageCount, 9);
+  assert.equal(result.summary.displayedMessageCount, 2);
+  assert.match(result.files[1].content, /question-visible/);
+  assert.match(result.files[1].content, /answer-visible/);
+  assert.doesNotMatch(result.files[1].content, /system-only|developer-only|analysis-only|tool-call-only|tool-result-only|hidden-only/);
+});
+
+test('an unfinished code fence is closed before the next speaker without changing JSON', async () => {
+  for (const delimiter of ['```', '~~~~']) {
+    const body = `${delimiter}js\nconst example = 1;`;
+    const source = { id: 'fence-demo', messages: [
+      { id: 'q', role: 'user', content: body },
+      { id: 'a', role: 'assistant', content: '下一条回复' },
+    ] };
+    const result = await build(source);
+    assert.ok(result.files[1].content.includes(`${body}\n${delimiter}\n\n---\n\n**ChatGPT：**`));
+    assert.equal(JSON.parse(result.files[0].content).messages[0].content, body);
+  }
 });

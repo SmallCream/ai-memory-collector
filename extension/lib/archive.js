@@ -1,5 +1,5 @@
 /** P0 archive builder. Native web-detail JSON is authoritative; Markdown is derived. */
-export const RENDERER_VERSION = 'p0-1';
+export const RENDERER_VERSION = 'p0-2';
 const PLATFORM = 'chatgpt';
 const SECRET_KEYS = new Set(['accesstoken', 'access_token', 'refreshtoken', 'refresh_token',
   'authorization', 'cookie', 'set-cookie', 'sessiontoken', 'session_token',
@@ -95,6 +95,84 @@ function label(value) {
     .replace(/[\\`*{}[\]()#+.!_|]/g, '\\$&');
 }
 
+function escapeProse(value) {
+  // Keep Markdown formatting, but make raw HTML and image embeds passive text.
+  return value.replace(/</g, '&lt;').replace(/(^|[^\\])((?:\\\\)*)!\[/g, '$1$2\\![');
+}
+
+function readableLine(line) {
+  const runs = [...line.matchAll(/`+/g)];
+  const next = new Map();
+  const closing = new Map();
+  for (let index = runs.length - 1; index >= 0; index--) {
+    closing.set(index, next.get(runs[index][0].length));
+    next.set(runs[index][0].length, index);
+  }
+  let cursor = 0;
+  const pieces = [];
+  for (let index = 0; index < runs.length; index++) {
+    const run = runs[index];
+    const slashes = /\\*$/.exec(line.slice(0, run.index))[0].length;
+    const end = closing.get(index);
+    if (slashes % 2 || end === undefined) continue;
+    const boundary = runs[end].index + runs[end][0].length;
+    pieces.push(escapeProse(line.slice(cursor, run.index)), line.slice(run.index, boundary));
+    cursor = boundary;
+    index = end;
+  }
+  pieces.push(escapeProse(line.slice(cursor)));
+  return pieces.join('');
+}
+
+function readableMarkdown(text) {
+  let block = null;
+  const lines = text.split('\n').map(line => {
+    const delimiter = /^( {0,3})(`{3,}|~{3,})(.*)$/.exec(line);
+    if (block) {
+      if (delimiter && delimiter[2][0] === block[0] && delimiter[2].length >= block.length && !delimiter[3].trim()) block = null;
+      return line;
+    }
+    if (delimiter && (delimiter[2][0] !== '`' || !delimiter[3].includes('`'))) {
+      block = delimiter[2];
+      return line;
+    }
+    return readableLine(line);
+  });
+  // A truncated response must not turn the next speaker into part of its code.
+  if (block) lines.push(block);
+  return lines.join('\n').replace(/^\n+|\n+$/g, '');
+}
+
+function readablePart(part) {
+  if (typeof part === 'string') return part;
+  if (!isRecord(part)) return part == null ? '' : '〔非文本内容〕';
+  const type = part.content_type ?? part.type ?? '';
+  if (type === 'code' && typeof (part.text ?? part.code) === 'string') {
+    const language = typeof part.language === 'string' && /^[A-Za-z0-9_+-]{1,40}$/.test(part.language) ? part.language : 'text';
+    return fence(part.text ?? part.code, language);
+  }
+  if (typeof part.text === 'string') return part.text;
+  if (typeof part.text?.value === 'string') return part.text.value;
+  if (/image/.test(type)) return '〔图片〕';
+  if (/audio/.test(type)) return '〔音频〕';
+  if (/video/.test(type)) return '〔视频〕';
+  if (/file|attachment/.test(type)) return '〔附件〕';
+  return '〔非文本内容〕';
+}
+
+function displayedMessage(message) {
+  if (!isRecord(message)) return null;
+  const role = message.author?.role ?? message.role;
+  if (['system', 'developer', 'tool'].includes(role) || message.metadata?.is_visually_hidden_from_conversation === true) return null;
+  if (role === 'assistant' && (message.channel === 'analysis' ||
+      (typeof message.recipient === 'string' && message.recipient && message.recipient !== 'all'))) return null;
+  const body = message.content;
+  const parts = isRecord(body) && Array.isArray(body.parts) ? body.parts : Array.isArray(body) ? body : [body];
+  const text = readableMarkdown(parts.map(readablePart).filter(Boolean).join('\n\n'));
+  if (!text.trim()) return null;
+  return { speaker: role === 'user' ? '你' : role === 'assistant' ? 'ChatGPT' : '消息', text };
+}
+
 function selectedBranch(conversation) {
   const mapping = conversation.mapping;
   const warnings = [];
@@ -105,7 +183,7 @@ function selectedBranch(conversation) {
       nodeKey: String(item.id ?? item.message?.id ?? `unverified-item-${index}`),
       node: own(item, 'message') ? item : { message: item },
     }));
-    if (conversation.messages.some(item => !item.id && !item.message?.id)) warnings.push('部分消息没有稳定 ID，展示锚点暂按位置生成。');
+    if (conversation.messages.some(item => !item.id && !item.message?.id)) warnings.push('部分消息没有稳定 ID，原生记录按返回位置保留。');
     return { nodes: arrayNodes, warnings, partial: false, mode: 'source-array' };
   }
   let cursor = conversation.current_node;
@@ -209,31 +287,11 @@ export async function buildArchive({ conversation, identity, capturedAt, existin
   };
   const selectedMessages = branch.nodes.filter(({ node }) => node.message !== null && node.message !== undefined);
   const messageCount = allNodes.filter(node => node.message !== null && node.message !== undefined).length;
-  const displayLabel = branch.mode === 'source-array' ? '接口返回顺序（未验证分支）' : '当前分支';
-  const lines = [
-    `# ${label(title)}`, '',
-    '> P0 采集快照：网页详情格式，消息和分支完整度尚未验证；附件只保留引用。', '',
-    `- 对话 ID：${label(id)}`,
-    `- 原文 SHA-256：${contentHash}`,
-    `- 格式：chatgpt-web-detail；渲染器：${RENDERER_VERSION}`,
-    `- ${displayLabel}展示 ${selectedMessages.length} 条消息；原生结构共保存 ${messageCount} 条消息。`, '',
-  ];
-  if (warnings.length) lines.push('## 采集说明', '', ...warnings.map(warning => `- ${label(warning)}`), '');
-  lines.push(`## ${displayLabel}`, '');
-  if (!selectedMessages.length) lines.push('无法确认可展示的当前分支。请查看 JSON 原档。', '');
-  for (const { nodeKey, node } of selectedMessages) {
-    const message = node.message;
-    const anchor = `msg-${(await hash(nodeKey)).slice(0, 24)}`;
-    lines.push(`### ${label(message.author?.role || message.role || 'unknown')} · ${anchor}`, '');
-    lines.push(`消息 ID：${label(message.id ?? nodeKey)}`, '');
-    const body = message.content;
-    if (isRecord(body) && Array.isArray(body.parts)) {
-      for (const part of body.parts) lines.push(fence(part, typeof part === 'string' ? 'text' : 'json'), '');
-      const extra = Object.fromEntries(Object.entries(body).filter(([key]) => !['parts', 'content_type'].includes(key)));
-      if (Object.keys(extra).length) lines.push('附加内容字段：', '', fence(extra, 'json'), '');
-    } else if (typeof body === 'string') lines.push(fence(body), '');
-    else if (body !== undefined) lines.push('未展开的原生内容：', '', fence(body, 'json'), '');
-    else lines.push('该消息没有可渲染的 content 字段；其他原生字段保存在 JSON 中。', '');
+  const displayed = selectedMessages.map(({ node }) => displayedMessage(node.message)).filter(Boolean);
+  const lines = [`# ${label(title)}`, ''];
+  for (const [index, message] of displayed.entries()) {
+    if (index) lines.push('---', '');
+    lines.push(`**${message.speaker}：**`, '', message.text, '');
   }
   const markdown = `${lines.join('\n').trimEnd()}\n`;
   const entry = {
@@ -258,7 +316,7 @@ export async function buildArchive({ conversation, identity, capturedAt, existin
     summary: { conversationId: id, title, contentHash, sourceFormat: 'chatgpt-web-detail',
       nodeCount: allNodes.length, messageCount,
       currentBranchMessageCount: branch.mode === 'current-branch' ? selectedMessages.length : null,
-      displayedMessageCount: selectedMessages.length, renderMode: branch.mode,
+      displayedMessageCount: displayed.length, renderMode: branch.mode,
       coverage, warnings, redactionCount: redactions.length, jsonPath, markdownPath },
   };
 }
