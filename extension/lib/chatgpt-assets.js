@@ -186,7 +186,12 @@ export async function probeChatGPTAsset(request) {
       const exactLibrary = asset.libraryFileId && url.pathname === `/api/library/files/${asset.libraryFileId}/download`;
       const observedFile = url.pathname.startsWith('/backend-api/files/') &&
         [asset.fileId, asset.libraryFileId].filter(Boolean).some(id => url.pathname.split('/').includes(id));
-      if (!exactLibrary && !observedFile) fail('ASSET_URL', '图片下载地址与当前资源不匹配。');
+      // This observed redirect route identifies the resource in the query, not
+      // the path. Reject ambiguous IDs; its signed URL stays inside this probe.
+      const contentIds = url.searchParams.getAll('id');
+      const observedContent = url.pathname === '/backend-api/estuary/content' && contentIds.length === 1 &&
+        filePattern.test(contentIds[0]) && contentIds[0] === asset.fileId;
+      if (!exactLibrary && !observedFile && !observedContent) fail('ASSET_URL', '图片下载地址与当前资源不匹配。');
     }
     return url;
   }

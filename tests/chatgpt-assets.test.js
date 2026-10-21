@@ -11,6 +11,7 @@ const ACCOUNT = await accountKey('synthetic-user-A');
 const asset = { fileId: 'file_testA', libraryFileId: 'libfile_testA', fileName: 'screenshot.png',
   size: PNG.byteLength, width: 1, height: 1, mimeType: 'image/png' };
 const libraryURL = 'https://chatgpt.com/api/library/files/libfile_testA/download';
+const estuaryURL = 'https://chatgpt.com/backend-api/estuary/content?id=file_testA&fn=synthetic-image.png&cd=attachment&ts=2000000000&p=fs&cid=1&sig=synthetic-estuary-secret&v=0';
 const sessionURL = 'https://chatgpt.com/api/auth/session';
 const pngResponse = (bytes = PNG, headers = {}) => new Response(bytes, { headers: { 'content-type': 'image/png', ...headers } });
 const locatedResponse = (response, url) => Object.defineProperty(response, 'url', { value: url });
@@ -173,6 +174,63 @@ test('canonical Library opaque redirect gets one native follow with same-origin 
   // Fetch-standard Authorization stripping on the internal cross-origin hop.
 });
 
+test('canonical Library opaque redirect accepts the observed estuary route for the exact file without leaking its temporary URL', async () => {
+  const h = harness({ serve: (_, options) => options.redirect === 'manual' ? { type: 'opaqueredirect' } :
+    locatedResponse(pngResponse(), estuaryURL) });
+  let probeResult;
+  const resolver = createChatGPTAssetResolver(browserFor(h, { mutate: result => { probeResult = result; return result; } }),
+    { allowLibraryDownload: true });
+  const result = await resolver.resolve({ tabId: 3, account: ACCOUNT, asset });
+  assert.deepEqual(result.bytes, PNG);
+  assert.equal(result.sha256, await hash(PNG));
+  assert.equal(result.quality, 'original');
+  assert.equal(result.via, 'library-download');
+  assert.deepEqual(h.calls.map(call => call.url), [sessionURL, libraryURL, libraryURL, sessionURL]);
+  const follow = h.calls[2].options;
+  assert.equal(follow.redirect, 'follow'); assert.equal(follow.credentials, 'same-origin');
+  assert.equal(follow.referrerPolicy, 'no-referrer');
+  for (const value of [probeResult, result]) {
+    const serialized = JSON.stringify(value);
+    assert.ok(!serialized.includes('https://'));
+    assert.ok(!serialized.includes('synthetic-estuary-secret'));
+    assert.ok(!serialized.includes('synthetic-secret-token'));
+    assert.ok(!serialized.includes('synthetic-image.png'));
+  }
+});
+
+test('estuary final URLs require the exact route and a single matching platform file ID before reading bytes', async t => {
+  const route = 'https://chatgpt.com/backend-api/estuary/content';
+  for (const value of [
+    { name: 'missing ID', url: route },
+    { name: 'empty ID', url: `${route}?id=` },
+    { name: 'wrong file ID', url: `${route}?id=file_other` },
+    { name: 'library ID is not a file ID', url: `${route}?id=libfile_testA` },
+    { name: 'manifest hash is not a file ID', url: `${route}?id=${'f'.repeat(64)}` },
+    { name: 'no expected file ID', url: `${route}?id=file_testA`, source: { libraryFileId: asset.libraryFileId } },
+    { name: 'repeated identical ID', url: `${route}?id=file_testA&id=file_testA` },
+    { name: 'repeated conflicting ID', url: `${route}?id=file_testA&id=file_other` },
+    { name: 'encoded duplicate query key', url: `${route}?id=file_testA&%69d=file_testA` },
+    { name: 'extra path segment', url: `${route}/extra?id=file_testA` },
+    { name: 'similar route', url: 'https://chatgpt.com/backend-api/other/content?id=file_testA' },
+    { name: 'insecure scheme', url: `${route.replace('https:', 'http:')}?id=file_testA` },
+    { name: 'untrusted origin', url: `${route.replace('chatgpt.com', 'attacker.example')}?id=file_testA` },
+    { name: 'embedded credentials', url: `${route.replace('https://', 'https://user:synthetic-password@')}?id=file_testA` },
+    { name: 'nonstandard port', url: `${route.replace('chatgpt.com', 'chatgpt.com:444')}?id=file_testA` },
+  ]) await t.test(value.name, async () => {
+    let reads = 0;
+    const url = `${value.url}${value.url.includes('?') ? '&' : '?'}sig=synthetic-estuary-secret`;
+    const h = harness({ serve: (_, options) => options.redirect === 'manual' ? { type: 'opaqueredirect' } : {
+      type: 'basic', url, ok: true, status: 200, headers: new Headers({ 'content-type': 'image/png' }),
+      get body() { reads++; return null; },
+    } });
+    const result = await h.run({ asset: value.source || { ...asset } });
+    assert.equal(result.error.code, 'ASSET_URL'); assert.equal(reads, 0); assert.equal(result.binary, undefined);
+    assert.ok(!JSON.stringify(result).includes('https://'));
+    assert.ok(!JSON.stringify(result).includes('synthetic-estuary-secret'));
+    assert.ok(!JSON.stringify(result).includes('synthetic-password'));
+  });
+});
+
 test('Library follow validates the final HTTPS destination before reading its body', async t => {
   for (const url of [undefined, '', 'http://sdmntprtest.oaiusercontent.com/a.png', 'https://attacker.example/a.png',
     'https://user:secret@sdmntprtest.oaiusercontent.com/a.png', 'https://chatgpt.com/login',
@@ -192,7 +250,7 @@ test('Library follow validates the final HTTPS destination before reading its bo
 
 test('captured URLs, queried Library URLs and anonymous CDN requests never opt into native follow', async t => {
   for (const url of [libraryURL, `${libraryURL}?download=true`, `${libraryURL}#download`,
-    'https://chatgpt.com/backend-api/files/file_testA/download', 'https://sdmntprtest.oaiusercontent.com/a.png',
+    'https://chatgpt.com/backend-api/files/file_testA/download', estuaryURL, 'https://sdmntprtest.oaiusercontent.com/a.png',
     'blob:https://chatgpt.com/1111-2222']) {
     await t.test(url, async () => {
       const h = harness({ serve: () => ({ type: 'opaqueredirect' }) });
@@ -222,15 +280,18 @@ test('Library follow retains HTTP, HTML, network and timeout failure classificat
 });
 
 test('Library follow retains size, original-image and final account gates', async t => {
-  for (const value of [
+  for (const destination of ['https://sdmntprtest.oaiusercontent.com/original.png', estuaryURL]) for (const value of [
     { name: 'stream limit', maxBytes: 32, source: { fileId: asset.fileId, libraryFileId: asset.libraryFileId }, code: 'ASSET_TOO_LARGE' },
     { name: 'declared limit', response: () => pngResponse(PNG, { 'content-length': '99999999' }), code: 'ASSET_TOO_LARGE' },
+    { name: 'invalid image bytes', response: () => pngResponse(new TextEncoder().encode('not an image')), code: 'ASSET_FORMAT' },
+    { name: 'wrong MIME', response: () => pngResponse(PNG, { 'content-type': 'image/jpeg' }), code: 'ASSET_FORMAT' },
+    { name: 'wrong original dimensions', source: { ...asset, width: 2 }, code: 'ASSET_VARIANT' },
     { name: 'wrong original size', source: { ...asset, size: PNG.length + 1 }, code: 'ASSET_VARIANT' },
     { name: 'wrong original hash', source: { ...asset, expectedHash: '0'.repeat(64) }, code: 'ASSET_HASH_MISMATCH' },
     { name: 'account switched', sessions: ['synthetic-user-A', 'synthetic-user-B'], code: 'ACCOUNT_CHANGED' },
-  ]) await t.test(value.name, async () => {
+  ]) await t.test(`${new URL(destination).pathname}: ${value.name}`, async () => {
     const h = harness({ sessions: value.sessions, serve: (_, options) => options.redirect === 'manual' ? { type: 'opaqueredirect' } :
-      locatedResponse((value.response || pngResponse)(), 'https://sdmntprtest.oaiusercontent.com/original.png') });
+      locatedResponse((value.response || pngResponse)(), destination) });
     const result = await h.run({ asset: value.source || { ...asset }, maxBytes: value.maxBytes || 16 * 1024 * 1024 });
     assert.equal(result.error.code, value.code); assert.equal(result.binary, undefined);
   });
