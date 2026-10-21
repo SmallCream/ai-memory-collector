@@ -1,4 +1,5 @@
 import { createConfigStore, publicConfig, cleanAlias, collectorError, safeError, INTERVALS } from './config.js';
+import { createActivityLog } from './activity-log.js';
 export const ALARM_NAME = 'collector-work';
 const ORIGIN = 'https://chatgpt.com/*';
 const SCRIPT_ID = 'collector-chatgpt-entry';
@@ -9,7 +10,8 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
   assetService, restoreService,
   now = Date.now, later = setTimeout }) {
   const settings = createConfigStore({ getSetting, setSetting });
-  const identities = new Map(), syncLocks = new Map();
+  const identities = new Map(), syncLocks = new Map(), identityReads = new Map();
+  const activity = createActivityLog({ getSetting, setSetting, now });
   let pumping = null, continuation = null, startupError = null;
   let mutationQueue = Promise.resolve();
   // Filesystem mutation (collection, remote winner reconciliation, directory
@@ -38,18 +40,24 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
     if (active[0] && matches(active[0].url)) return active[0];
     return (await browser.tabs.query({ url: ORIGIN })).sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0] || null;
   }
-  async function identify(tab, force = false) {
+  async function identify(tab, force = false, waitForPause = true) {
     if (!tab) return null;
     const cached = identities.get(tab.id);
     if (!force && cached && now() - cached.at < 10000) return cached.identity;
     try {
       const identity = await adapter.identify(tab.id);
-      if (cached?.identity.accountKey && cached.identity.accountKey !== identity.accountKey) await engine.pause(cached.identity.accountKey);
+      if (cached?.identity.accountKey && cached.identity.accountKey !== identity.accountKey) {
+        const paused = engine.pause(cached.identity.accountKey);
+        if (waitForPause) await paused; else void paused.catch(() => {});
+      }
       identities.set(tab.id, { at: now(), identity });
       return identity;
     } catch (error) {
       identities.delete(tab.id);
-      if (cached?.identity.accountKey) await engine.pause(cached.identity.accountKey);
+      if (cached?.identity.accountKey) {
+        const paused = engine.pause(cached.identity.accountKey);
+        if (waitForPause) await paused; else void paused.catch(() => {});
+      }
       throw error;
     }
   }
@@ -63,18 +71,39 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
     const config = await settings.read();
     let current = null, error = startupError;
     if (await browser.permissions.contains({ origins: [ORIGIN] })) {
-      try { current = await context(tabId); } catch (e) { error = safeError(e); }
+      try {
+        const tab = await sourceTab(tabId);
+        if (!tab) throw collectorError('TAB_UNAVAILABLE', '请打开并登录 ChatGPT，插件会自动识别。');
+        const cached = identities.get(tab.id);
+        if (cached && (now() - cached.at >= 10000 || identityReads.has(tab.id))) {
+          // Polling remains observable while identity verification or an older
+          // account's paused tick is waiting. The UI labels this cached identity.
+          if (!identityReads.has(tab.id)) {
+            const check = identify(tab, true, false);
+            identityReads.set(tab.id, check);
+            void check.catch(() => {}).finally(() => { if (identityReads.get(tab.id) === check) identityReads.delete(tab.id); });
+          }
+          current = { tab, identity: cached.identity, account: config.accounts[cached.identity.accountKey], identityChecking: true };
+        } else {
+          const identity = await identify(tab, false, false);
+          current = { tab, identity, account: config.accounts[identity.accountKey] };
+        }
+      } catch (e) { error = safeError(e); }
     } else error = { code: 'SITE_PERMISSION_REQUIRED', message: '请先授权访问 ChatGPT，之后会自动识别当前账号。' };
     const account = current?.account || null, directory = await directoryState();
     return { config: publicConfig(config), directory,
-      identity: current?.identity || null, account,
+      identity: current?.identity || null, identityChecking: current?.identityChecking === true, account,
       job: account ? await engine.getState(account.accountKey) : null,
       lastResult: account?.lastResult || null,
       nextRunAt: config.autoEnabled && account?.enabled ? account.nextRunAt || now() : null,
       githubStatus: account ? await getSetting(`githubStatus:${account.accountKey}`) || { status: 'idle' } : { status: 'idle' },
       assetStatus: account ? await getSetting(`assetStatus:${account.accountKey}`) || null : null,
       assetDiagnostics: account && assetService?.diagnostics ? await assetService.diagnostics({ account,
-        directory: directory.granted ? await getSetting('directory') : null }) : null,
+        directory: directory.granted ? await getSetting('directory') : null, github: config.github }) : null,
+      outboxSummary: account && engine.getOutboxSummary ? await engine.getOutboxSummary(account.accountKey) : null,
+      activity: Object.fromEntries(await Promise.all(Object.entries({ collection: 'collection', download: 'download',
+        upload: 'upload', github: 'github', restoreImages: 'restore-images', restore: 'restore' }).map(async ([name, channel]) =>
+        [name, name === 'restore' ? await activity.read('repository', channel) : account ? await activity.read(account.accountKey, channel) : null]))),
       restoreStatus: restoreService ? await restoreService.state() : null,
       legacyPending: Boolean(await getSetting('pendingArchive')), error, tabId: current?.tab.id ?? null };
   }
@@ -199,13 +228,17 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
       await setSetting(key, { ...previous, status: 'syncing', pending: pending.length });
       try {
         const assetPointers = assetService ? await assetService.prepareUploads({ directory: await getSetting('directory'), account, config: github, bundles: outbox }) : [];
-        const result = await syncArchives({ config: github, bundles: outbox, assetPointers });
+        const result = await activity.run(account.accountKey, 'github', { stage: 'commit', total: outbox.length },
+          () => syncArchives({ config: github, bundles: outbox, assetPointers }));
         const latest = (await settings.read()).github;
         if (latest.repository !== github.repository || latest.branch !== github.branch || latest.enabled !== github.enabled) {
           throw collectorError('GITHUB_TARGET_CHANGED', '同步目标已变化，待上传数据已保留，请重新同步。');
         }
         for (const winner of result.remoteWinners || []) {
-          const saved = await applyRemoteFiles({ directory: await getSetting('directory'), account, files: winner.files });
+          const directory = await getSetting('directory');
+          const saved = await activity.run(account.accountKey, 'github', { stage: 'apply-remote',
+            title: winner.entry?.title, conversationId: winner.entry?.conversationId },
+          () => applyRemoteFiles({ directory, account, files: winner.files }));
           if (saved?.recovered) await engine.enqueueArchive({ account, archive: saved.recovered });
         }
         await engine.acknowledgeOutbox(account.accountKey, outbox.map(x => x.id));

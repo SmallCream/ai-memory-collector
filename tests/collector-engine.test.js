@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createCollectorEngine } from '../extension/lib/collector-engine.js';
+import { createActivityLog } from '../extension/lib/activity-log.js';
 
 const account = { platform: 'chatgpt', accountKey: 'acct-demo', storageKey: 'demo-acct', alias: 'Demo', enabled: true, initialized: false };
 const key = name => `collector${name}:${account.accountKey}`;
@@ -321,4 +322,100 @@ test('delayed recovery delivery cannot replace a newer queued conversation or im
   } });
   const after = (await f.engine.getOutbox(account.accountKey)).find(bundle => bundle.conversationId === 'a');
   assert.equal(after.id, before.id);
+});
+
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+test('collection details remain readable during actual list, detail and filesystem waits', { timeout: 5000 }, async t => {
+  for (const stage of ['list', 'detail', 'save']) await t.test(stage, async () => {
+    const f = setup(), entered = deferred(), release = deferred();
+    await f.engine.start({ account, tabId: 1, mode: 'initial' });
+    if (stage !== 'list') await f.engine.tick({ account, tabId: 1 });
+    const activity = createActivityLog(f.dependencies);
+    if (stage === 'save') {
+      const original = f.dependencies.saveConversation;
+      f.dependencies.saveConversation = async input => { entered.resolve(); await release.promise; return original(input); };
+      f.engine = createCollectorEngine(f.dependencies);
+    } else {
+      const original = f.dependencies.adapter[stage];
+      f.dependencies.adapter[stage] = async (...args) => { entered.resolve(); await release.promise; return original(...args); };
+    }
+    const tick = f.engine.tick({ account, tabId: 1 });
+    await entered.promise;
+    const state = await f.engine.getState(account.accountKey);
+    const during = await activity.read(account.accountKey, 'collection');
+    assert.equal(during.current.status, 'running');
+    assert.equal(during.current.stage, stage);
+    if (stage !== 'list') {
+      assert.equal(during.current.conversationId, 'a');
+      assert.equal(during.current.title, 'Title a');
+      assert.equal(state.diagnostics.saved, 0);
+      assert.equal(state.diagnostics.remaining, 2);
+    }
+    f.advance(12_000);
+    const later = await activity.read(account.accountKey, 'collection');
+    assert.equal(later.current.startedAt, during.current.startedAt);
+    assert.equal(later.updatedAt, during.updatedAt, 'polling must not invent activity');
+    release.resolve(); await tick;
+    const after = await activity.read(account.accountKey, 'collection');
+    assert.notEqual(after.current.status, 'running');
+    assert.ok(after.recent.some(item => item.stage === stage));
+  });
+});
+
+test('collection diagnostics expose bounded sanitized queue metadata and distinguish retry from terminal failure', async () => {
+  const f = setup({ list: async () => ({ items: Array.from({ length: 65 }, (_, index) => ({
+    ...source(`item-${index}`), title: `Title ${index} https://example.invalid/private?sig=secret github_pat_syntheticsecret`,
+  })), nextOffset: null, total: 65 }), detailError: id => id === 'item-0' ? 'HTTP_429' : 'HTTP_404' });
+  await f.engine.start({ account, tabId: 1, mode: 'initial' });
+  await f.engine.tick({ account, tabId: 1 });
+  await f.engine.tick({ account, tabId: 1 });
+  await f.engine.tick({ account, tabId: 1 });
+  const state = await f.engine.getState(account.accountKey), detail = state.diagnostics;
+  assert.equal(detail.total, 65); assert.equal(detail.items.length, 50); assert.equal(detail.remaining, 65);
+  assert.equal(detail.retrying, 1); assert.equal(detail.failed, 1); assert.equal(detail.saved, 0);
+  assert.equal(detail.items[0].status, 'failed'); assert.equal(detail.items[0].code, 'HTTP_404');
+  const retry = detail.items.find(item => item.status === 'retry');
+  assert.equal(retry.conversationId, 'item-0'); assert.equal(retry.attempt, 1);
+  assert.ok(retry.nextRetryAt > f.dependencies.now());
+  assert.doesNotMatch(JSON.stringify(detail), /private|sig=|github_pat_|syntheticsecret|Untrusted error/);
+  assert.equal(state.queue, undefined); assert.equal(state.known, undefined); assert.equal(state.manifestIds, undefined);
+  const snapshots = structuredClone(f.store);
+  await f.engine.getState(account.accountKey); await f.engine.getState(account.accountKey);
+  assert.deepEqual(f.store, snapshots, 'read-only diagnostics never advance collection');
+});
+
+test('a failed detail logs its real error code while retry timing and completed archives remain unchanged', async () => {
+  const f = setup({ detailError: id => id === 'a' ? 'INCOMPLETE_DETAIL' : null });
+  await f.engine.start({ account, tabId: 1, mode: 'initial' });
+  await f.engine.tick({ account, tabId: 1 });
+  const result = await f.engine.tick({ account, tabId: 1 });
+  const activity = await createActivityLog(f.dependencies).read(account.accountKey, 'collection');
+  assert.equal(activity.current.stage, 'detail');
+  assert.equal(activity.current.status, 'failed');
+  assert.equal(activity.current.code, 'INCOMPLETE_DETAIL');
+  assert.equal(result.diagnostics.retrying, 1); assert.equal(result.processed, 0);
+  assert.equal(result.nextRetryAt, f.dependencies.now() + 60_000);
+  assert.deepEqual(await f.engine.getOutboxSummary(account.accountKey), { total: 0, items: [] });
+  await f.engine.tick({ account, tabId: 1 });
+  assert.equal((await f.engine.getState(account.accountKey)).diagnostics.saved, 1);
+});
+
+test('outbox summaries show only bounded metadata without reading conversation bodies into the UI response', async () => {
+  const f = setup(); await f.engine.start({ account, tabId: 1, mode: 'initial' }); await complete(f.engine);
+  const stored = f.store.get(key('Outbox'));
+  const first = stored.bundles[0];
+  stored.bundles = Array.from({ length: 60 }, (_, index) => ({ ...first, id: `bundle-${index}`, conversationId: `item-${index}`,
+    manifestEntry: { ...first.manifestEntry, title: 'Title https://example.invalid/image?sig=secret Bearer synthetic-token' },
+    files: [{ path: 'private-path', content: 'conversation body must remain private to the diagnostic response' }],
+  }));
+  f.store.set(key('Outbox'), stored);
+  const result = await f.engine.getOutboxSummary(account.accountKey);
+  assert.equal(result.total, 60); assert.equal(result.items.length, 50);
+  assert.equal(result.items[0].conversationId, 'item-0'); assert.ok(result.items[0].createdAt);
+  assert.doesNotMatch(JSON.stringify(result), /private-path|conversation body|sig=|synthetic-token|manifestEntry|files/);
 });

@@ -5,6 +5,7 @@ import { validateExternalAsset } from './chatgpt-assets.js';
 import { assetPath, readLocalBytes, verifiedLocalAsset, writeLocalAsset, imageExtension, MAX_ASSET_BYTES } from './asset-store.js';
 import { createLfsClient, hashBytes, formatLfsPointer, parseLfsPointer } from './lfs.js';
 import { collectorError, safeError } from './config.js';
+import { createActivityLog } from './activity-log.js';
 
 const ready = asset => asset.status === 'downloaded' && asset.oid && asset.localPath;
 const key = account => `assetJobs:${account.accountKey}`;
@@ -24,11 +25,12 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
   resolveAsset, refreshConversation, enqueueArchive, browser = globalThis.chrome, fetchImpl = globalThis.fetch, downloadRepositoryFile,
   lfsFactory = createLfsClient, now = Date.now }) {
   const ephemeral = new Map();
+  const activity = createActivityLog({ getSetting, setSetting, now });
   async function jobs(account) { return await getSetting(key(account)) || { tasks: [] }; }
   const label = value => String(value || '').replace(/(?:https?:\/\/|blob:|data:)[^\s<>"']+/gi, '[链接已隐藏]')
     .replace(/(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]+/g, '[已隐藏]').replace(/Bearer\s+[^\s,;]+/gi, '[已隐藏]')
     .replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, '').slice(0, 200);
-  async function diagnostics({ directory, account }) {
+  async function diagnostics({ directory, account, github }) {
     const state = await jobs(account);
     let manifest;
     if (directory) { try { manifest = await readAccountManifest(directory, account); } catch { /* queue remains readable without directory access */ } }
@@ -43,7 +45,36 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
         attempt: Number.isSafeInteger(task.attempt) && task.attempt >= 0 ? task.attempt : 0,
         retryAt: Number.isFinite(task.retryAt) ? task.retryAt : 0 };
     };
+    const captureItems = state.tasks.slice(0, 50).map(task => {
+      const item = describe(task);
+      return { conversationId: item.conversationId, title: item.conversationTitle, fileName: item.fileName,
+        status: deliveryPending(task) ? 'delivering' : task.manualRetry ? 'pending' : suspended(task) ? 'internal-missing' :
+          task.error ? (task.retryAt > now() ? 'retry' : 'failed') : 'pending',
+        attempt: item.attempt, nextRetryAt: item.retryAt, code: task.error ? item.code : null };
+    });
+    const receipts = await getSetting(receiptKey(account));
+    let receiptDirectory = Boolean(directory) && directory === receipts?.directory;
+    if (!receiptDirectory && directory && receipts?.directory) {
+      try { receiptDirectory = Boolean(await directory.isSameEntry(receipts.directory)); } catch { /* stale directory handle */ }
+    }
+    const receiptTarget = !github || (typeof github.repository === 'string' &&
+      receipts?.repository === github.repository.toLowerCase() && receipts?.branch === (github.branch || ''));
+    const uploaded = new Set(receiptDirectory && receiptTarget && Array.isArray(receipts?.uploaded) ? receipts.uploaded : []);
+    const uploadRecords = new Map();
+    for (const [conversationId, entry] of Object.entries(manifest?.conversations || {})) {
+      for (const asset of entry.assets || []) if (isImage(asset) && ready(asset)) {
+        const id = uploadIdentity(asset);
+        if (!uploadRecords.has(id)) uploadRecords.set(id, {
+          conversationId: label(conversationId), title: label(entry.title),
+          fileName: label(asset.fileName || asset.localPath?.split('/').at(-1)),
+          size: Number.isSafeInteger(asset.size) && asset.size >= 0 ? asset.size : 0,
+          status: uploaded.has(id) ? 'uploaded' : 'pending',
+        });
+      }
+    }
+    const uploadItems = [...uploadRecords.values()].sort((a, b) => Number(a.status === 'uploaded') - Number(b.status === 'uploaded')).slice(0, 50);
     return { total: state.tasks.length, pending: state.tasks.filter(activeTask).length, failed: failures.length,
+      captureTotal: state.tasks.length, captureItems, uploadTotal: uploadRecords.size, uploadItems,
       failures: failures.slice(0, 200).map(describe), internalMissing: internal.length,
       internalFailures: internal.slice(0, 200).map(task => ({ ...describe(task), code: 'HTTP_404',
         message: '内部附件未下载，自动重试已停止；原始来源和失败记录已保留。', retryAt: 0 })) };
@@ -127,22 +158,29 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
     return { ...asset, status: 'external', mimeType: result.mimeType };
   }
   async function capture(asset, request) {
-    if (asset.sourceType === 'external') return external(asset);
-    let bytes, mimeType = asset.mimeType, quality = 'original';
-    const retrievalURL = asset.retrieval?.url || asset.retrieval?.sourceRef || asset.sourceRef;
-    if (asset.sourceType === 'embedded' && /^data:image\/(?:png|jpeg|gif|webp|avif);base64,/i.test(retrievalURL)) {
-      const data = retrievalURL.split(',')[1];
-      if (data.length > MAX_ASSET_BYTES * 1.4) throw collectorError('ASSET_SIZE', '内嵌图片超过处理上限。');
-      try { bytes = Uint8Array.from(atob(data), c => c.charCodeAt(0)); } catch { throw collectorError('ASSET_FORMAT', '内嵌图片格式不正确。'); }
-    } else {
-      const resolved = await resolveAsset({ ...request, asset }); bytes = resolved.bytes; mimeType = resolved.mimeType || mimeType; quality = resolved.quality;
-    }
-    if (!(bytes instanceof Uint8Array) || !bytes.length || bytes.length > MAX_ASSET_BYTES) throw collectorError('ASSET_SIZE', '图片超过处理上限或没有数据。');
-    const extension = imageExtension(bytes), oid = await hashBytes(bytes);
-    const managed = reconcileAssetCapturePolicy({ ...asset, status: 'downloaded', oid, size: bytes.length, mimeType, quality,
-      localPath: assetPath(request.account, oid, extension) }, asset);
-    delete managed.errorCode;
-    await writeLocalAsset({ ...request, asset: managed, bytes, getSetting, setSetting });
+    const info = { title: request.title, conversationId: request.conversationId, fileName: asset.fileName,
+      ...(Number.isSafeInteger(asset.expectedSize) ? { size: asset.expectedSize } : {}) };
+    if (asset.sourceType === 'external') return activity.run(request.account.accountKey, 'download',
+      { ...info, stage: 'check-external' }, () => external(asset));
+    const { managed, bytes } = await activity.run(request.account.accountKey, 'download', { ...info, stage: 'download' }, async () => {
+      let bytes, mimeType = asset.mimeType, quality = 'original';
+      const retrievalURL = asset.retrieval?.url || asset.retrieval?.sourceRef || asset.sourceRef;
+      if (asset.sourceType === 'embedded' && /^data:image\/(?:png|jpeg|gif|webp|avif);base64,/i.test(retrievalURL)) {
+        const data = retrievalURL.split(',')[1];
+        if (data.length > MAX_ASSET_BYTES * 1.4) throw collectorError('ASSET_SIZE', '内嵌图片超过处理上限。');
+        try { bytes = Uint8Array.from(atob(data), c => c.charCodeAt(0)); } catch { throw collectorError('ASSET_FORMAT', '内嵌图片格式不正确。'); }
+      } else {
+        const resolved = await resolveAsset({ ...request, asset }); bytes = resolved.bytes; mimeType = resolved.mimeType || mimeType; quality = resolved.quality;
+      }
+      if (!(bytes instanceof Uint8Array) || !bytes.length || bytes.length > MAX_ASSET_BYTES) throw collectorError('ASSET_SIZE', '图片超过处理上限或没有数据。');
+      const extension = imageExtension(bytes), oid = await hashBytes(bytes);
+      const managed = reconcileAssetCapturePolicy({ ...asset, status: 'downloaded', oid, size: bytes.length, mimeType, quality,
+        localPath: assetPath(request.account, oid, extension) }, asset);
+      delete managed.errorCode;
+      return { managed, bytes };
+    });
+    await activity.run(request.account.accountKey, 'download', { ...info, stage: 'save-image', size: bytes.length },
+      () => writeLocalAsset({ ...request, asset: managed, bytes, getSetting, setSetting }));
     return managed;
   }
   async function tick({ directory, account, tabId, manualOnly = false }) {
@@ -223,13 +261,17 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
         if (!migrate404 && !(suspended(asset) && !task.manualRetry) && !ready(original) && original.status !== 'external' && refreshConversation && (task.refreshSource || task.error)) {
           operationStage = 'source';
           try {
-            const detail = await refreshConversation({ tabId, accountKey: account.accountKey, conversationId: task.conversationId });
-            if (detail?.identity?.accountKey !== account.accountKey) throw collectorError('ACCOUNT_CHANGED', '图片详情所属账号不匹配。');
-            if (nativeId(detail?.payload || {}) !== task.conversationId || detail.completeness !== 'complete') {
-              throw collectorError('INCOMPLETE_DETAIL', '图片来源详情未完整确认，原归档保持不变。');
-            }
-            const online = (await extractAssets(detail.payload)).find(a => a.id === asset.id);
-            if (!online) throw collectorError('ASSET_SOURCE_MISSING', '最新详情中未找到这张图片，保留已有记录等待检查。');
+            const online = await activity.run(account.accountKey, 'download', { stage: 'refresh-source', title: entry.title,
+              conversationId: task.conversationId, fileName: asset.fileName }, async () => {
+              const detail = await refreshConversation({ tabId, accountKey: account.accountKey, conversationId: task.conversationId });
+              if (detail?.identity?.accountKey !== account.accountKey) throw collectorError('ACCOUNT_CHANGED', '图片详情所属账号不匹配。');
+              if (nativeId(detail?.payload || {}) !== task.conversationId || detail.completeness !== 'complete') {
+                throw collectorError('INCOMPLETE_DETAIL', '图片来源详情未完整确认，原归档保持不变。');
+              }
+              const online = (await extractAssets(detail.payload)).find(a => a.id === asset.id);
+              if (!online) throw collectorError('ASSET_SOURCE_MISSING', '最新详情中未找到这张图片，保留已有记录等待检查。');
+              return online;
+            });
             // Live references may promote an attachment to normal capture. They
             // cannot weaken the source classification from the archived JSON.
             if (online.capturePolicy !== 'internal-viewer') asset = reconcileAssetCapturePolicy(asset, online);
@@ -256,7 +298,7 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
           try {
             if (sourceFailure) throw sourceFailure;
             completed = ready(asset) || asset.status === 'external' ? asset : await capture(requestAsset,
-              { directory, account, tabId, conversationId: task.conversationId });
+              { directory, account, tabId, conversationId: task.conversationId, title: entry.title });
             delete task.autoRetrySuspended;
           } catch (error) {
             const failure = safeError(error);
@@ -336,10 +378,12 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
     return { pending: state.tasks.filter(activeTask).length, runnable: state.tasks.some(t => runnable(t) || needsPolicyCheck(t)) };
   }
   async function prepareUploads({ directory, account, config, bundles }) {
-    const records = new Map();
+    const records = new Map(), sourceLabels = new Map();
     for (const bundle of bundles) for (const file of bundle.files) if (file.path.endsWith('/archive/manifest.json')) {
       const manifest = JSON.parse(file.content);
-      for (const entry of Object.values(manifest.conversations || {})) for (const asset of entry.assets || []) if (ready(asset)) records.set(asset.localPath, asset);
+      for (const [conversationId, entry] of Object.entries(manifest.conversations || {})) for (const asset of entry.assets || []) if (ready(asset)) {
+        records.set(asset.localPath, asset); sourceLabels.set(asset.localPath, { conversationId, title: entry.title });
+      }
     }
     if (records.size && config.lfsEnabled === false) throw collectorError('LFS_DISABLED', '图片已保存在本地；请启用 LFS 后同步带图片的对话。');
     const target = { repository: config.repository.toLowerCase(), branch: config.branch || '' };
@@ -377,7 +421,10 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
       const identity = uploadIdentity(asset);
       if (!uploaded.has(identity)) {
         if (transferred >= 2) { await progress(); throw collectorError('LFS_UPLOAD_PENDING', '图片正在分批上传，进度已保存。'); }
-        await client.upload({ bytes, oid: asset.oid, size: asset.size, mimeType: asset.mimeType });
+        await activity.run(account.accountKey, 'upload', { ...sourceLabels.get(asset.localPath), stage: 'upload-image',
+          fileName: asset.fileName || asset.localPath.split('/').at(-1), size: asset.size,
+          completed: [...records.values()].filter(item => uploaded.has(uploadIdentity(item))).length, total: records.size },
+        () => client.upload({ bytes, oid: asset.oid, size: asset.size, mimeType: asset.mimeType }));
         transferred++; uploaded.add(identity); receiptSet.add(identity);
         checkpoint.uploaded = [...uploaded]; receipts.uploaded = [...receiptSet];
         await setSetting(receiptKey(account), receipts);
@@ -459,10 +506,15 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
       try {
         const remote = snapshot.entries.find(e => e.path === asset.localPath);
         if (!remote) throw collectorError('ASSET_POINTER_MISSING', '远端图片指针缺失，已保留待补齐任务。');
-        const pointer = parseLfsPointer(text(await downloadRepositoryFile({ config, entry: remote, fetchImpl, maxBytes: 2048 })));
-        if (!pointer || pointer.oid !== asset.oid || pointer.size !== asset.size) throw collectorError('ASSET_POINTER_MISMATCH', '图片指针与对话清单不一致。');
-        const bytes = await client.download({ oid: asset.oid, size: asset.size });
-        await writeLocalAsset({ directory, account, asset, bytes, getSetting, setSetting }); downloaded++;
+        const info = { stage: 'restore-image', title: entry.title, conversationId: entry.conversationId,
+          fileName: asset.fileName || asset.localPath.split('/').at(-1), size: asset.size };
+        const bytes = await activity.run(account.accountKey, 'restore-images', info, async () => {
+          const pointer = parseLfsPointer(text(await downloadRepositoryFile({ config, entry: remote, fetchImpl, maxBytes: 2048 })));
+          if (!pointer || pointer.oid !== asset.oid || pointer.size !== asset.size) throw collectorError('ASSET_POINTER_MISMATCH', '图片指针与对话清单不一致。');
+          return client.download({ oid: asset.oid, size: asset.size });
+        });
+        await activity.run(account.accountKey, 'restore-images', { ...info, stage: 'save-image' },
+          () => writeLocalAsset({ directory, account, asset, bytes, getSetting, setSetting })); downloaded++;
         delete checkpoint.failures[id];
         await setSetting(checkpointKey, checkpoint);
       } catch (error) { await failed(id, error); }

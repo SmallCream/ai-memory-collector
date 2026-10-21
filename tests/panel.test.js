@@ -81,6 +81,36 @@ async function complete(f) {
   throw new Error('Job did not complete');
 }
 
+test('get-state shows actual GitHub request progress while the writer owns the command lock', async () => {
+  const gate = deferred();
+  const f = fixture({ syncGate: gate, github: { enabled: true, token: 'private-token', repository: 'owner/private' } });
+  await f.service.pump(); await f.service.pump(); await f.service.pump();
+  const pumping = f.service.pump();
+  for (let n = 0; n < 20 && !f.calls.uploads.length; n++) await turn();
+  assert.equal(f.calls.uploads.length, 1);
+  const state = (await f.service.command({ type: 'collector:get-state' }, 1)).state;
+  assert.equal(state.activity.github.current.status, 'running');
+  assert.equal(state.activity.github.current.stage, 'commit');
+  assert.equal(state.outboxSummary.total, 1);
+  assert.ok(!JSON.stringify(state.activity).includes('private-token'));
+  gate.resolve(); await pumping;
+  assert.equal((await f.service.state(1)).activity.github.current.status, 'success');
+});
+
+test('stale identity checks do not block progress reads and are labelled until the new account is confirmed', async () => {
+  const f = fixture(); await f.service.state(1); f.advance(11000);
+  const gate = deferred(); let checks = 0;
+  const changed = { platform: 'chatgpt', accountKey: 'acct-new', displayName: 'Other account' };
+  f.dependencies.adapter.identify = async () => { checks++; await gate.promise; return changed; };
+  const pending = await f.service.state(1);
+  assert.equal(pending.identity.accountKey, accountKey); assert.equal(pending.identityChecking, true);
+  await f.service.state(1); assert.equal(checks, 1);
+  gate.resolve(); await turn();
+  const next = await f.service.state(1);
+  assert.equal(next.identity.accountKey, changed.accountKey); assert.equal(next.identityChecking, false);
+  assert.equal(next.account, null); assert.equal(next.activity.collection, null); assert.equal(next.outboxSummary, null);
+});
+
 test('manual restore runs without a source tab, account binding or automatic upload', async () => {
   const f = fixture({ config: { setupComplete: false, accounts: {} }, github: { repository: 'owner/data', token: 'secret', enabled: false } });
   f.tabs.length = 0; f.permissions.delete(site);

@@ -51,10 +51,15 @@ async function setup(options = {}) {
       close: () => events.push('window-close'), showDirectoryPicker: async () => { events.push('directory-picker'); return directory; } },
     location: { href: options.url || 'chrome-extension://test/panel.html' }, URL, Date, Set, Map, Number, String, Array, Boolean, Event,
     setInterval: callback => { intervalCallbacks.push(callback); return 1; }, clearInterval() {},
+    setTimeout: options.setTimeout || setTimeout, clearTimeout: options.clearTimeout || clearTimeout,
     getSetting: async key => settings.get(key), setSetting: async (key, value) => { events.push(`setting:${key}`); settings.set(key, value); },
     chrome: {
       runtime: { sendMessage: async message => {
         messages.push(structuredClone(message)); events.push(message.type);
+        if (options.messageHook) {
+          const result = await options.messageHook(message, structuredClone(state));
+          if (result !== undefined) return result;
+        }
         if (options.messageError && message.type === options.messageError) return { ok: false, error: { code: 'TEST', message: 'simulated failure' } };
         if (message.type === 'collector:bind') state.account = { ...state.account, enabled: true, alias: message.alias };
         if (message.type === 'collector:configure') state.config = { ...state.config, ...message };
@@ -460,4 +465,176 @@ test('internal attachment diagnostics sanitize source labels and clear after suc
   assert.equal(app.elements.get('asset-internal').hidden, true);
   assert.equal(app.elements.get('asset-internal-list').children.length, 0);
   assert.equal(app.elements.get('retry-internal-images').disabled, true);
+});
+
+
+function visibleText(element) { return [element.textContent, ...element.children.map(visibleText)].join(' '); }
+function logItem(extra = {}) {
+  return { stage: 'detail', title: '项目讨论', conversationId: 'synthetic-conversation', status: 'running',
+    startedAt: Date.now() - 120_000, updatedAt: Date.now() - 120_000, ...extra };
+}
+
+test('collection details show real current work, retry queue and recent steps while preserving expansion', async () => {
+  const state = initialState();
+  state.job = { status: 'running', phase: 'details', discovered: 5, processed: 2, pages: 1,
+    diagnostics: { total: 5, remaining: 3, saved: 2, skipped: 0, failed: 0, retrying: 1,
+      items: [{ conversationId: 'synthetic-next', title: '下一段对话', status: 'retry', attempt: 2, code: 'HTTP_429', nextRetryAt: Date.now() + 60_000 }] } };
+  state.activity = { collection: { current: logItem(), recent: [logItem({ status: 'success', stage: 'save', finishedAt: Date.now() - 60_000 })] } };
+  const app = await setup({ state });
+  assert.equal(app.elements.get('collection-details').hidden, false);
+  assert.match(visibleText(app.elements.get('collection-current')), /读取对话详情 · 项目讨论/);
+  assert.match(visibleText(app.elements.get('collection-current')), /暂未收到新进展，可能仍在等待响应/);
+  assert.match(visibleText(app.elements.get('collection-queue')), /下一段对话 · 等待重试/);
+  assert.match(visibleText(app.elements.get('collection-queue')), /HTTP_429/);
+  assert.match(app.elements.get('collection-detail-counts').textContent, /失败／重试 1 条/);
+  assert.match(visibleText(app.elements.get('collection-recent')), /保存对话文件 · 本步骤完成/);
+  app.elements.get('collection-details').open = true;
+  app.elements.get('collection-queue').scrollTop = 72;
+  await app.poll();
+  assert.equal(app.elements.get('collection-details').open, true);
+  assert.equal(app.elements.get('collection-queue').scrollTop, 72);
+});
+
+test('retry waiting and paused jobs never infer stalled work from an old completed step', async () => {
+  const state = initialState(); state.job = { status: 'running', nextRetryAt: Date.now() + 600_000, discovered: 1, processed: 0 };
+  state.activity = { collection: { current: logItem({ status: 'failed', code: 'HTTP_429', finishedAt: Date.now() - 90_000 }) } };
+  const app = await setup({ state });
+  assert.equal(app.elements.get('collection-details-status').textContent, '等待重试');
+  assert.match(app.elements.get('collection-wait').textContent, /等待重试至/);
+  assert.doesNotMatch(visibleText(app.elements.get('collection-current')), /暂未收到新进展/);
+  state.job.status = 'paused'; app.setState(state); await app.poll();
+  assert.equal(app.elements.get('collection-details-status').textContent, '已暂停');
+  assert.match(app.elements.get('collection-wait').textContent, /点击“继续采集”/);
+  state.job.status = 'running'; state.job.nextRetryAt = null; state.activity.collection.current.status = 'interrupted';
+  app.setState(state); await app.poll();
+  assert.match(visibleText(app.elements.get('collection-current')), /上次处理已中断/);
+  assert.doesNotMatch(visibleText(app.elements.get('collection-current')), /暂未收到新进展/);
+});
+
+test('transfer details distinguish file upload from conversation commit and expose downloads and restore scope', async () => {
+  const state = initialState(); state.config.github.enabled = true;
+  state.githubStatus = { status: 'pending', pending: 1 };
+  state.assetDiagnostics = { pending: 1, failed: 1, internalMissing: 0, captureTotal: 1, captureItems: [
+    { title: '截图讨论', fileName: '截图.png', status: 'retry', attempt: 1, code: 'HTTP_403' }], uploadTotal: 1,
+    uploadItems: [{ title: '另一段对话', fileName: '结果.png', status: 'uploaded', size: 2048 }] };
+  state.outboxSummary = { total: 1, items: [{ conversationId: 'synthetic-commit', title: '待提交对话', createdAt: Date.now() - 1000 }] };
+  state.activity = { upload: { current: logItem({ status: 'success', stage: 'upload-image', fileName: '结果.png', finishedAt: Date.now(), completed: 1, total: 1 }), recent: [] } };
+  state.restoreStatus = { total: 5, processed: 3, pending: 2, failed: 0 };
+  const app = await setup({ state });
+  assert.match(visibleText(app.elements.get('transfer-current')), /图片上传 · 本步骤完成/);
+  assert.match(visibleText(app.elements.get('upload-queue')), /结果.png · 已上传/);
+  assert.match(visibleText(app.elements.get('download-queue')), /HTTP_403/);
+  assert.match(visibleText(app.elements.get('outbox-queue')), /待提交对话 · 等待提交/);
+  assert.match(app.elements.get('transfer-wait').textContent, /还需要提交 JSON、Markdown 与清单/);
+  assert.match(app.elements.get('transfer-restore-detail').textContent, /已处理 3 \/ 5 条/);
+  assert.match(html, /仓库恢复（全部账号）/);
+  app.elements.get('transfer-details').open = true;
+  await app.poll(); assert.equal(app.elements.get('transfer-details').open, true);
+});
+
+test('diagnostic rows are bounded, redact source credentials, and clear when account changes', async () => {
+  const state = initialState();
+  state.job = { status: 'running', diagnostics: { total: 80, items: Array.from({ length: 80 }, (_, i) => ({
+    title: `<img onerror=alert(1)> ${i} https://example.com/?sig=secret ghp_syntheticsecret`, status: 'pending' })) } };
+  state.activity = { collection: { current: logItem({ title: 'Bearer synthetic-secret https://example.com/private' }),
+    recent: Array.from({ length: 25 }, () => logItem({ status: 'success' })) } };
+  const app = await setup({ state });
+  assert.equal(app.elements.get('collection-queue').children.length, 50);
+  assert.equal(app.elements.get('collection-recent').children.length, 20);
+  assert.match(app.elements.get('collection-queue-note').textContent, /共 80 项，显示前 50 项/);
+  const text = visibleText(app.elements.get('collection-queue')) + visibleText(app.elements.get('collection-current'));
+  assert.doesNotMatch(text, /sig=secret|syntheticsecret|synthetic-secret|https:\/\//);
+  assert.match(text, /<img onerror=alert\(1\)>/);
+  const next = initialState(); next.identity.accountKey = 'acct-other'; next.account.accountKey = 'acct-other';
+  app.setState(next); await app.poll();
+  assert.equal(app.elements.get('collection-details').hidden, true);
+  assert.equal(app.elements.get('collection-queue').children.length, 0);
+  assert.equal(app.elements.get('collection-recent').children.length, 0);
+});
+
+test('identity checking labels cached account progress and disables account mutations while allowing settings', async () => {
+  const state = initialState(); state.identityChecking = true;
+  const app = await setup({ state });
+  assert.equal(app.elements.get('account-badge').textContent, '核验中');
+  assert.equal(app.elements.get('identity-checking-note').hidden, false);
+  for (const id of ['start-capture', 'full-capture', 'pause-capture', 'retry-github', 'retry-images']) assert.equal(app.elements.get(id).disabled, true);
+  assert.equal(app.elements.get('open-settings').disabled, false);
+  state.identityChecking = false; app.setState(state); await app.poll();
+  assert.equal(app.elements.get('identity-checking-note').hidden, true);
+  assert.equal(app.elements.get('start-capture').disabled, false);
+});
+
+test('read-only progress polling continues during a long command without reenabling mutation controls', async () => {
+  let release;
+  const held = new Promise(resolve => { release = resolve; });
+  const state = initialState(); state.config.github.enabled = true; state.githubStatus = { status: 'pending', pending: 1 };
+  const app = await setup({ state, messageHook: async message => {
+    if (message.type === 'collector:retry-github') await held;
+  } });
+  const command = app.click('retry-github');
+  await new Promise(resolve => setImmediate(resolve));
+  state.activity = { upload: { current: logItem({ stage: 'upload-image', fileName: 'current.png' }) } };
+  app.setState(state); await app.poll();
+  assert.match(visibleText(app.elements.get('transfer-current')), /current.png/);
+  assert.equal(app.elements.get('retry-github').disabled, true);
+  release(); await command;
+  assert.equal(app.elements.get('retry-github').disabled, false);
+});
+
+test('overlapping polls share one read and stale poll cannot overwrite a newer command response', async () => {
+  let releasePoll, releaseCommand, pollReads = 0;
+  const pendingPoll = new Promise(resolve => { releasePoll = resolve; });
+  const pendingCommand = new Promise(resolve => { releaseCommand = resolve; });
+  const state = initialState(); state.config.github.enabled = true; state.githubStatus = { status: 'pending', pending: 1 };
+  const fresh = structuredClone(state); fresh.githubStatus = { status: 'synced', pending: 0 };
+  const app = await setup({ state, messageHook: async (message, snapshot) => {
+    if (message.type === 'collector:get-state' && ++pollReads > 1) { await pendingPoll; return { ok: true, state: snapshot }; }
+    if (message.type === 'collector:retry-github') { await pendingCommand; return { ok: true, state: fresh }; }
+  } });
+  const command = app.click('retry-github'); await new Promise(resolve => setImmediate(resolve));
+  const first = app.poll(), second = app.poll();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(pollReads, 2);
+  releaseCommand(); await new Promise(resolve => setImmediate(resolve));
+  releasePoll(); await Promise.all([command, first, second]);
+  assert.equal(app.elements.get('github-state').textContent, '已同步');
+});
+
+test('a failed status read clearly marks retained diagnostic records as stale', async () => {
+  let fail = false;
+  const app = await setup({ messageHook: message => fail && message.type === 'collector:get-state' ? { ok: false, error: { message: 'read failed' } } : undefined });
+  fail = true; await app.poll();
+  assert.equal(app.elements.get('transfer-connection').hidden, false);
+  assert.match(app.elements.get('transfer-connection').textContent, /不能据此确认任务仍在运行/);
+  fail = false; await app.poll();
+  assert.equal(app.elements.get('transfer-connection').hidden, true);
+});
+
+
+test('a hung state read times out visibly and its late response cannot replace newer progress', async () => {
+  const timers = new Map(); let timerId = 0, reads = 0, release;
+  const held = new Promise(resolve => { release = resolve; });
+  const state = initialState();
+  const app = await setup({ state,
+    setTimeout: callback => { timers.set(++timerId, callback); return timerId; }, clearTimeout: id => timers.delete(id),
+    messageHook: async (message, snapshot) => {
+      if (message.type === 'collector:get-state' && ++reads === 2) { await held; return { ok: true, state: snapshot }; }
+    } });
+  const pending = app.poll(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(timers.size, 1);
+  [...timers.values()][0](); await pending;
+  assert.match(app.elements.get('global-status').textContent, /读取后台状态超时/);
+  assert.equal(app.elements.get('transfer-connection').hidden, false);
+  const updated = initialState(); updated.account.alias = '最新账号记录'; app.setState(updated); await app.poll();
+  assert.equal(app.elements.get('account-name').textContent, '最新账号记录');
+  release(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.elements.get('account-name').textContent, '最新账号记录');
+});
+
+test('GitHub queue explains waiting for collection rather than implying an active upload', async () => {
+  const state = initialState(); state.config.github.enabled = true; state.job = { status: 'running', phase: 'details' };
+  state.outboxSummary = { total: 2, items: [] };
+  const app = await setup({ state });
+  assert.equal(app.elements.get('transfer-details-status').textContent, '等待提交');
+  assert.match(app.elements.get('transfer-wait').textContent, /对话采集中，完成本轮后提交 GitHub/);
 });

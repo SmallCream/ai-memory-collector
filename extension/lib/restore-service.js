@@ -2,6 +2,7 @@
 import { accountPrefix, readAccountManifest } from './archive-store.js';
 import { readLocalBytes } from './asset-store.js';
 import { hashBytes } from './lfs.js';
+import { createActivityLog } from './activity-log.js';
 
 export const RESTORE_SETTING_KEY = 'repositoryRestore:v1';
 const MAX_ITEMS = 100_000;
@@ -116,6 +117,7 @@ export function createRestoreService({ getSetting, setSetting, fetchRepositorySn
   for (const dependency of [getSetting, setSetting, fetchRepositorySnapshot, downloadRepositoryFile, applyRemoteFiles, readLocalManifest, readLocalFile]) {
     if (typeof dependency !== 'function') throw new TypeError('Missing restore service dependency');
   }
+  const activity = createActivityLog({ getSetting, setSetting, now });
   let operation = Promise.resolve();
   function locked(callback) {
     const pending = operation.catch(() => {}).then(callback); operation = pending; return pending;
@@ -132,10 +134,12 @@ export function createRestoreService({ getSetting, setSetting, fetchRepositorySn
     return summarize(job);
   }
   async function downloadText(config, entry) {
+    return activity.run('repository', 'restore', { stage: 'restore-file', fileName: entry?.path?.split('/').at(-1), size: entry?.size }, async () => {
     if (!entry || entry.size > MAX_BYTES) throw fail(entry ? 'RESTORE_LIMIT' : 'RESTORE_PATH');
     const bytes = await downloadRepositoryFile({ config, entry, maxBytes: MAX_BYTES });
     if (!(bytes instanceof Uint8Array) || bytes.byteLength > MAX_BYTES) throw fail('RESTORE_LIMIT');
     try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { throw fail('RESTORE_METADATA'); }
+    });
   }
   async function reusableLocalText(directory, account, prior, remoteEntry) {
     const result = {};
@@ -191,7 +195,7 @@ export function createRestoreService({ getSetting, setSetting, fetchRepositorySn
           return publish(previous);
         }
       }
-      const snapshot = await fetchRepositorySnapshot({ config });
+      const snapshot = await activity.run('repository', 'restore', { stage: 'restore-scan' }, () => fetchRepositorySnapshot({ config }));
       if (!record(snapshot) || typeof snapshot.repository !== 'string' || typeof snapshot.branch !== 'string' ||
           !Array.isArray(snapshot.entries) || snapshot.entries.length > MAX_ITEMS) throw fail('RESTORE_METADATA');
       const prefixes = new Set(), seen = new Set();
@@ -258,11 +262,12 @@ export function createRestoreService({ getSetting, setSetting, fetchRepositorySn
               // Persist before the write; replay is safe if the worker stops after
               // the writer commits but before this job records its receipt.
               item.status = 'restoring'; await publish(job);
-              const result = await applyRemoteFiles({ directory, account: item.account, files: [
+              const result = await activity.run('repository', 'restore', { stage: 'restore-save',
+                title: item.entry.title, conversationId: item.entry.conversationId }, () => applyRemoteFiles({ directory, account: item.account, files: [
                 { path: item.entry.jsonPath, content: nativeText }, { path: item.entry.markdownPath, content: markdownText },
                 { path: `${item.prefix}/archive/manifest.json`, content: metadataForAccount.manifestText },
                 { path: `${item.prefix}/account.json`, content: metadataForAccount.accountText },
-              ] });
+              ] }));
               item.outcome = result.status; item.restoredEntry = result.entry || item.entry;
               if (result.recovered) item.pendingRecovered = result.recovered;
             }
@@ -280,9 +285,10 @@ export function createRestoreService({ getSetting, setSetting, fetchRepositorySn
             await publish(job);
           }
           if (hydrateAssets) {
-            const result = await hydrateAssets({ directory, account: item.account, entry: item.restoredEntry,
+            const result = await activity.run('repository', 'restore', { stage: 'restore-assets',
+              title: item.entry.title, conversationId: item.entry.conversationId }, () => hydrateAssets({ directory, account: item.account, entry: item.restoredEntry,
               remoteEntry: item.entry, config, snapshot: { repository: job.repository, branch: job.branch,
-                commitSha: job.commitSha, treeSha: job.treeSha, entries: job.entries, empty: job.empty } });
+                commitSha: job.commitSha, treeSha: job.treeSha, entries: job.entries, empty: job.empty } }));
             if (result?.failed) throw fail('ASSET_RESTORE_FAILED');
             if (result?.pending) { item.status = 'hydrating'; finish(job); return publish(job); }
           }

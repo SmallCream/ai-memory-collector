@@ -15,6 +15,8 @@ let settingsLoaded = false;
 let stateRevision = 0;
 let activeAliasKey = null;
 let externalImagePermission = false;
+let refreshPending = null;
+const renderedLists = new Map();
 const githubOrigins = ['https://api.github.com/*', 'https://github.com/*', 'https://lfs.github.com/*',
   'https://github-cloud.githubusercontent.com/*', 'https://objects.githubusercontent.com/*',
   'https://media.githubusercontent.com/*', 'https://github-cloud.s3.amazonaws.com/*'];
@@ -38,7 +40,7 @@ function errorObject(error) {
 async function send(type, fields = {}) {
   const reply = await chrome.runtime.sendMessage({ type, ...(sourceTabId === null ? {} : { tabId: sourceTabId }), ...fields });
   if (!reply?.ok) throw errorObject(reply?.error || '后台暂未响应，请重新加载扩展后重试。');
-  if (reply.state) current = reply.state;
+  if (reply.state) { stateRevision++; current = reply.state; }
   return reply;
 }
 function time(value) {
@@ -126,6 +128,148 @@ function renderInternalAttachments(diagnostics, missing) {
     list.append(item);
   }
 }
+const activityStages = { identify: '核验账号与保存位置', list: '读取对话列表', detail: '读取对话详情',
+  save: '保存对话文件', download: '下载对话图片', 'save-image': '保存图片到本地',
+  'upload-image': '上传图片到 GitHub LFS', 'restore-image': '从 GitHub 下载图片',
+  github: '同步 GitHub', sync: '提交对话到 GitHub', 'sync-archives': '提交对话到 GitHub',
+  commit: '提交对话到 GitHub', 'apply-remote': '写入远端合并结果', 'refresh-source': '刷新图片下载来源',
+  'prepare-upload': '准备图片上传', 'restore-snapshot': '读取仓库目录', 'restore-metadata': '读取归档清单',
+  'restore-conversation': '恢复对话文件', restore: '恢复仓库文件',
+  'restore-scan': '读取仓库目录', 'restore-file': '下载对话归档', 'restore-save': '保存恢复的对话', 'restore-assets': '补齐归档图片' };
+const taskStatuses = { pending: '排队中', retry: '等待重试', failed: '失败待处理', saved: '已保存',
+  skipped: '无变化，已跳过', downloaded: '已下载', uploaded: '已上传', 'internal-missing': '内部附件未下载',
+  suspended: '内部附件未下载', delivering: '正在交付归档', queued: '排队中', waiting: '等待处理',
+  running: '正在处理', external: '保留外链', unavailable: '尚未取得' };
+const activityStatuses = { running: '正在处理', success: '本步骤完成', failed: '本步骤未完成', interrupted: '上次处理已中断' };
+function clock(value) {
+  const date = new Date(value);
+  return value && Number.isFinite(date.getTime()) ? date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
+}
+function duration(ms) {
+  const seconds = Math.max(0, Math.floor(Number(ms) / 1000) || 0);
+  if (seconds < 60) return `${seconds} 秒`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+  return `${Math.floor(seconds / 3600)} 小时 ${Math.floor(seconds % 3600 / 60)} 分`;
+}
+function fileSize(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size) || size <= 0) return '';
+  return size >= 1048576 ? `${(size / 1048576).toFixed(1)} MiB` : `${Math.max(1, Math.round(size / 1024))} KiB`;
+}
+function activityName(item) { return activityStages[item?.stage] || '处理任务'; }
+function activityTitle(item) {
+  return [item?.title, item?.fileName].filter(value => typeof value === 'string' && value)
+    .map(value => assetLabel(value, '')).join(' · ') || assetLabel(item?.conversationId, '未命名任务');
+}
+function appendText(parent, tag, value, className) {
+  const element = document.createElement(tag); element.textContent = value;
+  if (className) element.classList.add(className);
+  parent.append(element); return element;
+}
+function renderActivityCards(id, channels) {
+  const parent = $(id); parent.replaceChildren();
+  for (const [label, log] of channels) {
+    const item = log?.current;
+    if (!item) continue;
+    const card = document.createElement('div'); card.classList.add('activity-card');
+    if (['running', 'interrupted'].includes(item.status)) card.classList.add(`is-${item.status}`);
+    appendText(card, 'strong', `${label} · ${activityStatuses[item.status] || '进度已记录'}`);
+    appendText(card, 'p', `${activityName(item)} · ${activityTitle(item)}`);
+    const parts = [];
+    if (Number.isFinite(item.startedAt)) {
+      if (item.status === 'running') parts.push(`已等待 ${duration(Date.now() - item.startedAt)}`);
+      else if (Number.isFinite(item.finishedAt)) parts.push(`耗时 ${duration(item.finishedAt - item.startedAt)}`);
+      else if (clock(item.startedAt)) parts.push(`开始于 ${clock(item.startedAt)}`);
+    }
+    if (clock(item.updatedAt)) parts.push(`最近进展 ${clock(item.updatedAt)}`);
+    if (Number.isFinite(item.completed) && Number.isFinite(item.total) && item.total > 0) parts.push(`步骤开始时已完成 ${count(item.completed)} / ${count(item.total)}`);
+    if (fileSize(item.size)) parts.push(`文件大小 ${fileSize(item.size)}`);
+    if (item.code) parts.push(assetFailureCode(item.code));
+    appendText(card, 'p', parts.join(' · '), 'muted');
+    if (item.status === 'running' && Number.isFinite(item.updatedAt || item.startedAt) &&
+        Date.now() - (item.updatedAt || item.startedAt) >= 90_000) {
+      appendText(card, 'p', '暂未收到新进展，可能仍在等待响应；这不代表程序已停止。', 'warning-text');
+    }
+    if (item.status === 'interrupted') appendText(card, 'p', '上次执行未记录结束；进度已保留，等待后台继续处理。', 'warning-text');
+    parent.append(card);
+  }
+  if (!parent.children.length) appendText(parent, 'p', '暂无执行记录，新任务开始后会显示当前步骤。', 'hint');
+}
+function renderTaskList(id, noteId, items, total, emptyText, mode = 'queue') {
+  const rows = Array.isArray(items) ? items.slice(0, mode === 'recent' ? 20 : 50) : [];
+  const knownTotal = Math.max(rows.length, Number(total) || 0);
+  text(noteId, !rows.length ? emptyText : mode === 'recent' ? `显示最近 ${rows.length} 条步骤记录。` :
+    knownTotal > rows.length ? `共 ${count(knownTotal)} 项，显示前 ${rows.length} 项。` : `共 ${rows.length} 项。`);
+  const key = JSON.stringify(rows);
+  if (renderedLists.get(id) === key) return;
+  renderedLists.set(id, key);
+  const list = $(id), previousScroll = list.scrollTop;
+  list.replaceChildren();
+  for (const item of rows) {
+    const row = document.createElement('li');
+    const status = mode === 'recent' ? activityStatuses[item.status] || '进度已记录' : taskStatuses[item.status] || (mode === 'outbox' ? '等待提交' : '等待处理');
+    appendText(row, 'strong', mode === 'recent' ? `${assetLabel(item.channelLabel, '')}${item.channelLabel ? ' · ' : ''}${activityName(item)} · ${status}` : `${activityTitle(item)} · ${status}`);
+    if (mode === 'recent') appendText(row, 'p', activityTitle(item));
+    const parts = [];
+    if (item.conversationId && !item.title) parts.push(`对话 ${assetLabel(item.conversationId, '')}`);
+    if (Number(item.attempt) > 0) parts.push(`已尝试 ${count(item.attempt)} 次`);
+    if (clock(item.nextRetryAt)) parts.push(`重试时间 ${clock(item.nextRetryAt)}`);
+    if (item.code) parts.push(assetFailureCode(item.code));
+    if (fileSize(item.size)) parts.push(`文件大小 ${fileSize(item.size)}`);
+    if (mode === 'recent' && clock(item.finishedAt || item.updatedAt)) parts.push(clock(item.finishedAt || item.updatedAt));
+    if (mode === 'outbox' && clock(item.createdAt)) parts.push(`入队 ${clock(item.createdAt)}`);
+    if (parts.length) appendText(row, 'p', parts.join(' · '), 'muted');
+    list.append(row);
+  }
+  if (Number.isFinite(previousScroll)) list.scrollTop = previousScroll;
+}
+function renderDetailedProgress() {
+  const job = current.job, diagnostics = job?.diagnostics || {}, activity = current.activity || {};
+  const collection = activity.collection, liveCollection = collection?.current?.status === 'running';
+  show('collection-details', Boolean(job || collection?.current));
+  const jobLabels = { running: liveCollection ? '正在处理' : '等待调度', paused: '已暂停', blocked: '需要处理', partial: '部分完成', completed: '已完成' };
+  text('collection-details-status', jobLabels[job?.status] || '暂无任务');
+  let collectionWait = '';
+  if (job?.status === 'paused') collectionWait = '采集已暂停，点击“继续采集”后处理未完成项。';
+  else if (job?.status === 'blocked') collectionWait = assetLabel(job.error?.message, '采集等待登录或保存权限恢复。');
+  else if (!liveCollection && Number(job?.nextRetryAt) > Date.now()) collectionWait = `等待重试至 ${clock(job.nextRetryAt)}，剩余 ${duration(job.nextRetryAt - Date.now())}。`;
+  else if (job?.status === 'running' && !liveCollection) collectionWait = '当前没有进行中的请求，等待后台调度下一项。';
+  else if (job?.status === 'completed') collectionWait = '本轮对话采集完成；图片下载、上传和对话提交进度见下方详情。';
+  else if (job?.status === 'partial') collectionWait = '本轮仍有未完成项，可查看失败原因并继续采集。';
+  else if (liveCollection) collectionWait = '正在执行下方步骤，面板收起后任务仍可继续。';
+  if (job?.status === 'running' && !liveCollection && Number(job?.nextRetryAt) > Date.now()) text('collection-details-status', '等待重试');
+  text('collection-wait', collectionWait);
+  text('collection-detail-counts', job ? `已发现 ${count(job.discovered)} 条 · 已处理 ${count(job.processed)} 条 · 待处理 ${count(diagnostics.remaining ?? Math.max(0, (job.discovered || 0) - (job.processed || 0)))} 条 · 失败／重试 ${count(diagnostics.failed !== undefined ? Number(diagnostics.failed) + Number(diagnostics.retrying || 0) : job.failed)} 条${job.pages ? ` · 已读 ${count(job.pages)} 页列表` : ''}` : '');
+  renderActivityCards('collection-current', [['采集', collection]]);
+  renderTaskList('collection-queue', 'collection-queue-note', diagnostics.items, diagnostics.total,
+    job?.phase === 'list' ? '正在获取列表，发现对话后显示队列。' : '暂无对话队列记录。');
+  renderTaskList('collection-recent', 'collection-recent-note', collection?.recent, 0, '暂无步骤完成记录。', 'recent');
+  const transferChannels = [['对话图片下载', activity.download], ['图片上传', activity.upload], ['GitHub 对话提交', activity.github],
+    ['仓库恢复（全部账号）', activity.restore], ['当前账号图片恢复', activity.restoreImages]];
+  const running = transferChannels.filter(([, log]) => log?.current?.status === 'running');
+  const interrupted = transferChannels.some(([, log]) => log?.current?.status === 'interrupted');
+  const asset = current.assetDiagnostics || {}, github = current.githubStatus || {}, outbox = current.outboxSummary || {};
+  const retryAt = github.nextRetryAt || github.retryAt;
+  let wait = '', badge = '暂无传输';
+  if (running.length) { badge = '正在处理'; wait = '当前正在执行下方步骤；完成当前文件后会更新数量。'; }
+  else if (Number(retryAt) > Date.now()) { badge = '等待重试'; wait = `GitHub 同步等待至 ${clock(retryAt)}，剩余 ${duration(retryAt - Date.now())}。`; }
+  else if (interrupted) { badge = '等待继续'; wait = '上次传输未记录结束，进度已保留，等待后台继续处理。'; }
+  else if (!current.config?.github?.enabled) { badge = '本地采集'; wait = 'GitHub 自动同步未启用；本地图片采集和手动恢复可独立进行。'; }
+  else if (job?.status === 'running' && Number(outbox.total ?? github.pending) > 0) { badge = '等待提交'; wait = '对话采集中，完成本轮后提交 GitHub；图片下载仍可继续处理。'; }
+  else if (Number(asset.pending) > 0 || Number(outbox.total ?? github.pending) > 0) { badge = '等待处理'; wait = '等待后台处理队列。图片已上传后，还需要提交 JSON、Markdown 与清单。'; }
+  else if (github.status === 'synced') { badge = '已同步'; wait = '当前已知的对话提交已完成；未下载附件仍保留各自状态。'; }
+  text('transfer-details-status', badge); text('transfer-wait', wait);
+  text('transfer-detail-counts', `图片待处理 ${count(asset.pending)} · 失败 ${count(asset.failed)} · 内部附件未下载 ${count(asset.internalMissing)} · 待提交对话 ${count(outbox.total ?? github.pending)}`);
+  renderActivityCards('transfer-current', transferChannels);
+  renderTaskList('download-queue', 'download-queue-note', asset.captureItems, asset.captureTotal, '暂无图片下载任务。');
+  renderTaskList('upload-queue', 'upload-queue-note', asset.uploadItems, asset.uploadTotal, '暂无可上传的本地图片。');
+  renderTaskList('outbox-queue', 'outbox-queue-note', outbox.items, outbox.total, '暂无待提交的对话。', 'outbox');
+  const restore = current.restoreStatus;
+  text('transfer-restore-detail', restore ? `已处理 ${count(restore.processed)} / ${count(restore.total)} 条 · 待处理 ${count(restore.pending)} · 失败 ${count(restore.failed)}${Number(restore.nextRetryAt) > Date.now() ? ` · 重试时间 ${clock(restore.nextRetryAt)}` : ''}${restore.error?.code ? ` · ${assetFailureCode(restore.error.code)}` : ''}` : '尚未执行仓库恢复。');
+  const recent = transferChannels.flatMap(([label, log]) => (Array.isArray(log?.recent) ? log.recent : []).map(item => ({ ...item, channelLabel: label })))
+    .sort((a, b) => (b.finishedAt || b.updatedAt || 0) - (a.finishedAt || a.updatedAt || 0)).slice(0, 20);
+  renderTaskList('transfer-recent', 'transfer-recent-note', recent, 0, '暂无传输完成记录。', 'recent');
+}
 function jobError(job) { return job?.error?.message || (typeof job?.error === 'string' ? job.error : ''); }
 function describeGithub(value, enabled) {
   if (!enabled) return '未启用';
@@ -186,7 +330,8 @@ function render() {
   text('account-name', selectedName);
   text('account-avatar', identity ? Array.from(selectedName).slice(0, 2).join('').toUpperCase() : 'AI');
   text('account-context', identity ? 'ChatGPT · 普通对话' : '打开并登录 ChatGPT 后自动识别');
-  text('account-badge', !identity ? '等待登录' : account?.enabled ? '已启用' : '未启用');
+  text('account-badge', current.identityChecking ? '核验中' : !identity ? '等待登录' : account?.enabled ? '已启用' : '未启用');
+  show('identity-checking-note', current.identityChecking === true);
   const hasIdentity = Boolean(identity?.accountKey);
   show('account-alert', !hasIdentity || !account?.enabled);
   show('bind-account', hasIdentity && !account?.enabled);
@@ -259,6 +404,7 @@ function render() {
   text('asset-summary-text', assetParts.join(' · ')); show('asset-summary', assetParts.length > 0);
   renderAssetFailures(diagnostics);
   renderInternalAttachments(diagnostics, internalMissing);
+  renderDetailedProgress();
   show('retry-images', failedImages > 0);
   show('image-retry-note', failedImages > 0);
   const imagePermissionNeeded = assets.needsPermission || current.githubStatus?.needsPermission ||
@@ -326,20 +472,47 @@ function render() {
   $('restore-github').disabled = busy || !restoreReady || restoreRunning;
   $('restore-retry').disabled = busy || !restoreReady || restoreRunning;
   $('grant-external-images').disabled = busy || externalImagePermission;
+  if (current.identityChecking === true) {
+    for (const id of ['wizard-bind', 'bind-account', 'wizard-finish', 'start-capture', 'full-capture', 'pause-capture',
+      'resume-capture', 'retry-images', 'retry-internal-images', 'retry-github', 'grant-github-images']) $(id).disabled = true;
+  }
   if (!started) { started = true; window.dispatchEvent(new Event('collector:ready')); }
 }
-async function refresh() {
+async function readState() {
   const revision = ++stateRevision;
   const reply = await chrome.runtime.sendMessage({ type: 'collector:get-state', ...(sourceTabId === null ? {} : { tabId: sourceTabId }) });
   if (!reply?.ok) throw errorObject(reply?.error || '暂时无法读取后台状态。');
   if (revision !== stateRevision) return;
-  current = reply.state;
   if (chrome.permissions.contains) {
     try { externalImagePermission = await chrome.permissions.contains({ origins: ['https://*/*'] }); }
     catch { externalImagePermission = false; }
     if (revision !== stateRevision) return;
   }
+  current = reply.state;
   render();
+}
+function refresh() {
+  if (refreshPending) return refreshPending;
+  let timer;
+  const request = readState();
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      stateRevision++; // A late response must not overwrite a newer read or command.
+      reject(new Error('读取后台状态超时；进度记录保留，请稍后查看。'));
+    }, 15_000);
+  });
+  refreshPending = Promise.race([request, timeout]).finally(() => { clearTimeout(timer); refreshPending = null; });
+  return refreshPending;
+}
+function refreshProgress() {
+  return refresh().then(() => {
+    for (const id of ['collection-connection', 'transfer-connection']) { text(id, ''); show(id, false); }
+  }).catch(error => {
+    for (const id of ['collection-connection', 'transfer-connection']) {
+      text(id, '暂时无法读取后台状态；以下保留上次记录，不能据此确认任务仍在运行。'); show(id, true);
+    }
+    feedback(safeMessage(error), true);
+  });
 }
 function action(id, handler) {
   $(id).addEventListener('click', async () => {
@@ -454,9 +627,9 @@ action('settings-hide', () => closePanel(true));
 for (const id of ['wizard-repository', 'wizard-branch', 'wizard-token', 'wizard-lfs-enabled']) $(id).addEventListener('input', () => {
   wizardGithubVerified = false; $('wizard-next-2').disabled = true; text('wizard-github-status', '配置已改变，请重新验证。');
 });
-window.addEventListener('focus', () => { if (!busy) refresh().catch(error => feedback(safeMessage(error), true)); });
-document.addEventListener('visibilitychange', () => { if (!document.hidden && !busy) refresh().catch(error => feedback(safeMessage(error), true)); });
-const poll = setInterval(() => { if (!document.hidden && !busy) refresh().catch(error => feedback(safeMessage(error), true)); }, 3000);
+window.addEventListener('focus', () => { refreshProgress(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshProgress(); });
+const poll = setInterval(() => { if (!document.hidden) return refreshProgress(); }, 3000);
 window.addEventListener('pagehide', () => clearInterval(poll), { once: true });
 try { directory = await getSetting('directory'); await refresh(); feedback(''); }
 catch (error) { feedback(safeMessage(error), true); window.dispatchEvent(new Event('collector:ready')); }

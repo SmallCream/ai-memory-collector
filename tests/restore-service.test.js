@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createRestoreService, RESTORE_SETTING_KEY } from '../extension/lib/restore-service.js';
+import { createActivityLog } from '../extension/lib/activity-log.js';
 
 const config = { repository: 'example/private-data', branch: 'main', token: 'never-persist-this-token' };
 const hash = text => createHash('sha256').update(text).digest('hex');
@@ -89,8 +90,28 @@ test('restores multiple accounts without website login or enabling capture; one 
   assert.deepEqual(env.calls.map(value => value.account.accountKey), ['acct-a', 'acct-a', 'acct-b']);
   assert.ok(env.calls.every(value => value.account.enabled === undefined));
   assert.ok(env.calls.every(value => value.files.length === 4));
-  assert.deepEqual([...env.settings.keys()], [RESTORE_SETTING_KEY]);
+  assert.deepEqual([...env.settings.keys()].sort(), ['activity:v1:repository:restore', RESTORE_SETTING_KEY].sort());
   assert.ok(!JSON.stringify(env.settings.get(RESTORE_SETTING_KEY), (key, value) => key === 'directory' ? null : value).includes(config.token));
+});
+
+test('restore file downloads and local writes expose real running activity without blocking status reads', async () => {
+  const env = setup(); await env.start(); await env.tick();
+  const original = env.dependencies.downloadRepositoryFile;
+  let release, began;
+  const gate = new Promise(resolve => { release = resolve; });
+  const entered = new Promise(resolve => { began = resolve; });
+  env.dependencies.downloadRepositoryFile = async input => { began(); await gate; return original(input); };
+  const service = env.restart(), running = service.tick({ config, directory: env.directory });
+  await entered;
+  const log = createActivityLog(env.dependencies);
+  const snapshot = await log.read('repository', 'restore');
+  assert.equal(snapshot.current.stage, 'restore-file'); assert.equal(snapshot.current.status, 'running');
+  assert.match(snapshot.current.fileName, /\.json$/);
+  assert.equal((await service.state()).processed, 0);
+  assert.ok(!JSON.stringify(snapshot).includes(config.token));
+  release(); await running;
+  const finished = await log.read('repository', 'restore');
+  assert.ok(finished.recent.some(item => item.stage === 'restore-save' && item.status === 'success'));
 });
 
 test('worker restart resumes the fixed snapshot and does not refetch moving branch', async () => {

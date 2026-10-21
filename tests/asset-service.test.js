@@ -4,6 +4,7 @@ import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
 import { createChatGPTAssetResolver } from '../extension/lib/chatgpt-assets.js';
 import { createAssetService } from '../extension/lib/asset-service.js';
+import { createActivityLog } from '../extension/lib/activity-log.js';
 import { extractAssets } from '../extension/lib/assets.js';
 import { createArchiveStore, readAccountManifest } from '../extension/lib/archive-store.js';
 import { assetPath } from '../extension/lib/asset-store.js';
@@ -866,4 +867,149 @@ test('unavailable metadata delivery after restart retains the ordinary capture t
   assert.equal((await env.service.diagnostics({ account })).internalMissing, 0);
   assert.equal(refreshes, 1); await env.tick(); assert.equal(refreshes, 2);
   assert.equal((await env.fs.getSetting(jobKey)).tasks.length, 1);
+});
+
+function transferGate() {
+  let release, entered;
+  const waiting = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  return { waiting, started, release, entered };
+}
+function transferActivity(env, channel) {
+  return createActivityLog({ getSetting: env.dependencies.getSetting, setSetting: env.dependencies.setSetting,
+    now: env.dependencies.now }).read(account.accountKey, channel);
+}
+
+test('capture exposes the real in-flight download and separately records verified local image saving', async () => {
+  const env = setup(), gate = transferGate();
+  await env.save(detail());
+  env.dependencies.resolveAsset = async input => {
+    env.captures.push(input); gate.entered(); await gate.waiting;
+    return { bytes: PNG, mimeType: 'image/png', quality: 'original' };
+  };
+  env.restart(); const pending = env.tick(); await gate.started;
+  const current = (await transferActivity(env, 'download')).current;
+  assert.equal(current.status, 'running'); assert.equal(current.stage, 'download');
+  assert.equal(current.conversationId, 'conversation-one'); assert.equal(current.title, 'Synthetic image conversation');
+  assert.equal((await env.manifest()).conversations['conversation-one'].assets[0].status, 'pending');
+  gate.release(); await pending;
+  const finished = await transferActivity(env, 'download');
+  assert.equal(finished.current.status, 'success'); assert.equal(finished.current.stage, 'save-image');
+  assert.ok(finished.recent.some(item => item.stage === 'download' && item.status === 'success'));
+  assert.equal((await env.service.diagnostics({ directory: env.fs.directory, account })).captureTotal, 0);
+});
+
+test('failed image validation is logged as a failed download rather than a saved image', async () => {
+  const env = setup(); await env.save(detail());
+  env.dependencies.resolveAsset = async () => ({ bytes: new Uint8Array([1, 2]), mimeType: 'image/png' });
+  env.restart(); await env.tick();
+  const activity = await transferActivity(env, 'download');
+  assert.equal(activity.current.stage, 'download'); assert.equal(activity.current.status, 'failed');
+  assert.ok(!activity.recent.some(item => item.stage === 'save-image'));
+  assert.equal((await env.service.diagnostics({ account })).captureItems[0].status, 'retry');
+});
+
+test('source refresh waits are visible during explicit image retry', async () => {
+  const env = setup(), gate = transferGate(); await env.save(detail());
+  env.resolveFailure(true); await env.tick(); env.resolveFailure(false);
+  env.dependencies.refreshConversation = async () => { gate.entered(); await gate.waiting; return detail(); };
+  env.restart(); await env.service.retryFailed({ account });
+  const pending = env.tick(); await gate.started;
+  assert.equal((await transferActivity(env, 'download')).current.stage, 'refresh-source');
+  assert.equal((await transferActivity(env, 'download')).current.status, 'running');
+  gate.release(); await pending;
+  assert.equal((await env.service.diagnostics({ account })).failed, 0);
+});
+
+test('upload diagnostics remain pending in flight and use scoped durable receipts only after upload', async () => {
+  const env = setup(), gate = transferGate(); await env.save(detail()); await env.tick();
+  env.dependencies.lfsFactory = () => ({ upload: async () => { gate.entered(); await gate.waiting; } }); env.restart();
+  const bundles = [env.enqueued.at(-1).archive];
+  const pending = env.service.prepareUploads({ directory: env.fs.directory, account, config, bundles });
+  await gate.started;
+  const activity = await transferActivity(env, 'upload');
+  assert.equal(activity.current.status, 'running'); assert.equal(activity.current.stage, 'upload-image');
+  assert.equal(activity.current.title, 'Synthetic image conversation');
+  assert.equal(activity.current.total, 1); assert.equal(activity.current.completed, 0);
+  const before = await env.service.diagnostics({ directory: env.fs.directory, account, github: config });
+  assert.equal(before.uploadTotal, 1); assert.equal(before.uploadItems[0].status, 'pending');
+  gate.release(); await pending;
+  const after = await env.service.diagnostics({ directory: env.fs.directory, account, github: config });
+  assert.equal(after.uploadItems[0].status, 'uploaded');
+  for (const github of [{ ...config, repository: 'example/other' }, { ...config, branch: 'other' }]) {
+    assert.equal((await env.service.diagnostics({ directory: env.fs.directory, account, github })).uploadItems[0].status, 'pending');
+  }
+  const old = await env.fs.getSetting(`assetReceipts:${account.accountKey}`);
+  await env.fs.setSetting(`assetReceipts:${account.accountKey}`, { ...old, directory: memoryBinaryFs().directory });
+  assert.equal((await env.service.diagnostics({ directory: env.fs.directory, account, github: config })).uploadItems[0].status, 'pending');
+  assert.equal((await transferActivity(env, 'upload')).current.status, 'success');
+});
+
+test('upload failures keep pending receipt state and expose only sanitized labels and an error code', async () => {
+  const env = setup(), source = detail();
+  source.payload.title = 'Synthetic https://example.invalid/?sig=private ghp_private Bearer private';
+  await env.save(source); await env.tick();
+  env.dependencies.lfsFactory = () => ({ upload: async () => { throw Object.assign(new Error('https://example.invalid/?sig=private'), { code: 'HTTP_403' }); } });
+  env.restart();
+  await assert.rejects(env.service.prepareUploads({ directory: env.fs.directory, account, config, bundles: [env.enqueued.at(-1).archive] }), { code: 'HTTP_403' });
+  const activity = await transferActivity(env, 'upload');
+  assert.equal(activity.current.status, 'failed'); assert.equal(activity.current.code, 'HTTP_403');
+  assert.doesNotMatch(JSON.stringify(activity), /private|https:\/\//);
+  const diagnostics = await env.service.diagnostics({ directory: env.fs.directory, account, github: config });
+  assert.equal(diagnostics.uploadItems[0].status, 'pending');
+  assert.doesNotMatch(JSON.stringify(diagnostics), /private|https:\/\//);
+});
+
+test('LFS restoration exposes the actual pending network download and then local save without fake byte progress', async () => {
+  const env = setup(), gate = transferGate(), assets = await managed(env, 1, { local: false });
+  env.dependencies.lfsFactory = () => ({ download: async input => { gate.entered(); await gate.waiting; return env.objects.get(input.oid); } });
+  env.restart();
+  const pending = env.service.hydrateAssets({ directory: env.fs.directory, account,
+    entry: { conversationId: 'synthetic-restore', title: 'Restore image', assets }, config, snapshot: snapshot(assets) });
+  await gate.started;
+  const activity = await transferActivity(env, 'restore-images');
+  assert.equal(activity.current.stage, 'restore-image'); assert.equal(activity.current.status, 'running');
+  assert.equal(activity.current.completed, undefined); assert.equal(activity.current.conversationId, 'synthetic-restore');
+  assert.equal(env.fs.files.has(assets[0].localPath), false);
+  gate.release(); await pending;
+  assert.equal((await transferActivity(env, 'restore-images')).current.stage, 'save-image');
+  assert.equal((await transferActivity(env, 'restore-images')).current.status, 'success');
+  assert.deepEqual(env.fs.files.get(assets[0].localPath), env.objects.get(assets[0].oid));
+});
+
+test('diagnostic task lists are bounded and explicitly preserve waiting, delivery and internal missing states', async () => {
+  const env = setup();
+  const tasks = Array.from({ length: 60 }, (_, index) => ({ conversationId: `conversation-${index}`, assetId: `image-${index}`,
+    attempt: index, retryAt: index ? 9_000_000 : 0, error: index ? { code: 'HTTP_429', message: 'https://example.invalid/?sig=private' } : null }));
+  tasks[1].pendingArchives = [{}]; tasks[2].autoRetrySuspended = true;
+  await env.fs.setSetting(`assetJobs:${account.accountKey}`, { tasks });
+  const diagnostics = await env.service.diagnostics({ account });
+  assert.equal(diagnostics.captureTotal, 60); assert.equal(diagnostics.captureItems.length, 50);
+  assert.equal(diagnostics.captureItems[0].status, 'pending'); assert.equal(diagnostics.captureItems[1].status, 'delivering');
+  assert.equal(diagnostics.captureItems[2].status, 'internal-missing'); assert.equal(diagnostics.captureItems[3].status, 'retry');
+  assert.equal(diagnostics.captureItems[3].nextRetryAt, 9_000_000);
+  assert.doesNotMatch(JSON.stringify(diagnostics), /private|https:\/\//);
+});
+
+test('activity storage failures do not change capture, local bytes or the original retry outcome', async () => {
+  const env = setup(); await env.save(detail());
+  env.dependencies.setSetting = async (key, value) => {
+    if (key.startsWith('activity:')) throw new Error('synthetic activity unavailable');
+    return env.fs.setSetting(key, value);
+  };
+  env.restart(); await env.tick();
+  const asset = (await env.manifest()).conversations['conversation-one'].assets[0];
+  assert.equal(asset.status, 'downloaded'); assert.deepEqual(env.fs.files.get(asset.localPath), PNG);
+  assert.equal((await env.service.diagnostics({ account })).pending, 0);
+});
+
+test('a fetched source rejected for ownership is a failed refresh activity rather than success', async () => {
+  const env = setup(); await env.save(detail()); env.resolveFailure(true); await env.tick();
+  const foreign = detail(); foreign.identity.accountKey = 'acct-foreign';
+  env.dependencies.refreshConversation = async () => foreign; env.restart();
+  await env.service.retryFailed({ account }); await env.tick();
+  const activity = await transferActivity(env, 'download');
+  assert.equal(activity.current.stage, 'refresh-source'); assert.equal(activity.current.status, 'failed');
+  assert.equal(activity.current.code, 'ACCOUNT_CHANGED'); assert.equal(env.captures.length, 1);
+  assert.equal((await env.service.diagnostics({ account })).captureItems[0].code, 'ACCOUNT_CHANGED');
 });

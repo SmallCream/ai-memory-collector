@@ -3,6 +3,7 @@
  * and commits its checkpoint before returning. No timers, DOM, or GitHub client
  * live here: the MV3 scheduler supplies those and may stop between any two ticks.
  */
+import { createActivityLog, activityLabel } from './activity-log.js';
 const MODES = new Set(['initial', 'incremental', 'full']);
 const LIVE = new Set(['running', 'paused', 'blocked']);
 const MAX_ITEMS = 100_000;
@@ -85,10 +86,31 @@ function validateTab(tabId) {
   if (!Number.isInteger(tabId) || tabId < 0) throw fail('SOURCE_UNAVAILABLE');
 }
 
+const diagnosticLabel = activityLabel;
+const diagnosticId = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,160}$/.test(value) ? value : '';
+const diagnosticTime = value => Number.isFinite(value) && value >= 0 ? value : null;
+function queueDiagnostics(queue = []) {
+  const rank = { failed: 0, retry: 1, pending: 2, saved: 3, skipped: 4 };
+  const totals = [0, 0, 0, 0, 0], groups = [[], [], [], [], []];
+  for (const item of queue) {
+    const group = own(rank, item.status) ? rank[item.status] : 2;
+    totals[group]++;
+    if (groups[group].length < 50) groups[group].push(item);
+  }
+  return { total: queue.length, remaining: totals[0] + totals[1] + totals[2],
+    saved: totals[3], skipped: totals[4], retrying: totals[1], failed: totals[0],
+    items: groups.flat().slice(0, 50).map(item => ({
+      conversationId: diagnosticId(item.id), title: diagnosticLabel(item.title) || '未命名对话',
+      status: own(rank, item.status) ? item.status : 'pending',
+      attempt: Number.isSafeInteger(item.attempts) && item.attempts >= 0 ? item.attempts : 0,
+      nextRetryAt: diagnosticTime(item.nextRetryAt), code: item.error ? safeError(item.error).code : null,
+    })) };
+}
+
 function stateOf(job) {
   if (!job) return null;
   const { queue, known, manifestIds, ...state } = job;
-  return COPY(state);
+  return COPY({ ...state, diagnostics: queueDiagnostics(queue) });
 }
 
 function counts(job) {
@@ -115,6 +137,7 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
     throw new TypeError('Missing platform adapter');
   }
   const locks = new Map();
+  const activity = createActivityLog({ getSetting, setSetting, now });
 
   function locked(accountKey, operation) {
     const previous = locks.get(accountKey) || Promise.resolve();
@@ -146,10 +169,12 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
 
   async function verify(account, tabId) {
     validateTab(tabId);
-    const identity = await adapter.identify(tabId);
-    if (!identity?.accountKey) throw fail('IDENTITY');
-    if (identity.accountKey !== account.accountKey || identity.platform && identity.platform !== account.platform) throw fail('ACCOUNT_CHANGED');
-    return identity;
+    return activity.run(account.accountKey, 'collection', { stage: 'identify', title: '核对登录账号' }, async () => {
+      const identity = await adapter.identify(tabId);
+      if (!identity?.accountKey) throw fail('IDENTITY');
+      if (identity.accountKey !== account.accountKey || identity.platform && identity.platform !== account.platform) throw fail('ACCOUNT_CHANGED');
+      return identity;
+    });
   }
 
   async function createJob(account, tabId, mode) {
@@ -324,31 +349,37 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
   }
 
   async function detailStep(job, account, tabId, directory, item) {
-    const detail = await adapter.detail(tabId, { accountKey: account.accountKey, conversationId: item.id });
-    if (detail?.identity?.accountKey !== account.accountKey) throw fail('ACCOUNT_CHANGED');
-    if (detail.completeness === 'partial') throw fail('PARTIAL_DETAIL');
-    const conversationId = detail.payload?.conversation_id ?? detail.payload?.id;
-    if (conversationId !== item.id) throw fail('FORMAT');
+    const info = { title: item.title, conversationId: item.id, completed: job.processed, total: job.discovered };
+    const detail = await activity.run(account.accountKey, 'collection', { ...info, stage: 'detail' }, async () => {
+      const result = await adapter.detail(tabId, { accountKey: account.accountKey, conversationId: item.id });
+      if (result?.identity?.accountKey !== account.accountKey) throw fail('ACCOUNT_CHANGED');
+      if (result.completeness === 'partial') throw fail('PARTIAL_DETAIL');
+      const conversationId = result.payload?.conversation_id ?? result.payload?.id;
+      if (conversationId !== item.id) throw fail('FORMAT');
+      return result;
+    });
     // The adapter verifies before/after its network request. Recheck just before
     // handing off to the file writer so switching while the detail resolves does
     // not silently relabel another account's response.
     await verify(account, tabId);
-    const saved = await saveConversation({ directory, account, detail, tabId });
-    if (!saved || !['added', 'updated', 'unchanged'].includes(saved.status) || !Array.isArray(saved.files)) throw fail('STORAGE');
-    if (saved.recovered?.files && saved.recovered.entry?.conversationId) {
-      await appendOutbox(account, { id: saved.recovered.entry.conversationId }, saved.recovered.files);
-    }
-    await appendOutbox(account, item, saved.files);
-    const indexKey = keys(account.accountKey).index;
-    const current = await getSetting(indexKey);
-    const items = current?.schemaVersion === 1 && current.accountKey === account.accountKey && current.storageKey === account.storageKey
-      ? current.items || {} : {};
-    Object.defineProperty(items, item.id, { enumerable: true, configurable: true, writable: true,
-      value: { listUpdateTime: item.listUpdateTime, checkedAt: now(), contentHash: saved.entry?.contentHash || null } });
-    await store(indexKey, { schemaVersion: 1, accountKey: account.accountKey, storageKey: account.storageKey, items });
-    item.status = 'saved'; item.result = saved.status; item.error = null; item.nextRetryAt = null;
-    job.error = null;
-    return publish(job);
+    return activity.run(account.accountKey, 'collection', { ...info, stage: 'save' }, async () => {
+      const saved = await saveConversation({ directory, account, detail, tabId });
+      if (!saved || !['added', 'updated', 'unchanged'].includes(saved.status) || !Array.isArray(saved.files)) throw fail('STORAGE');
+      if (saved.recovered?.files && saved.recovered.entry?.conversationId) {
+        await appendOutbox(account, { id: saved.recovered.entry.conversationId }, saved.recovered.files);
+      }
+      await appendOutbox(account, item, saved.files);
+      const indexKey = keys(account.accountKey).index;
+      const current = await getSetting(indexKey);
+      const items = current?.schemaVersion === 1 && current.accountKey === account.accountKey && current.storageKey === account.storageKey
+        ? current.items || {} : {};
+      Object.defineProperty(items, item.id, { enumerable: true, configurable: true, writable: true,
+        value: { listUpdateTime: item.listUpdateTime, checkedAt: now(), contentHash: saved.entry?.contentHash || null } });
+      await store(indexKey, { schemaVersion: 1, accountKey: account.accountKey, storageKey: account.storageKey, items });
+      item.status = 'saved'; item.result = saved.status; item.error = null; item.nextRetryAt = null;
+      job.error = null;
+      return publish(job);
+    });
   }
 
   return {
@@ -380,7 +411,9 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
         catch (error) { return handleError(job, error); }
         job.tabId = tabId;
         if (job.phase === 'list') {
-          try { return await listStep(job, account, tabId); }
+          try { return await activity.run(account.accountKey, 'collection', {
+            stage: 'list', title: `对话列表 · 第 ${job.pages + 1} 页`, completed: job.pages,
+          }, () => listStep(job, account, tabId)); }
           catch (error) { return handleError(job, error); }
         }
         job.listAttempts = 0; job.listRetryAt = null;
@@ -426,6 +459,14 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
         try { await onChange(null); } catch { /* UI event only. */ }
         return null;
       });
+    },
+    async getOutboxSummary(accountKey) {
+      const state = outboxState(await getSetting(keys(accountKey).outbox));
+      return { total: state.bundles.length, items: state.bundles.slice(0, 50).map(bundle => ({
+        conversationId: diagnosticId(bundle.conversationId),
+        title: diagnosticLabel(bundle.manifestEntry?.title) || diagnosticLabel(bundle.conversationId) || '未命名对话',
+        createdAt: diagnosticTime(bundle.createdAt),
+      })) };
     },
     async getOutbox(accountKey) {
       const state = outboxState(await getSetting(keys(accountKey).outbox));
