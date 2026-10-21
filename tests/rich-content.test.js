@@ -126,6 +126,75 @@ test('native image pointer and metadata attachment merge filename and library id
   assert.equal(Object.keys(asset).includes('retrieval'), false);
 });
 
+test('direct file content references reuse the original image identity and retain all message occurrences', async () => {
+  const fileId = 'file_synthetic_cited_image', libraryFileId = 'libfile_synthetic_cited_image';
+  const source = conversation({ content_type: 'multimodal_text', parts: [
+    { content_type: 'image_asset_pointer', asset_pointer: `sediment://${fileId}`, width: 1, height: 1 },
+  ] });
+  source.messages[0].metadata = { attachments: [{ id: fileId, library_file_id: libraryFileId,
+    name: 'synthetic-cited-image.png', mime_type: 'image/png', size_bytes: 100 }] };
+  const [original] = await extractAssets(source);
+  source.messages.push({ id: 'assistant-msg', role: 'assistant', content: { content_type: 'text', parts: ['Synthetic answer'] },
+    metadata: { content_references: [{ type: 'file', source: 'my_files', id: fileId, library_file_id: libraryFileId,
+      name: 'synthetic-cited-image.png', input_pointer: { message_id: null }, matched_text: 'synthetic-file-marker',
+      alt: null, cloud_doc_url: null }] } });
+  const snapshot = structuredClone(source);
+  for (const messages of [source.messages, [...source.messages].reverse()]) {
+    const assets = await extractAssets({ ...source, messages });
+    assert.equal(assets.length, 1);
+    const [asset] = assets;
+    assert.equal(asset.id, original.id); assert.equal(asset.fileId, fileId); assert.equal(asset.libraryFileId, libraryFileId);
+    assert.equal(asset.retrieval.fileId, fileId); assert.equal(asset.retrieval.libraryFileId, libraryFileId);
+    assert.equal(asset.kind, 'image'); assert.equal(asset.expectedSize, 100); assert.equal(asset.width, 1);
+    assert.equal(asset.occurrences.length, 3);
+    for (const occurrence of original.occurrences) assert.ok(asset.occurrences.some(item =>
+      item.messageId === occurrence.messageId && item.path === occurrence.path));
+    assert.ok(asset.occurrences.some(item => item.messageId === 'assistant-msg' &&
+      item.path === 'messages/assistant-msg/metadata/content_references/0'));
+  }
+  assert.deepEqual(source, snapshot);
+});
+
+test('content-reference IDs are inferred only for direct file entries with a valid file and library pair', async t => {
+  const reference = { type: 'file', source: 'my_files', id: 'file_synthetic_reference',
+    library_file_id: 'libfile_synthetic_reference', name: 'synthetic-reference.png' };
+  for (const value of [
+    { name: 'web reference', metadata: { content_references: [{ ...reference, type: 'web' }] } },
+    { name: 'missing type', metadata: { content_references: [{ ...reference, type: undefined }] } },
+    { name: 'non-file ID', metadata: { content_references: [{ ...reference, id: 'turn-synthetic-reference' }] } },
+    { name: 'invalid library ID', metadata: { content_references: [{ ...reference, library_file_id: 'not-a-library-id' }] } },
+    { name: 'missing library ID', metadata: { content_references: [{ ...reference, library_file_id: undefined }] } },
+    { name: 'other metadata location', metadata: { other_references: [{ ...reference }] } },
+    { name: 'nested content references', metadata: { nested: { content_references: [{ ...reference }] } } },
+    { name: 'nested file object', metadata: { content_references: [{ type: 'web', nested: { ...reference } }] } },
+    { name: 'not a reference list', metadata: { content_references: { 0: { ...reference } } } },
+  ]) await t.test(value.name, async () => {
+    const source = conversation({ content_type: 'text', parts: ['Synthetic answer'] });
+    source.messages[0].metadata = value.metadata;
+    const assets = await extractAssets(source);
+    assert.ok(assets.every(asset => asset.fileId === undefined));
+  });
+  const source = conversation({ content_type: 'text', parts: ['Synthetic answer'] });
+  source.messages[0].content.content_references = [{ ...reference }];
+  assert.ok((await extractAssets(source)).every(asset => asset.fileId === undefined));
+});
+
+test('file-reference recognition neither merges different file IDs by library ID nor leaks between extractions', async () => {
+  const source = conversation({ content_type: 'text', parts: ['Synthetic answer'] });
+  source.messages[0].metadata = { content_references: [
+    { type: 'file', id: 'file_synthetic_one', library_file_id: 'libfile_synthetic_shared' },
+    { type: 'file', id: 'file_synthetic_two', library_file_id: 'libfile_synthetic_shared' },
+  ] };
+  const assets = await extractAssets(source);
+  assert.equal(assets.length, 2); assert.notEqual(assets[0].id, assets[1].id);
+  assert.deepEqual(assets.map(asset => asset.fileId), ['file_synthetic_one', 'file_synthetic_two']);
+  const separate = conversation({ content_type: 'text', parts: ['Another synthetic account'] });
+  separate.messages[0].metadata = { content_references: [{ type: 'file', library_file_id: 'libfile_synthetic_shared' }] };
+  const [unknown] = await extractAssets(separate);
+  assert.equal(unknown.fileId, undefined);
+  assert.ok(assets.every(asset => asset.id !== unknown.id));
+});
+
 test('native asset_pointer_link enriches the pointer asset without persisting its signed URL', async () => {
   const link = 'https://files.oaiusercontent.com/synthetic-image.png?sig=synthetic-private-signature';
   const source = conversation({ content_type: 'multimodal_text', parts: [

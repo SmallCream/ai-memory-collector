@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
 import { createChatGPTAssetResolver, probeChatGPTAsset, validateExternalAsset } from '../extension/lib/chatgpt-assets.js';
+import { extractAssets } from '../extension/lib/assets.js';
 
 const PNG = new Uint8Array(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9WQAAAAASUVORK5CYII=', 'base64'));
 const hash = async bytes => Buffer.from(await webcrypto.subtle.digest('SHA-256', bytes)).toString('hex');
@@ -327,6 +328,44 @@ test('canonical Library opaque redirect accepts the observed estuary route for t
     assert.ok(!serialized.includes('synthetic-estuary-secret'));
     assert.ok(!serialized.includes('synthetic-secret-token'));
     assert.ok(!serialized.includes('synthetic-image.png'));
+  }
+});
+
+test('an assistant citation of the second uploaded image preserves its file ID through extraction and Library redirect', async () => {
+  const serve = (_, options) => options.redirect === 'manual' ? { type: 'opaqueredirect' } : locatedResponse(pngResponse(), estuaryURL);
+  const legacy = createChatGPTAssetResolver(browserFor(harness({ serve })), { allowLibraryDownload: true });
+  // Reproduce the former library-only duplicate: the final estuary ID cannot
+  // be verified when extraction has discarded the native platform file ID.
+  await assert.rejects(legacy.resolve({ tabId: 3, account: ACCOUNT,
+    asset: { libraryFileId: asset.libraryFileId, fileName: 'synthetic-second.png' } }), { code: 'ASSET_URL' });
+
+  const files = [
+    { id: 'file_synthetic_uncited', library_file_id: 'libfile_synthetic_uncited', name: 'synthetic-first.png' },
+    { id: asset.fileId, library_file_id: asset.libraryFileId, name: 'synthetic-second.png' },
+  ];
+  const source = { id: 'synthetic-citation-conversation', messages: [
+    { id: 'synthetic-user-message', role: 'user', content: { content_type: 'multimodal_text', parts: files.map(file => ({
+      content_type: 'image_asset_pointer', asset_pointer: `sediment://${file.id}`, width: 1, height: 1, size_bytes: PNG.length,
+    })) }, metadata: { attachments: files.map(file => ({ ...file, mime_type: 'image/png' })) } },
+    { id: 'synthetic-assistant-message', role: 'assistant', content: { content_type: 'text', parts: ['Synthetic answer'] },
+      metadata: { content_references: [{ type: 'file', source: 'my_files', ...files[1],
+        input_pointer: { message_id: null }, matched_text: 'synthetic-file-marker', cloud_doc_url: null }] } },
+  ] };
+  const extracted = await extractAssets(source);
+  assert.equal(extracted.length, 2);
+  const second = extracted.find(item => item.fileId === asset.fileId);
+  assert.equal(second.libraryFileId, asset.libraryFileId); assert.equal(second.occurrences.length, 3);
+  assert.equal(extracted.find(item => item.fileId === files[0].id).occurrences.length, 2);
+  let probeResult;
+  const h = harness({ serve });
+  const resolver = createChatGPTAssetResolver(browserFor(h, { mutate: result => { probeResult = result; return result; } }),
+    { allowLibraryDownload: true });
+  const result = await resolver.resolve({ tabId: 3, account: ACCOUNT, asset: second });
+  assert.deepEqual(result.bytes, PNG); assert.equal(result.sha256, await hash(PNG));
+  assert.equal(result.via, 'library-download'); assert.equal(result.quality, 'original');
+  assert.deepEqual(h.calls.map(call => call.url), [sessionURL, libraryURL, libraryURL, sessionURL]);
+  for (const value of [extracted, probeResult, result]) {
+    assert.doesNotMatch(JSON.stringify(value), /https:\/\/|synthetic-estuary-secret|synthetic-secret-token/);
   }
 });
 

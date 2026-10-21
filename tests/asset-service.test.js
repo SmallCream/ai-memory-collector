@@ -4,6 +4,7 @@ import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
 import { createChatGPTAssetResolver } from '../extension/lib/chatgpt-assets.js';
 import { createAssetService } from '../extension/lib/asset-service.js';
+import { extractAssets } from '../extension/lib/assets.js';
 import { createArchiveStore, readAccountManifest } from '../extension/lib/archive-store.js';
 import { assetPath } from '../extension/lib/asset-store.js';
 import { hashBytes, formatLfsPointer, parseLfsPointer } from '../extension/lib/lfs.js';
@@ -65,6 +66,182 @@ function bundle(assets) {
     content: JSON.stringify({ conversations: { one: { assets } } }) }] }];
 }
 const snapshot = assets => ({ entries: assets.map(asset => ({ path: asset.localPath, pointer: formatLfsPointer(asset) })) });
+
+async function legacyFileCitation({ downloaded = false, ambiguous = false } = {}) {
+  const env = setup(), source = detail([{ content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_image',
+    width: 1, height: 1, size_bytes: PNG.length }]);
+  const upload = source.payload.mapping.reply.message;
+  upload.author.role = 'user'; upload.metadata = { attachments: [{ id: 'file_image', library_file_id: 'libfile_image', name: 'image.png' }] };
+  source.payload.current_node = 'citation';
+  source.payload.mapping.citation = { parent: 'reply', message: { id: 'message-citation', author: { role: 'assistant' },
+    status: 'finished_successfully', content: { content_type: 'text', parts: ['The uploaded picture.'] },
+    metadata: { content_references: [{ type: 'file', source: 'my_files', id: 'file_image', library_file_id: 'libfile_image', name: 'image.png' }] } } };
+  if (ambiguous) upload.metadata.attachments.push({ id: 'file_other', library_file_id: 'libfile_image', name: 'different.png' });
+  const extracted = await extractAssets(source.payload);
+  let canonical = extracted.find(asset => asset.fileId === 'file_image');
+  if (downloaded) {
+    await env.save(source); await env.tick();
+    canonical = (await env.manifest()).conversations['conversation-one'].assets.find(asset => asset.id === canonical.id);
+  }
+  canonical = { ...canonical, occurrences: canonical.occurrences.filter(item => item.messageId !== 'message-citation') };
+  const alias = { id: await hashBytes(new TextEncoder().encode('platform:library:libfile_image')), sourceType: 'platform',
+    sourceRef: 'library:libfile_image', libraryFileId: 'libfile_image', status: 'pending', kind: 'attachment', fileName: 'image.png',
+    messageId: 'message-citation', references: ['library:libfile_image'],
+    occurrences: [{ messageId: 'message-citation', path: 'messages/message-citation/metadata/content_references/0', kind: 'attachment' }] };
+  const saved = await env.store.saveConversation({ directory: env.fs.directory, account, detail: source,
+    assets: [canonical, ...extracted.filter(asset => asset.id !== canonical.id), alias] });
+  const jobKey = `assetJobs:${account.accountKey}`;
+  const failure = assetId => ({ conversationId: 'conversation-one', assetId, attempt: 4, retryAt: 999_999,
+    error: { code: 'ASSET_URL', message: 'synthetic previous version' } });
+  await env.fs.setSetting(jobKey, { tasks: [failure(alias.id), failure(canonical.id)] });
+  env.dependencies.refreshConversation = async () => source;
+  env.restart();
+  return { env, source, saved, canonical, alias, jobKey };
+}
+
+test('manual retry migrates an old Library-only citation to its verified downloaded file without recapturing', async () => {
+  const { env, saved, canonical, jobKey } = await legacyFileCitation({ downloaded: true });
+  const original = env.fs.text(saved.entry.jsonPath), beforeCaptures = env.captures.length;
+  await env.service.retryFailed({ account }); await env.tick();
+  const entry = (await env.manifest()).conversations['conversation-one'];
+  assert.equal(entry.assets.length, 1); assert.equal(entry.assets[0].id, canonical.id);
+  assert.equal(env.captures.length, beforeCaptures);
+  assert.ok(entry.assets[0].occurrences.some(item => item.messageId === 'message-citation'));
+  assert.deepEqual(env.fs.files.get(entry.assets[0].localPath), PNG);
+  assert.match(env.fs.text(entry.markdownPath), /assets\/[a-f0-9]{64}\.png/);
+  assert.equal(env.fs.text(entry.jsonPath), original);
+  assert.equal((await env.fs.getSetting(jobKey)).tasks.length, 0);
+});
+
+test('old duplicate pending tasks capture once under the file identity and retain archived byte constraints', async () => {
+  const { env, source, saved, canonical, jobKey } = await legacyFileCitation();
+  const original = env.fs.text(saved.entry.jsonPath), live = structuredClone(source);
+  Object.assign(live.payload.mapping.reply.message.content.parts[0], { width: 2, height: 2, size_bytes: PNG.length + 1 });
+  env.dependencies.refreshConversation = async () => live; env.restart();
+  await env.service.retryFailed({ account }); await env.tick();
+  assert.equal(env.captures.length, 1);
+  assert.equal(env.captures[0].asset.id, canonical.id); assert.equal(env.captures[0].asset.fileId, 'file_image');
+  assert.equal(env.captures[0].asset.expectedSize, PNG.length); assert.equal(env.captures[0].asset.width, 1);
+  assert.equal((await env.manifest()).conversations['conversation-one'].assets.length, 1);
+  assert.equal(env.fs.text(saved.entry.jsonPath), original);
+  assert.equal((await env.fs.getSetting(jobKey)).tasks.length, 0);
+});
+
+test('duplicate migration verifies a ready local file and retains its known hash if bytes need recapture', async t => {
+  for (const kind of ['missing', 'modified']) await t.test(kind, async () => {
+    const { env, canonical, jobKey } = await legacyFileCitation({ downloaded: true });
+    const beforeCaptures = env.captures.length;
+    if (kind === 'missing') env.fs.files.delete(canonical.localPath);
+    else env.fs.put(canonical.localPath, new Uint8Array([1, 2, 3]));
+    await env.service.retryFailed({ account }); await env.tick();
+    if (kind === 'missing') {
+      assert.equal(env.captures.length, beforeCaptures + 1);
+      assert.equal(env.captures.at(-1).asset.sha256, canonical.oid);
+      assert.equal((await env.fs.getSetting(jobKey)).tasks.length, 0);
+    } else {
+      assert.equal(env.captures.length, beforeCaptures);
+      assert.equal((await env.fs.getSetting(jobKey)).tasks[0].error.code, 'ASSET_LOCAL_CONFLICT');
+      assert.deepEqual(env.fs.files.get(canonical.localPath), new Uint8Array([1, 2, 3]));
+    }
+  });
+});
+
+test('a source rescan preserves newly extracted citation anchors on an already downloaded image', async () => {
+  const { env, source, canonical } = await legacyFileCitation({ downloaded: true });
+  await env.save(source);
+  const entry = (await env.manifest()).conversations['conversation-one'];
+  assert.equal(entry.assets.length, 1); assert.equal(entry.assets[0].id, canonical.id);
+  assert.equal(entry.assets[0].status, 'downloaded');
+  assert.ok(entry.assets[0].occurrences.some(item => item.messageId === 'message-citation'));
+});
+
+test('Library-only migration retains failures when the archived mapping is ambiguous or citation anchors disagree', async t => {
+  for (const kind of ['ambiguous', 'anchor', 'constraint', 'mime']) await t.test(kind, async () => {
+    const { env, saved, alias, jobKey } = await legacyFileCitation({ ambiguous: kind === 'ambiguous' });
+    if (kind !== 'ambiguous') {
+      const manifest = await env.manifest(), entry = manifest.conversations['conversation-one'];
+      const old = entry.assets.find(item => item.id === alias.id);
+      if (kind === 'anchor') old.occurrences[0].messageId = 'unrelated-message';
+      else if (kind === 'constraint') old.expectedSize = PNG.length + 1;
+      else { old.mimeType = 'image/jpeg'; entry.assets.find(item => item.fileId === 'file_image').mimeType = 'image/png'; }
+      env.fs.put(`${saved.entry.jsonPath.split('/conversations/')[0]}/archive/manifest.json`, JSON.stringify(manifest));
+    }
+    const original = env.fs.text(saved.entry.jsonPath);
+    await env.service.retryFailed({ account }); await env.tick();
+    assert.equal(env.captures.length, 0); assert.equal(env.fs.text(saved.entry.jsonPath), original);
+    assert.ok((await env.manifest()).conversations['conversation-one'].assets.some(item => item.id === alias.id));
+    assert.equal((await env.fs.getSetting(jobKey)).tasks[0].error.code, 'ASSET_SOURCE_MISSING');
+  });
+});
+
+test('Library-only retry validates the live account and conversation before changing existing records', async t => {
+  for (const kind of ['account', 'conversation', 'incomplete', 'missing']) await t.test(kind, async () => {
+    const { env, source, saved, alias, jobKey } = await legacyFileCitation({ downloaded: true });
+    const live = structuredClone(source), original = env.fs.text(saved.entry.jsonPath), beforeCaptures = env.captures.length;
+    if (kind === 'account') live.identity.accountKey = 'acct-ffffffffffffffffffffffff';
+    if (kind === 'conversation') live.payload.conversation_id = 'another-conversation';
+    if (kind === 'incomplete') live.completeness = 'partial';
+    if (kind === 'missing') live.payload.mapping = {};
+    env.dependencies.refreshConversation = async () => live; env.restart();
+    await env.service.retryFailed({ account }); await env.tick();
+    assert.equal(env.captures.length, beforeCaptures); assert.equal(env.fs.text(saved.entry.jsonPath), original);
+    assert.ok((await env.manifest()).conversations['conversation-one'].assets.some(item => item.id === alias.id));
+    const task = (await env.fs.getSetting(jobKey)).tasks[0];
+    assert.equal(task.assetId, alias.id);
+    assert.equal(task.error.code, kind === 'account' ? 'ACCOUNT_CHANGED' : kind === 'missing' ? 'ASSET_SOURCE_MISSING' : 'INCOMPLETE_DETAIL');
+  });
+});
+
+test('migration preserves older pending archives and resumes their delivery before the corrected manifest', async () => {
+  const { env, saved, jobKey } = await legacyFileCitation({ downloaded: true });
+  const state = await env.fs.getSetting(jobKey); state.tasks[1].pendingArchives = [saved]; await env.fs.setSetting(jobKey, state);
+  const before = env.enqueued.length, beforeCaptures = env.captures.length;
+  env.enqueueFailure(true); await env.service.retryFailed({ account }); await env.tick();
+  const pending = await env.fs.getSetting(jobKey);
+  assert.equal(pending.tasks.length, 1); assert.equal(pending.tasks[0].pendingArchives.length, 2);
+  env.restart(); env.enqueueFailure(false); await env.service.retryFailed({ account }); await env.tick();
+  assert.equal(env.captures.length, beforeCaptures);
+  assert.deepEqual(env.enqueued.slice(before).map(item => item.archive.entry.assets.length), [2, 1]);
+  assert.equal((await env.fs.getSetting(jobKey)).tasks.length, 0);
+});
+
+test('a crash after migration filesystem commit can enqueue the corrected archive using the checkpointed file ID', async () => {
+  const { env, canonical, jobKey } = await legacyFileCitation();
+  let interrupt = true;
+  env.dependencies.setSetting = async (key, value) => {
+    if (interrupt && key === jobKey && value?.tasks.some(task => task.pendingArchives?.length)) throw new Error('synthetic worker stop');
+    return env.fs.setSetting(key, value);
+  };
+  env.restart(); await env.service.retryFailed({ account });
+  await assert.rejects(env.tick(), /synthetic worker stop/);
+  assert.equal((await env.fs.getSetting(jobKey)).tasks[0].assetId, canonical.id);
+  assert.equal((await env.manifest()).conversations['conversation-one'].assets.length, 1);
+  interrupt = false; env.restart(); await env.service.retryFailed({ account }); await env.tick();
+  assert.equal(env.captures.length, 1); assert.equal(env.enqueued.length, 1);
+  assert.equal((await env.fs.getSetting(jobKey)).tasks.length, 0);
+});
+
+test('canonical-first migration checkpoints an old alias receipt before a crash removes the alias from the manifest', async () => {
+  const { env, saved, jobKey } = await legacyFileCitation({ downloaded: true });
+  const state = await env.fs.getSetting(jobKey);
+  state.tasks[0].pendingArchives = [saved]; state.tasks.reverse(); await env.fs.setSetting(jobKey, state);
+  const before = env.enqueued.length, beforeCaptures = env.captures.length;
+  let interrupt = true;
+  env.dependencies.setSetting = async (key, value) => {
+    if (interrupt && key === jobKey && (await env.manifest()).conversations['conversation-one'].assets.length === 1) {
+      throw new Error('synthetic stop after corrected manifest');
+    }
+    return env.fs.setSetting(key, value);
+  };
+  env.restart(); await env.service.retryFailed({ account });
+  await assert.rejects(env.tick(), /synthetic stop after corrected manifest/);
+  const checkpoint = await env.fs.getSetting(jobKey);
+  assert.equal(checkpoint.tasks.length, 1); assert.equal(checkpoint.tasks[0].priorArchives.length, 1);
+  interrupt = false; env.restart(); await env.service.retryFailed({ account }); await env.tick();
+  assert.deepEqual(env.enqueued.slice(before).map(item => item.archive.entry.assets.length), [2, 1]);
+  assert.equal(env.captures.length, beforeCaptures);
+  assert.equal((await env.fs.getSetting(jobKey)).tasks.length, 0);
+});
 
 test('capture persists exact image, regenerates Markdown and enqueues archive while native JSON remains identical', async () => {
   const env = setup(), saved = await env.save(detail());

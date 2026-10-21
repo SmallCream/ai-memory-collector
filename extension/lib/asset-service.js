@@ -1,5 +1,6 @@
 /** Persistent image work. Native conversations remain authoritative and unchanged. */
 import { extractAssets, sanitizeAssetRecords } from './assets.js';
+import { reconcileFileCitation } from './asset-reconciliation.js';
 import { validateExternalAsset } from './chatgpt-assets.js';
 import { assetPath, readLocalBytes, verifiedLocalAsset, writeLocalAsset, imageExtension, MAX_ASSET_BYTES } from './asset-store.js';
 import { createLfsClient, hashBytes, formatLfsPointer, parseLfsPointer } from './lfs.js';
@@ -14,6 +15,7 @@ const enc = new TextDecoder('utf-8', { fatal: true });
 const text = bytes => enc.decode(bytes);
 const nativeId = native => native.conversation_id ?? native.id;
 const isImage = asset => asset.kind === 'image' || /^image\//i.test(asset.mimeType || '') || /\.(png|jpe?g|gif|webp|avif)$/i.test(asset.fileName || '');
+
 
 export function createAssetService({ getSetting, setSetting, readAccountManifest, saveConversation,
   resolveAsset, refreshConversation, enqueueArchive, browser = globalThis.chrome, fetchImpl = globalThis.fetch, downloadRepositoryFile,
@@ -80,14 +82,15 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
         // A manifest receipt alone does not prove the binary still exists.
         // Missing bytes return to capture; differing bytes remain a conflict.
         const present = await verifiedLocalAsset({ directory, account, asset: previous, getSetting });
-        assets.push(present ? { ...asset, ...previous } : asset);
-      } else assets.push(previous?.status === 'external' ? { ...asset, ...previous } : asset);
+        assets.push(present ? { ...asset, ...previous, references: asset.references, occurrences: asset.occurrences } : asset);
+      } else assets.push(previous?.status === 'external' ?
+        { ...asset, ...previous, references: asset.references, occurrences: asset.occurrences } : asset);
     }
     const saved = await saveConversation({ ...input, assets });
     const state = await jobs(account);
     // A ready asset may still have a pending outbox acknowledgement after a
     // crash. A new source scan must not erase that durable delivery task.
-    state.tasks = state.tasks.filter(t => t.conversationId !== id || t.pendingArchives?.length || assets.some(a => a.id === t.assetId));
+    state.tasks = state.tasks.filter(t => t.conversationId !== id || t.pendingArchives?.length || t.priorArchives?.length || assets.some(a => a.id === t.assetId));
     for (const asset of assets) if (isImage(asset) && !ready(asset) && asset.status !== 'external' && !state.tasks.some(t => t.conversationId === id && t.assetId === asset.id)) {
       state.tasks.push({ conversationId: id, assetId: asset.id, attempt: 0, retryAt: 0 });
     }
@@ -127,14 +130,26 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
     try {
       const manifest = await readAccountManifest(directory, account), entry = manifest?.conversations?.[task.conversationId];
       finalManifest = manifest;
-      const asset = entry?.assets?.find(a => a.id === task.assetId);
+      let asset = entry?.assets?.find(a => a.id === task.assetId);
       if (!task.pendingArchives?.length && asset) {
         const nativeBytes = await readLocalBytes(directory, entry.jsonPath, 24 * 1024 * 1024);
         if (!nativeBytes || await hashBytes(nativeBytes) !== entry.contentHash) throw collectorError('LOCAL_CONFLICT', '对话原始文件已变化，图片任务暂停以保护原文件。');
         const native = JSON.parse(text(nativeBytes));
-        let fresh = (await extractAssets(native)).find(a => a.id === asset.id);
+        const original = asset;
+        const reconciliation = await reconcileFileCitation(asset, entry.assets, await extractAssets(native));
+        asset = reconciliation.asset;
+        let fresh = reconciliation.fresh;
+        if (reconciliation.retired.length && nativeId(native) !== task.conversationId) {
+          throw collectorError('INCOMPLETE_DETAIL', '图片来源对话不匹配，保留已有记录等待检查。');
+        }
+        if (reconciliation.retired.length && ready(asset) &&
+            !await verifiedLocalAsset({ directory, account, asset, getSetting })) {
+          if (asset.sha256 && asset.sha256 !== asset.oid) throw collectorError('ASSET_HASH', '图片内容摘要记录冲突，已保留已有记录。');
+          asset = { ...asset, status: 'pending', sha256: asset.oid };
+          delete asset.oid; delete asset.localPath; delete asset.size;
+        }
         let retrieval = ephemeral.get(`${account.accountKey}:${task.conversationId}:${asset.id}`) || fresh?.retrieval;
-        if (!ready(asset) && asset.status !== 'external' && refreshConversation && (task.refreshSource || task.error)) {
+        if (!ready(original) && original.status !== 'external' && refreshConversation && (task.refreshSource || task.error)) {
           const detail = await refreshConversation({ tabId, accountKey: account.accountKey, conversationId: task.conversationId });
           if (detail?.identity?.accountKey !== account.accountKey) throw collectorError('ACCOUNT_CHANGED', '图片详情所属账号不匹配。');
           if (nativeId(detail?.payload || {}) !== task.conversationId || detail.completeness !== 'complete') {
@@ -152,18 +167,41 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
         const completed = ready(asset) || asset.status === 'external' ? asset : await capture({ ...fresh, ...asset,
           ...(fresh?.libraryFileId ? { libraryFileId: fresh.libraryFileId } : {}), retrieval },
         { directory, account, tabId, conversationId: task.conversationId });
-        const updated = entry.assets.map(a => a.id === asset.id ? completed : a);
+        const duplicates = state.tasks.filter(other => other !== task && other.conversationId === task.conversationId &&
+          (other.assetId === asset.id || reconciliation.retired.includes(other.assetId)));
+        if (task.assetId !== asset.id || duplicates.length) {
+          // Checkpoint the surviving ID before changing the manifest. If the
+          // worker stops after the write, replay can still enqueue its archive.
+          // Move older receipts in the same checkpoint: once the alias is gone
+          // from the manifest it cannot be used to discover those tasks again.
+          task.assetId = asset.id;
+          task.priorArchives = [...(task.priorArchives || []), ...duplicates.flatMap(other =>
+            [...(other.priorArchives || []), ...(other.pendingArchives || [])])];
+          state.tasks = state.tasks.filter(other => !duplicates.includes(other));
+          await setSetting(key(account), state);
+        }
+        const updated = entry.assets.filter(a => !reconciliation.retired.includes(a.id)).map(a => a.id === asset.id ? completed : a);
         const saved = await saveConversation({ directory, account, assets: sanitizeAssetRecords(updated), detail: {
           payload: native, identity: { accountKey: account.accountKey, displayName: account.displayName },
           capturedAt: entry.lastChangedAt || new Date(now()).toISOString(), completeness: entry.sourceCompleteness,
         } });
         const { recovered, ...current } = saved;
-        task.pendingArchives = recovered ? [recovered, current] : [current];
+        // Preserve older durable receipts and deliver them first; the corrected
+        // manifest must be the last archive for this image.
+        task.pendingArchives = [...(task.priorArchives || []),
+          ...(recovered ? [recovered, current] : [current])];
+        delete task.priorArchives;
         // Persist the delivery list before handing off either archive. A replay
         // may have recovered a different conversation whose receipt would
         // otherwise disappear after its filesystem journal is cleared.
         await setSetting(key(account), state);
         finalManifest = saved.manifest;
+      }
+      if (!asset && task.priorArchives?.length) {
+        // A later source change removed the surviving image. Keep its older
+        // receipts until a current archive can be produced, rather than send an
+        // obsolete manifest by itself or silently erase the pending delivery.
+        throw collectorError('ASSET_SOURCE_MISSING', '图片来源已变化，待交付归档已保留。');
       }
       while (task.pendingArchives?.length) {
         await enqueueArchive({ account, archive: task.pendingArchives[0] });

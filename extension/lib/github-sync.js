@@ -2,6 +2,8 @@
 import { buildArchive } from './archive.js';
 import { createGitHubClient, inspectGitHubRepository, commitProbe, GitHubProbeError } from './github.js';
 import { formatLfsPointer } from './lfs.js';
+import { extractAssets } from './assets.js';
+import { reconcileFileCitation } from './asset-reconciliation.js';
 
 const MAX_BYTES = 32 * 1024 * 1024;
 const MAX_FILES = 512;
@@ -77,15 +79,29 @@ function validatePointers(bundles, supplied) {
   }
   return { references, pointers };
 }
-function mergeSameNativeAssets(localEntry, remoteEntry, prefix) {
+async function mergeSameNativeAssets(localEntry, remoteEntry, prefix, native) {
   if (localEntry.assets === undefined && remoteEntry?.assets === undefined) return undefined;
   const result = new Map(assetsOf(localEntry, prefix).map(asset => [asset.id, asset]));
   for (const remoteAsset of assetsOf(remoteEntry || {}, prefix)) {
     const localAsset = result.get(remoteAsset.id);
     // A stable source resource already saved remotely must not become pending again.
-    if (!localAsset || READY_ASSETS.has(remoteAsset.status) || !READY_ASSETS.has(localAsset.status)) {
-      result.set(remoteAsset.id, remoteAsset);
+    const preferred = !localAsset || READY_ASSETS.has(remoteAsset.status) || !READY_ASSETS.has(localAsset.status) ? remoteAsset : localAsset;
+    const merged = { ...preferred };
+    for (const field of ['references', 'occurrences']) if (Array.isArray(localAsset?.[field]) || Array.isArray(remoteAsset[field])) {
+      merged[field] = [...new Map([localAsset, remoteAsset].flatMap(item => Array.isArray(item?.[field]) ? item[field] : []).map(value =>
+        [typeof value === 'string' ? value : JSON.stringify(value), value])).values()];
     }
+    result.set(remoteAsset.id, merged);
+  }
+  // The caller has verified account ownership, the local hash and identical
+  // native content. Retire only aliases proven by that same conversation.
+  const extracted = await extractAssets(native);
+  for (const asset of [...result.values()]) {
+    if (!result.has(asset.id)) continue;
+    const reconciled = await reconcileFileCitation(asset, [...result.values()], extracted);
+    if (!reconciled.retired.length) continue;
+    result.set(reconciled.asset.id, reconciled.asset);
+    for (const id of reconciled.retired) result.delete(id);
   }
   return [...result.values()];
 }
@@ -281,7 +297,7 @@ async function plan(api, remote, bundles, assetPlan) {
         continue;
       }
       if (sameNative && (localEntry.assets !== undefined || previous?.assets !== undefined)) {
-        const mergedAssets = mergeSameNativeAssets(localEntry, previous, prefix);
+        const mergedAssets = await mergeSameNativeAssets(localEntry, previous, prefix, native);
         for (const asset of mergedAssets) await ensureAsset(asset, prefix);
         const rebuilt = await buildArchive({ conversation: parse(remoteJSON),
           identity: { accountKey, displayName: bundle.account.displayName },

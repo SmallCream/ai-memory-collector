@@ -73,6 +73,7 @@ function messages(conversation) {
  */
 export async function extractAssets(conversation) {
   const candidates = [];
+  const fileContentReferences = new WeakSet();
   const add = (ref, info) => { if (typeof ref === 'string' && ref.trim()) candidates.push({ ref, ...info }); };
   function text(value, info) {
     for (const reference of extractRichReferences(value)) add(reference.ref, { ...info, kind: reference.kind, syntax: reference.syntax, attribute: reference.attribute });
@@ -86,7 +87,8 @@ export async function extractAssets(conversation) {
     if (type === 'code') return;
     const media = /image|audio|video|file|attachment/i.test(type) || info.attachment;
     const pointerFileId = typeof value.asset_pointer === 'string' ? classifyAssetReference(value.asset_pointer).fileId : undefined;
-    const fileId = value.file_id ?? value.fileId ?? (info.attachment ? value.id : undefined) ?? pointerFileId;
+    const fileId = value.file_id ?? value.fileId ??
+      (info.attachment || fileContentReferences.has(value) ? value.id : undefined) ?? pointerFileId;
     const libraryFileId = value.library_file_id ?? value.libraryFileId;
     const mimeType = value.mime_type ?? value.mimeType ?? value.content_mime_type;
     const common = { ...info, fileId, libraryFileId, mimeType,
@@ -126,6 +128,13 @@ export async function extractAssets(conversation) {
   for (const item of messages(conversation)) {
     if (!record(item.message)) continue;
     const messageId = String(item.message.id ?? item.fallback);
+    // Only the observed direct message-level file citation declares this ID
+    // pair. Web citations and arbitrary nested `id` fields are not attachments.
+    const references = item.message.metadata?.content_references;
+    if (Array.isArray(references)) for (const ref of references) {
+      if (record(ref) && ref.type === 'file' && typeof ref.id === 'string' && /^file[-_][A-Za-z0-9_-]{1,160}$/.test(ref.id) &&
+          typeof ref.library_file_id === 'string' && /^libfile_[A-Za-z0-9_-]{1,160}$/.test(ref.library_file_id)) fileContentReferences.add(ref);
+    }
     walk(item.message, { messageId, path: `messages/${messageId}`, kind: 'attachment', prose: false, attachment: false });
   }
   const result = new Map();

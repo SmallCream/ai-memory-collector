@@ -5,6 +5,7 @@ import { syncArchives } from '../extension/lib/github-sync.js';
 import { PROBE_CONTENT, PROBE_PATH } from '../extension/lib/github.js';
 import { buildArchive } from '../extension/lib/archive.js';
 import { formatLfsPointer } from '../extension/lib/lfs.js';
+import { extractAssets } from '../extension/lib/assets.js';
 const ACCOUNT = 'acct-' + '1'.repeat(24);
 const PREFIX = 'data/web/chatgpt/demo-' + '1'.repeat(8);
 const MANIFEST = PREFIX + '/archive/manifest.json';
@@ -273,6 +274,69 @@ async function pictureBundle({ assets = [IMAGE], time = 100, text = 'Screenshot'
     capturedAt: '2026-10-21T00:00:00Z', existingManifest: initial.manifest, productionPrefix: PREFIX, assets });
   return { accountKey: ACCOUNT, files: built.files, manifest: built.manifest, entry: built.manifest.conversations.picture };
 }
+
+async function citedPictureBundles({ ambiguous = false, readyAlias = false } = {}) {
+  const initial = bundle('cited-picture'), native = JSON.parse(initial.files[0].content);
+  const libraryFileId = 'libfile_synthetic_citation';
+  native.mapping.a.message.content.parts.push({ content_type: 'image_asset_pointer', asset_pointer: 'file-service://file-one' });
+  native.mapping.a.message.metadata = { attachments: [{ id: 'file-one', library_file_id: libraryFileId, name: 'synthetic.png' }] };
+  if (ambiguous) native.mapping.a.message.metadata.attachments.push({ id: 'file-synthetic-other', library_file_id: libraryFileId, name: 'other.png' });
+  native.current_node = 'citation';
+  native.mapping.citation = { parent: 'a', message: { id: 'synthetic-citation-message', author: { role: 'assistant' },
+    content: { content_type: 'text', parts: ['Synthetic answer'] }, metadata: { content_references: [
+      { type: 'file', source: 'my_files', id: 'file-one', library_file_id: libraryFileId, name: 'synthetic.png' },
+    ] } } };
+  const extracted = await extractAssets(native), canonical = extracted.find(asset => asset.fileId === 'file-one');
+  const ready = { ...canonical, status: 'downloaded', oid: IMAGE.oid, size: IMAGE.size, localPath: IMAGE.localPath,
+    occurrences: canonical.occurrences.filter(item => item.messageId !== 'synthetic-citation-message') };
+  const alias = { id: digest(`platform:library:${libraryFileId}`), sourceType: 'platform', sourceRef: `library:${libraryFileId}`,
+    libraryFileId, status: 'pending', fileName: 'synthetic.png', kind: 'attachment', references: [`library:${libraryFileId}`],
+    occurrences: canonical.occurrences.filter(item => item.messageId === 'synthetic-citation-message') };
+  if (readyAlias) Object.assign(alias, { status: 'synced', oid: ready.oid, size: ready.size, localPath: ready.localPath });
+  const build = async assets => {
+    const built = await buildArchive({ conversation: native, identity: { accountKey: ACCOUNT, displayName: 'Demo' },
+      capturedAt: '2026-10-21T00:00:00Z', existingManifest: initial.manifest, productionPrefix: PREFIX, assets });
+    return { accountKey: ACCOUNT, files: built.files, manifest: built.manifest, entry: built.manifest.conversations['cited-picture'] };
+  };
+  return { local: await build(extracted), remote: await build([ready, ...extracted.filter(asset => asset.id !== canonical.id), alias]),
+    canonical, alias, ready };
+}
+
+test('same native sync retires a proven remote file-citation duplicate, keeps ready bytes and stabilizes on replay', async () => {
+  const { local, remote, canonical, alias, ready } = await citedPictureBundles();
+  const server = gitServer({ initial: { ...fileMap(remote), [ready.localPath]: formatLfsPointer(ready), [ATTRIBUTES]: RULE } });
+  const result = await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+  const assets = JSON.parse(server.files()[MANIFEST]).conversations['cited-picture'].assets;
+  assert.equal(assets.length, 1); assert.equal(assets[0].id, canonical.id);
+  assert.equal(assets[0].status, 'downloaded'); assert.equal(assets[0].oid, ready.oid);
+  assert.equal(assets[0].occurrences.length, 3);
+  assert.ok(!assets.some(asset => asset.id === alias.id));
+  assert.equal(result.remoteWinners[0].entry.assets.length, 1);
+  assert.equal(server.files()[remote.entry.jsonPath], remote.files[0].content);
+  const before = server.calls.length;
+  const again = await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+  assert.equal(again.status, 'unchanged'); assert.ok(server.calls.slice(before).every(call => call.method === 'GET'));
+  assert.equal(again.remoteWinners[0].entry.assets.length, 1);
+});
+
+test('same native sync preserves ambiguous library identities instead of retiring their records', async () => {
+  const { local, remote, alias, ready } = await citedPictureBundles({ ambiguous: true });
+  const server = gitServer({ initial: { ...fileMap(remote), [ready.localPath]: formatLfsPointer(ready), [ATTRIBUTES]: RULE } });
+  await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+  const assets = JSON.parse(server.files()[MANIFEST]).conversations['cited-picture'].assets;
+  assert.equal(assets.length, 3); assert.ok(assets.some(asset => asset.id === alias.id));
+  assert.equal(assets.find(asset => asset.id === ready.id).status, 'downloaded');
+});
+
+test('same native sync does not retire a legacy citation that already owns saved image bytes', async () => {
+  const { local, remote, alias, ready } = await citedPictureBundles({ readyAlias: true });
+  const server = gitServer({ initial: { ...fileMap(remote), [ready.localPath]: formatLfsPointer(ready), [ATTRIBUTES]: RULE } });
+  await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+  const assets = JSON.parse(server.files()[MANIFEST]).conversations['cited-picture'].assets;
+  assert.equal(assets.length, 2);
+  assert.equal(assets.find(asset => asset.id === alias.id).status, 'synced');
+  assert.equal(assets.find(asset => asset.id === alias.id).oid, alias.oid);
+});
 
 test('LFS pointer, scoped attributes, native JSON, Markdown and metadata commit atomically', async () => {
   const b = await pictureBundle(), server = gitServer({ initial: { [ATTRIBUTES]: '*.md text eol=lf\n', 'notes.txt': 'keep' } });
