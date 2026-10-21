@@ -1,5 +1,17 @@
 # 验证记录
 
+## 0.3.2 附件下载跳转 · 2026-10-21
+
+验证：`npm test` **401 项全部通过**，0 失败、0 跳过；静态检查、差异格式检查与打包通过。ZIP 内 26 个文件与扩展源码逐字节一致，SHA-256：`7290934b6c91fb75696768896bbdcf3b39a98fa9f34a465011d42960dafc5b93`。新增跳转与嵌套来源用例均使用合成数据；模拟测试验证扩展请求选项和处理逻辑，不代表实际浏览器网络链路已成功。
+
+用户新版截图确认：两个上传附件显示 `ASSET_REDIRECT`，生成图片显示 `ASSET_PENDING`。前者与代码中 `fetch(..., {redirect: 'manual'})` 取得不透明跳转后终止的分支对应，但截图本身不能确认跳转最终是图片 CDN 还是登录页面。
+
+本次仅为按当前 Library ID 构造的标准下载入口增加例外：遇到 `opaqueredirect` 后，在同一超时范围内用原生 Fetch 跟随一次重定向链，使用 `credentials: 'same-origin'` 和 `referrerPolicy: 'no-referrer'`。浏览器按 Fetch 标准在跨源重定向时移除 Authorization；不把 Cookie 发送给跨源 CDN。返回后先核对最终 HTTPS 地址、域名和资源路径，再读取有界字节及执行图片格式、原始大小、尺寸、哈希与账号检查。其他下载入口、任意外链及会话查询维持原跳转约束。
+
+边界：最终地址检查发生在重定向之后，不能宣称每个中间跳转都提前通过域名白名单。该策略信任指定平台下载入口的重定向链，拒绝接受未知最终来源的内容；没有新增浏览器权限。规范依据：[Fetch HTTP-redirect fetch](https://fetch.spec.whatwg.org/#http-redirect-fetch)、[MDN Response.type](https://developer.mozilla.org/en-US/docs/Web/API/Response/type)。
+
+另外补齐原生图片直属 `metadata.asset_pointer_link` 的关联，只向该链接传递父图片的来源身份；不将父图片 ID 扩散到其他附件。实际生成图片的这项链接为 null，且没有 Library ID，因此本次不会凭空解决它的 `ASSET_PENDING`。网页下载入口的直接核验未完成，未验证真实原图成功写入本地或 LFS。
+
 ## 0.3.1 图片诊断与补采 · 2026-10-21
 
 最终检查：`npm test` **371 项全部通过**，0 失败、0 跳过；`npm run check`、`git diff --check` 与打包通过。0.3.1 ZIP 内 26 个文件与扩展源码逐字节一致，SHA-256：`64f05b896c641991b4dccc51ccac0807341d83afbb862a249ea1b9d8adf38778`。自动化测试均使用合成数据及模拟接口。

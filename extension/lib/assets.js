@@ -106,6 +106,20 @@ export async function extractAssets(conversation) {
       }
       const attachment = info.attachment || ['attachments', 'files'].includes(key);
       const prose = ['text', 'parts', 'content'].includes(key) || (key === 'html' && /html/i.test(type)) || (info.prose && key === 'value');
+      if (key === 'metadata' && record(child) && common.kind === 'image' && (fileId || libraryFileId)) {
+        // Native generated-image parts place this link inside their metadata.
+        // Associate only this direct link with the owning image; do not pass
+        // parent IDs to sibling attachments or arbitrary nested metadata.
+        const link = typeof child.asset_pointer_link === 'string' ? child.asset_pointer_link : child.asset_pointer_link?.url;
+        const childFileId = child.file_id ?? child.fileId, childLibraryId = child.library_file_id ?? child.libraryFileId;
+        const consistent = (!childFileId || childFileId === fileId) && (!childLibraryId || childLibraryId === libraryFileId);
+        if (link && consistent) {
+          add(link, { ...common, path: `${info.path}/metadata/asset_pointer_link` });
+          const rest = { ...child }; delete rest.asset_pointer_link;
+          walk(rest, { ...info, path: `${info.path}/${key}`, attachment, prose }, depth + 1);
+          continue;
+        }
+      }
       walk(child, { ...info, path: `${info.path}/${key}`, attachment, prose }, depth + 1);
     }
   }

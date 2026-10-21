@@ -207,13 +207,28 @@ export async function probeChatGPTAsset(request) {
     for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.byteLength; }
     return result;
   }
-  async function requestData(url, token, limit, sessionRequest = false) {
+  async function requestData(url, token, limit, sessionRequest = false, allowLibraryRedirectFollow = false) {
     const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 20000);
     try {
       const sameOrigin = new URL(url, 'https://chatgpt.com').origin === 'https://chatgpt.com' && !String(url).startsWith('blob:');
-      const response = await fetch(url, { method: 'GET', credentials: sameOrigin ? 'include' : 'omit',
+      const options = { method: 'GET', credentials: sameOrigin ? 'include' : 'omit',
         cache: 'no-store', redirect: sessionRequest ? 'error' : 'manual', referrerPolicy: 'no-referrer',
-        headers: token && sameOrigin ? { Authorization: `Bearer ${token}` } : {}, signal: controller.signal });
+        headers: token && sameOrigin ? { Authorization: `Bearer ${token}` } : {}, signal: controller.signal };
+      let response = await fetch(url, options);
+      if (response.type === 'opaqueredirect' && !sessionRequest && allowLibraryRedirectFollow && asset.libraryFileId &&
+          url === `https://chatgpt.com/api/library/files/${asset.libraryFileId}/download`) {
+        // Browser fetch hides Location on manual redirects. Only this canonical
+        // platform download entry may delegate one redirect chain to the browser.
+        // Fetch removes Authorization on cross-origin redirects; same-origin
+        // credentials keep cookies off the CDN. Intermediate anonymous requests
+        // are not prevalidated; the final destination is checked before reading.
+        response = await fetch(url, { ...options, redirect: 'follow', credentials: 'same-origin' });
+        if (response.type === 'opaqueredirect' || response.type === 'opaque' || (response.status >= 300 && response.status < 400)) {
+          fail('ASSET_REDIRECT', '图片下载跳转未完成，等待补采。');
+        }
+        if (typeof response.url !== 'string' || !/^https:\/\//.test(response.url)) fail('ASSET_URL', '图片下载的最终地址无法确认，未读取内容。');
+        safeURL(response.url);
+      }
       if (response.type === 'opaqueredirect') fail('ASSET_REDIRECT', '网页返回了不可检查的跳转，请等待资源适配或打开原图补采。');
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get('location');
@@ -285,7 +300,7 @@ export async function probeChatGPTAsset(request) {
     for (let attempt = 0; attempt < 4; attempt++) {
       if (seen.has(url)) fail('ASSET_REDIRECT', '图片地址发生循环跳转。');
       seen.add(url);
-      const result = await requestData(url, token, maximum);
+      const result = await requestData(url, token, maximum, false, via === 'library-download' && attempt === 0);
       let next = result.redirect;
       if (result.mime === 'application/json') {
         let payload; try { payload = JSON.parse(new TextDecoder().decode(result.bytes)); } catch { fail('ASSET_PROTOCOL', '图片下载响应无法解析。'); }

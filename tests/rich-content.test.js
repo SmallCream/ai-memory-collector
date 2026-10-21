@@ -168,6 +168,56 @@ test('attachment links and native pointers merge in either traversal order', asy
   }
 });
 
+test('generated-image metadata link enriches only its owning pointer and preserves native input', async () => {
+  const url = 'https://files.oaiusercontent.com/generated-synthetic.png?sig=synthetic-nested-secret';
+  for (const link of [url, { url }]) {
+    const source = conversation({ content_type: 'multimodal_text', parts: [{ content_type: 'image_asset_pointer',
+      asset_pointer: 'sediment://file_synthetic_generated', library_file_id: 'libfile_synthetic_generated',
+      width: 1024, height: 1024, size_bytes: 12345, metadata: { asset_pointer_link: link } }] });
+    const before = structuredClone(source), assets = await extractAssets(source);
+    assert.equal(assets.length, 1);
+    const [asset] = assets;
+    assert.equal(asset.fileId, 'file_synthetic_generated'); assert.equal(asset.libraryFileId, 'libfile_synthetic_generated');
+    assert.equal(asset.kind, 'image'); assert.equal(asset.retrieval.url, url);
+    assert.equal(asset.expectedSize, 12345); assert.equal(asset.width, 1024);
+    assert.equal(asset.occurrences.length, 2);
+    assert.match(asset.occurrences[1].path, /content\/parts\/0\/metadata\/asset_pointer_link$/);
+    assert.doesNotMatch(JSON.stringify(asset), /synthetic-nested-secret/);
+    assert.doesNotMatch(JSON.stringify(sanitizeAssetRecords(assets)), /synthetic-nested-secret/);
+    assert.deepEqual(source, before);
+  }
+});
+
+test('image metadata link inheritance does not relabel sibling attachments or message metadata', async () => {
+  const owned = 'https://files.oaiusercontent.com/owned.png?sig=owned-secret';
+  const other = 'https://files.oaiusercontent.com/other.png?sig=other-secret';
+  const messageLink = 'https://files.oaiusercontent.com/message.png?sig=message-secret';
+  const source = conversation({ content_type: 'multimodal_text', parts: [{ content_type: 'image_asset_pointer',
+    asset_pointer: 'sediment://file_synthetic_owner', metadata: { asset_pointer_link: owned,
+      attachments: [{ id: 'file_synthetic_other', mime_type: 'image/png', asset_pointer_link: other }] } }] });
+  source.messages[0].metadata = { asset_pointer_link: messageLink };
+  const assets = await extractAssets(source);
+  assert.equal(assets.length, 3);
+  assert.equal(assets.find(a => a.fileId === 'file_synthetic_owner').retrieval.url, owned);
+  assert.equal(assets.find(a => a.fileId === 'file_synthetic_other').retrieval.url, other);
+  assert.equal(assets.find(a => a.retrieval.url === messageLink).fileId, undefined);
+  assert.doesNotMatch(JSON.stringify(assets), /owned-secret|other-secret|message-secret/);
+});
+
+test('null nested image link remains unresolved and a conflicting metadata ID is not attached to the parent', async () => {
+  const source = conversation({ content_type: 'multimodal_text', parts: [{ content_type: 'image_asset_pointer',
+    asset_pointer: 'sediment://file_synthetic_parent', metadata: { asset_pointer_link: null } }] });
+  let assets = await extractAssets(source);
+  assert.equal(assets.length, 1); assert.equal(assets[0].status, 'pending');
+  assert.equal(assets[0].retrieval.url, 'sediment://file_synthetic_parent');
+  source.messages[0].content.parts[0].metadata = { file_id: 'file_synthetic_different',
+    asset_pointer_link: 'https://files.oaiusercontent.com/different.png?sig=different-secret' };
+  assets = await extractAssets(source);
+  assert.equal(assets.length, 2);
+  assert.equal(assets.find(a => a.fileId === 'file_synthetic_parent').retrieval.url, 'sediment://file_synthetic_parent');
+  assert.match(assets.find(a => a.fileId === 'file_synthetic_different').retrieval.url, /^https:/);
+});
+
 test('deduplicated image retrieval prefers HTTPS over HTTP, blob and opaque pointers', async () => {
   const usable = 'https://files.oaiusercontent.com/synthetic.png?sig=synthetic-secret';
   const alternatives = ['sediment://file_synthetic_precedence', 'http://files.oaiusercontent.com/synthetic.png',

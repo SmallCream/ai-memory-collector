@@ -13,6 +13,7 @@ const asset = { fileId: 'file_testA', libraryFileId: 'libfile_testA', fileName: 
 const libraryURL = 'https://chatgpt.com/api/library/files/libfile_testA/download';
 const sessionURL = 'https://chatgpt.com/api/auth/session';
 const pngResponse = (bytes = PNG, headers = {}) => new Response(bytes, { headers: { 'content-type': 'image/png', ...headers } });
+const locatedResponse = (response, url) => Object.defineProperty(response, 'url', { value: url });
 const jsonResponse = value => new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } });
 const sessionResponse = user => jsonResponse({ user: { id: user }, accessToken: 'synthetic-secret-token' });
 
@@ -145,11 +146,94 @@ test('JSON links and readable redirects to untrusted destinations are rejected b
   }
 });
 
-test('opaque browser redirects remain pending instead of following an unchecked destination', async () => {
+test('a Library follow attempt that still exposes an opaque redirect remains pending', async () => {
   const h = harness({ serve: () => ({ type: 'opaqueredirect' }) });
   const result = await h.run();
   assert.equal(result.error.code, 'ASSET_REDIRECT');
   assert.equal(result.error.state, 'pending');
+  assert.equal(h.calls.filter(call => call.options.redirect === 'follow').length, 1);
+});
+
+test('canonical Library opaque redirect gets one native follow with same-origin credentials and a shared timeout', async () => {
+  const destination = 'https://sdmntprtest.oaiusercontent.com/original.png?sig=synthetic-private';
+  const h = harness({ serve: (url, options) => options.redirect === 'manual' ? { type: 'opaqueredirect' } : locatedResponse(pngResponse(), destination) });
+  const result = await h.run();
+  assert.equal(result.ok, true); assert.equal(result.binary.quality, 'original');
+  assert.equal(result.binary.via, 'library-download'); assert.equal(result.binary.sha256, await hash(PNG));
+  const downloads = h.calls.filter(call => call.url === libraryURL);
+  assert.equal(downloads.length, 2); assert.equal(downloads[0].options.redirect, 'manual');
+  assert.equal(downloads[1].options.redirect, 'follow'); assert.equal(downloads[1].options.credentials, 'same-origin');
+  assert.equal(downloads[1].options.headers.Authorization, 'Bearer synthetic-secret-token');
+  assert.equal(downloads[1].options.referrerPolicy, 'no-referrer');
+  assert.equal(downloads[1].options.signal, downloads[0].options.signal);
+  assert.equal(downloads[1].options.signal.aborted, true);
+  assert.deepEqual(h.calls.map(call => call.url), [sessionURL, libraryURL, libraryURL, sessionURL]);
+  assert.ok(!JSON.stringify(result).includes('synthetic-private'));
+  // This mock verifies our fetch options, not the browser's implementation of
+  // Fetch-standard Authorization stripping on the internal cross-origin hop.
+});
+
+test('Library follow validates the final HTTPS destination before reading its body', async t => {
+  for (const url of [undefined, '', 'http://sdmntprtest.oaiusercontent.com/a.png', 'https://attacker.example/a.png',
+    'https://user:secret@sdmntprtest.oaiusercontent.com/a.png', 'https://chatgpt.com/login',
+    'https://chatgpt.com/api/library/files/libfile_other/download']) {
+    await t.test(String(url), async () => {
+      let reads = 0;
+      const h = harness({ serve: (_, options) => options.redirect === 'manual' ? { type: 'opaqueredirect' } : {
+        type: 'cors', url, ok: true, status: 200, headers: new Headers({ 'content-type': 'image/png' }),
+        get body() { reads++; return null; },
+      } });
+      const result = await h.run();
+      assert.equal(result.error.code, 'ASSET_URL'); assert.equal(reads, 0); assert.equal(result.binary, undefined);
+      assert.ok(!JSON.stringify(result).includes('secret'));
+    });
+  }
+});
+
+test('captured URLs, queried Library URLs and anonymous CDN requests never opt into native follow', async t => {
+  for (const url of [libraryURL, `${libraryURL}?download=true`, `${libraryURL}#download`,
+    'https://chatgpt.com/backend-api/files/file_testA/download', 'https://sdmntprtest.oaiusercontent.com/a.png',
+    'blob:https://chatgpt.com/1111-2222']) {
+    await t.test(url, async () => {
+      const h = harness({ serve: () => ({ type: 'opaqueredirect' }) });
+      const result = await h.run({ asset: { ...asset, retrievalURL: url }, allowLibraryDownload: false });
+      assert.equal(result.error.code, 'ASSET_REDIRECT');
+      assert.equal(h.calls.some(call => call.options.redirect === 'follow'), false);
+    });
+  }
+  const cdn = 'https://sdmntprtest.oaiusercontent.com/a.png';
+  const h = harness({ serve: url => url === libraryURL ? jsonResponse({ download_url: cdn }) : { type: 'opaqueredirect' } });
+  assert.equal((await h.run()).error.code, 'ASSET_REDIRECT');
+  assert.equal(h.calls.some(call => call.options.redirect === 'follow'), false);
+});
+
+test('Library follow retains HTTP, HTML, network and timeout failure classification without leaking response details', async t => {
+  for (const value of [
+    { name: 'HTTP failure', response: () => new Response('', { status: 403 }), code: 'HTTP_403' },
+    { name: 'login HTML', response: () => new Response('<html>login secret</html>', { headers: { 'content-type': 'text/html' } }), code: 'ASSET_FORMAT' },
+    { name: 'CORS failure', response: () => { throw new TypeError('signed-url-secret'); }, code: 'ASSET_NETWORK' },
+    { name: 'timeout', response: () => { throw Object.assign(new Error('signed-url-secret'), { name: 'AbortError' }); }, code: 'ASSET_TIMEOUT' },
+  ]) await t.test(value.name, async () => {
+    const h = harness({ serve: (_, options) => options.redirect === 'manual' ? { type: 'opaqueredirect' } : locatedResponse(value.response(), libraryURL) });
+    const result = await h.run();
+    assert.equal(result.error.code, value.code); assert.equal(result.binary, undefined);
+    assert.ok(!JSON.stringify(result).includes('secret'));
+  });
+});
+
+test('Library follow retains size, original-image and final account gates', async t => {
+  for (const value of [
+    { name: 'stream limit', maxBytes: 32, source: { fileId: asset.fileId, libraryFileId: asset.libraryFileId }, code: 'ASSET_TOO_LARGE' },
+    { name: 'declared limit', response: () => pngResponse(PNG, { 'content-length': '99999999' }), code: 'ASSET_TOO_LARGE' },
+    { name: 'wrong original size', source: { ...asset, size: PNG.length + 1 }, code: 'ASSET_VARIANT' },
+    { name: 'wrong original hash', source: { ...asset, expectedHash: '0'.repeat(64) }, code: 'ASSET_HASH_MISMATCH' },
+    { name: 'account switched', sessions: ['synthetic-user-A', 'synthetic-user-B'], code: 'ACCOUNT_CHANGED' },
+  ]) await t.test(value.name, async () => {
+    const h = harness({ sessions: value.sessions, serve: (_, options) => options.redirect === 'manual' ? { type: 'opaqueredirect' } :
+      locatedResponse((value.response || pngResponse)(), 'https://sdmntprtest.oaiusercontent.com/original.png') });
+    const result = await h.run({ asset: value.source || { ...asset }, maxBytes: value.maxBytes || 16 * 1024 * 1024 });
+    assert.equal(result.error.code, value.code); assert.equal(result.binary, undefined);
+  });
 });
 
 test('unsupported JSON structure is pending and not treated as image bytes', async () => {
