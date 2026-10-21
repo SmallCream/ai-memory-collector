@@ -98,6 +98,34 @@ function renderAssetFailures(diagnostics) {
     item.append(title, filename, explanation, metadata); list.append(item);
   }
 }
+function renderInternalAttachments(diagnostics, missing) {
+  const failures = Array.isArray(diagnostics?.internalFailures) ? diagnostics.internalFailures : [];
+  show('asset-internal', missing > 0);
+  text('asset-internal-heading', `内部附件未下载（${count(missing)}）`);
+  show('asset-internal-limit', missing > failures.length);
+  text('asset-internal-limit', `仅显示前 ${failures.length} 条记录，其余来源记录仍会保留。`);
+  const list = $('asset-internal-list');
+  list.replaceChildren();
+  for (const failure of failures) {
+    const item = document.createElement('li');
+    const title = document.createElement('strong');
+    title.textContent = assetLabel(failure.conversationTitle, '未命名对话');
+    const filename = document.createElement('p');
+    filename.textContent = assetLabel(failure.fileName, '未命名内部附件');
+    const explanation = document.createElement('p');
+    explanation.textContent = '工具内部看图附件（container.open_image），尚未取得原始图片。';
+    const metadata = document.createElement('p'); metadata.classList.add('muted');
+    metadata.textContent = `${assetFailureCode(failure.code)} · 已尝试 ${count(failure.attempt)} 次 · 已停止自动重试`;
+    item.append(title, filename, explanation, metadata);
+    if (failure.messageId || failure.fileId) {
+      const source = document.createElement('p'); source.classList.add('muted');
+      source.textContent = [failure.messageId ? `消息：${assetLabel(failure.messageId, '')}` : '',
+        failure.fileId ? `文件：${assetLabel(failure.fileId, '')}` : ''].filter(Boolean).join(' · ');
+      item.append(source);
+    }
+    list.append(item);
+  }
+}
 function jobError(job) { return job?.error?.message || (typeof job?.error === 'string' ? job.error : ''); }
 function describeGithub(value, enabled) {
   if (!enabled) return '未启用';
@@ -218,6 +246,7 @@ function render() {
   const diagnostics = current.assetDiagnostics;
   const pendingImages = Number(diagnostics?.pending ?? assets.pendingCapture) || 0;
   const failedImages = Number(diagnostics?.failed ?? assets.failed) || 0;
+  const internalMissing = Number(diagnostics?.internalMissing ?? assets.internalMissing) || 0;
   const assetParts = [];
   if (Number(assets.local) > 0) assetParts.push(`本地图片 ${count(assets.local)}`);
   if (Number(assets.uploaded) > 0) assetParts.push(`已上传 ${count(assets.uploaded)}`);
@@ -226,8 +255,10 @@ function render() {
   if (pendingImages > 0) assetParts.push(`${diagnostics ? '待处理' : '待采集'} ${count(pendingImages)}${failedImages > 0 ? `（其中失败 ${count(failedImages)}）` : ''}`);
   else if (failedImages > 0) assetParts.push(`待处理失败 ${count(failedImages)}`);
   if (Number(assets.pendingUpload) > 0) assetParts.push(`待上传 ${count(assets.pendingUpload)}`);
+  if (internalMissing > 0) assetParts.push(`内部附件未下载 ${count(internalMissing)}`);
   text('asset-summary-text', assetParts.join(' · ')); show('asset-summary', assetParts.length > 0);
   renderAssetFailures(diagnostics);
+  renderInternalAttachments(diagnostics, internalMissing);
   show('retry-images', failedImages > 0);
   show('image-retry-note', failedImages > 0);
   const imagePermissionNeeded = assets.needsPermission || current.githubStatus?.needsPermission ||
@@ -289,6 +320,8 @@ function render() {
   $('full-capture').disabled = busy || !account?.enabled || !granted;
   $('resume-capture').disabled = busy || !account?.enabled || !granted;
   $('retry-images').disabled = busy || failedImages <= 0 || !account?.enabled || !granted || !hasIdentity ||
+    account.accountKey !== identity.accountKey || !Number.isSafeInteger(current.tabId) || current.tabId < 0;
+  $('retry-internal-images').disabled = busy || internalMissing <= 0 || !account?.enabled || !granted || !hasIdentity ||
     account.accountKey !== identity.accountKey || !Number.isSafeInteger(current.tabId) || current.tabId < 0;
   $('restore-github').disabled = busy || !restoreReady || restoreRunning;
   $('restore-retry').disabled = busy || !restoreReady || restoreRunning;
@@ -398,6 +431,7 @@ action('full-capture', () => send('collector:start', { mode: 'full' }));
 action('pause-capture', () => send('collector:pause'));
 action('resume-capture', () => send('collector:resume'));
 action('retry-images', () => send('collector:retry-images'));
+action('retry-internal-images', () => send('collector:retry-images', { includeInternal: true }));
 action('retry-github', async () => { await grantGithub(current?.config?.github?.lfsEnabled !== false); await send('collector:retry-github'); });
 action('grant-github-images', async () => { await grantGithub(true); await send('collector:retry-github'); });
 for (const id of ['open-restore', 'wizard-open-restore']) action(id, () => { screen = 'settings'; settingsLoaded = false; });

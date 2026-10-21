@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildArchive } from '../extension/lib/archive.js';
+import { extractAssets } from '../extension/lib/assets.js';
 import { createArchiveStore, readAccountManifest, accountPrefix } from '../extension/lib/archive-store.js';
 
 const account = { platform: 'chatgpt', accountKey: 'acct-0123456789abcdef01234567', alias: 'demo', storageKey: 'demo-01234567' };
@@ -88,6 +89,38 @@ test('restoring an older derivative cannot erase downloaded assets from the iden
   assert.equal(restored.entry.assets[0].status, 'downloaded');
   assert.equal(restored.entry.assets[0].oid, oid);
   assert.equal(restored.entry.markdownHash, local.entry.markdownHash);
+});
+
+test('restore preserves local internal-viewer 404 suspension against an older same-native derivative', async () => {
+  const fs = setup(), source = detail('internal-picture');
+  source.payload.mapping.reply.message = { id: 'viewer', author: { role: 'tool', name: 'container.open_image' },
+    content: { content_type: 'execution_output', text: '<<ImageDisplayed>>' },
+    metadata: { attachments: [{ id: 'file_synthetic_viewer', name: 'synthetic.png', mime_type: 'image/png' }] } };
+  const [asset] = await extractAssets(source.payload);
+  const remote = await fs.store.saveConversation({ directory: fs.directory, account, detail: source, assets: [asset] });
+  await fs.store.saveConversation({ directory: fs.directory, account, detail: source,
+    assets: [{ ...asset, status: 'unavailable', errorCode: 'HTTP_404', autoRetrySuspended: true }] });
+  const restored = await fs.store.applyRemoteFiles({ directory: fs.directory, account, files: remote.files });
+  assert.equal(restored.entry.assets[0].capturePolicy, 'internal-viewer');
+  assert.equal(restored.entry.assets[0].autoRetrySuspended, true);
+  assert.equal(restored.entry.assets[0].errorCode, 'HTTP_404');
+  assert.equal(fs.files.get(restored.entry.jsonPath), remote.files.find(file => file.path === remote.entry.jsonPath).content);
+  assert.equal(restored.entry.assets[0].localPath, undefined);
+  const another = setup();
+  const imported = await another.store.applyRemoteFiles({ directory: another.directory, account, files: restored.files });
+  assert.equal(imported.entry.assets[0].autoRetrySuspended, true);
+});
+
+test('restore rederives capture policy and rejects a forged suspension for a visible image', async () => {
+  const fs = setup(), source = detail('visible-picture', '![Picture](sediment://file_synthetic_visible)');
+  const [asset] = await extractAssets(source.payload);
+  const remote = await fs.store.saveConversation({ directory: fs.directory, account, detail: source,
+    assets: [{ ...asset, capturePolicy: 'internal-viewer', autoRetrySuspended: true, errorCode: 'HTTP_404' }] });
+  const target = setup();
+  const restored = await target.store.applyRemoteFiles({ directory: target.directory, account, files: remote.files });
+  assert.equal(restored.entry.assets[0].capturePolicy, undefined);
+  assert.equal(restored.entry.assets[0].autoRetrySuspended, undefined);
+  assert.equal(restored.entry.assets[0].status, 'pending');
 });
 
 test('multiple conversations share one directory, stable filenames update, identical content does not rewrite', async () => {

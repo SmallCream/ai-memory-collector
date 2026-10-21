@@ -135,15 +135,23 @@ export async function extractAssets(conversation) {
       if (record(ref) && ref.type === 'file' && typeof ref.id === 'string' && /^file[-_][A-Za-z0-9_-]{1,160}$/.test(ref.id) &&
           typeof ref.library_file_id === 'string' && /^libfile_[A-Za-z0-9_-]{1,160}$/.test(ref.library_file_id)) fileContentReferences.add(ref);
     }
-    walk(item.message, { messageId, path: `messages/${messageId}`, kind: 'attachment', prose: false, attachment: false });
+    const internalViewer = item.message.author?.role === 'tool' && item.message.author?.name === 'container.open_image' &&
+      item.message.content?.content_type === 'execution_output';
+    walk(item.message, { messageId, path: `messages/${messageId}`, kind: 'attachment', prose: false, attachment: false,
+      internalAttachmentRoot: internalViewer ? `messages/${messageId}/metadata/attachments/` : null });
   }
-  const result = new Map();
+  const result = new Map(), internalOnly = new Map();
   for (const candidate of candidates) {
     const classified = classifyAssetReference(candidate.ref, candidate);
     if (classified.sourceType === 'embedded') classified.sourceRef = `embedded:sha256:${await sha256(classified.original)}`;
     const stable = classified.fileId ? `platform:file:${classified.fileId}` : classified.libraryFileId ? `platform:library:${classified.libraryFileId}` : `${classified.sourceType}:${classified.sourceRef}`;
     const id = await sha256(stable), occurrence = { messageId: candidate.messageId, path: candidate.path, kind: candidate.kind || 'attachment',
       ...(candidate.syntax ? { syntax: candidate.syntax } : {}), ...(candidate.attribute ? { attribute: candidate.attribute } : {}) };
+    // Only this known viewer's attachment results are internal. Filename,
+    // directory, HTTP status and other tool messages are not classification
+    // evidence. Any additional ordinary occurrence keeps capture mandatory.
+    internalOnly.set(id, internalOnly.get(id) !== false && Boolean(candidate.internalAttachmentRoot &&
+      candidate.path.startsWith(candidate.internalAttachmentRoot)));
     let asset = result.get(id);
     if (!asset) {
       asset = { id, sourceRef: classified.sourceRef, sourceType: classified.sourceType, status: 'pending',
@@ -173,7 +181,19 @@ export async function extractAssets(conversation) {
     if (!asset.references.includes(classified.sourceRef)) asset.references.push(classified.sourceRef);
     if (!asset.occurrences.some(item => item.messageId === occurrence.messageId && item.path === occurrence.path && item.kind === occurrence.kind)) asset.occurrences.push(occurrence);
   }
+  for (const asset of result.values()) if (internalOnly.get(asset.id)) asset.capturePolicy = 'internal-viewer';
   return [...result.values()];
+}
+
+/** Re-derive policy from freshly extracted native data, never persisted labels. */
+export function reconcileAssetCapturePolicy(asset, fresh) {
+  const result = { ...asset };
+  if (asset.retrieval) Object.defineProperty(result, 'retrieval', { value: asset.retrieval, enumerable: false, configurable: true });
+  if (fresh?.id === asset.id && fresh.capturePolicy === 'internal-viewer') result.capturePolicy = 'internal-viewer';
+  else delete result.capturePolicy;
+  if (result.capturePolicy !== 'internal-viewer' || result.errorCode !== 'HTTP_404' ||
+      READY.has(result.status) || result.status === 'external' || result.autoRetrySuspended !== true) delete result.autoRetrySuspended;
+  return result;
 }
 
 function safePath(path) {
@@ -193,6 +213,9 @@ export function sanitizeAssetRecords(records) {
     for (const key of ['fileId', 'libraryFileId', 'fileName', 'mimeType', 'messageId', 'kind', 'errorCode', 'quality']) {
       if (typeof asset[key] === 'string') item[key] = cleanName(asset[key]);
     }
+    if (asset.capturePolicy === 'internal-viewer') item.capturePolicy = 'internal-viewer';
+    if (item.capturePolicy === 'internal-viewer' && item.errorCode === 'HTTP_404' && asset.autoRetrySuspended === true &&
+        !READY.has(item.status) && item.status !== 'external') item.autoRetrySuspended = true;
     if (safePath(asset.localPath)) item.localPath = asset.localPath;
     if (typeof asset.sha256 === 'string' && /^[a-f0-9]{64}$/.test(asset.sha256)) item.sha256 = asset.sha256;
     if (typeof asset.oid === 'string' && /^(?:sha256:)?[a-f0-9]{64}$/.test(asset.oid)) item.oid = asset.oid;

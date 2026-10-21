@@ -309,3 +309,31 @@ test('destination changes during an upload cannot acknowledge data for the new r
   assert.equal((await f.service.engine.getOutbox(accountKey)).length, 1);
   assert.equal((await f.service.state(1)).githubStatus.error.code, 'GITHUB_TARGET_CHANGED');
 });
+
+test('internal attachment retry forwards only explicit true and keeps the active account scope', async () => {
+  const f = fixture({ config: { autoEnabled: false } }), retries = [];
+  f.dependencies.assetService = { retryFailed: async request => retries.push(request) };
+  f.service = createCollectorService(f.dependencies);
+  for (const includeInternal of [true, false, 'true']) {
+    await f.service.command({ type: 'collector:retry-images', includeInternal, account: { accountKey: 'foreign' } }, 1);
+  }
+  assert.equal(retries.length, 3);
+  assert(retries.every(request => request.account.accountKey === accountKey));
+  assert.deepEqual(retries.map(request => request.includeInternal), [true, undefined, undefined]);
+});
+
+test('internal attachment retry rejects missing permissions and switched or disabled accounts', async () => {
+  for (const kind of ['site', 'directory', 'disabled', 'switched']) {
+    const f = fixture(); let retried = false;
+    f.dependencies.assetService = { retryFailed: async () => { retried = true; } };
+    f.service = createCollectorService(f.dependencies); await f.service.state(1);
+    if (kind === 'site') f.permissions.delete(site);
+    if (kind === 'directory') f.root.granted = false;
+    if (kind === 'disabled') f.config().accounts[accountKey].enabled = false;
+    if (kind === 'switched') f.identities.set(1, { platform: 'chatgpt', accountKey: 'acct-' + 'b'.repeat(24), displayName: 'Other' });
+    await assert.rejects(f.service.command({ type: 'collector:retry-images', includeInternal: true }, 1), {
+      code: kind === 'site' ? 'SITE_PERMISSION_REQUIRED' : kind === 'directory' ? 'DIRECTORY_PERMISSION' : 'ACCOUNT_DISABLED',
+    });
+    assert.equal(retried, false);
+  }
+});

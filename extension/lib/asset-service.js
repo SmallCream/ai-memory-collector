@@ -1,5 +1,5 @@
 /** Persistent image work. Native conversations remain authoritative and unchanged. */
-import { extractAssets, sanitizeAssetRecords } from './assets.js';
+import { extractAssets, sanitizeAssetRecords, reconcileAssetCapturePolicy } from './assets.js';
 import { reconcileFileCitation } from './asset-reconciliation.js';
 import { validateExternalAsset } from './chatgpt-assets.js';
 import { assetPath, readLocalBytes, verifiedLocalAsset, writeLocalAsset, imageExtension, MAX_ASSET_BYTES } from './asset-store.js';
@@ -14,6 +14,9 @@ const uploadIdentity = asset => `${asset.localPath}:${asset.oid}:${asset.size}`;
 const enc = new TextDecoder('utf-8', { fatal: true });
 const text = bytes => enc.decode(bytes);
 const nativeId = native => native.conversation_id ?? native.id;
+const suspended = asset => asset?.autoRetrySuspended === true;
+const deliveryPending = task => task.pendingArchives?.length || task.priorArchives?.length;
+const activeTask = task => !suspended(task) || deliveryPending(task);
 const isImage = asset => asset.kind === 'image' || /^image\//i.test(asset.mimeType || '') || /\.(png|jpe?g|gif|webp|avif)$/i.test(asset.fileName || '');
 
 
@@ -29,20 +32,25 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
     const state = await jobs(account);
     let manifest;
     if (directory) { try { manifest = await readAccountManifest(directory, account); } catch { /* queue remains readable without directory access */ } }
-    const failures = state.tasks.filter(task => task.error);
-    return { total: state.tasks.length, pending: state.tasks.length, failed: failures.length,
-      failures: failures.slice(0, 200).map(task => {
-        const entry = manifest?.conversations?.[task.conversationId], asset = entry?.assets?.find(a => a.id === task.assetId);
-        return { conversationId: label(task.conversationId), assetId: label(task.assetId),
-          conversationTitle: label(entry?.title), fileName: label(asset?.fileName),
-          code: safeError(task.error).code, message: '图片处理未完成，请根据错误代码检查后重试。',
-          attempt: Number.isSafeInteger(task.attempt) && task.attempt >= 0 ? task.attempt : 0,
-          retryAt: Number.isFinite(task.retryAt) ? task.retryAt : 0 };
-      }) };
+    const failures = state.tasks.filter(task => activeTask(task) && task.error);
+    const internal = state.tasks.filter(suspended);
+    const describe = task => {
+      const entry = manifest?.conversations?.[task.conversationId], asset = entry?.assets?.find(a => a.id === task.assetId);
+      return { conversationId: label(task.conversationId), assetId: label(task.assetId),
+        conversationTitle: label(entry?.title), fileName: label(asset?.fileName),
+        messageId: label(asset?.messageId), fileId: label(asset?.fileId),
+        code: safeError(task.error).code, message: '图片处理未完成，请根据错误代码检查后重试。',
+        attempt: Number.isSafeInteger(task.attempt) && task.attempt >= 0 ? task.attempt : 0,
+        retryAt: Number.isFinite(task.retryAt) ? task.retryAt : 0 };
+    };
+    return { total: state.tasks.length, pending: state.tasks.filter(activeTask).length, failed: failures.length,
+      failures: failures.slice(0, 200).map(describe), internalMissing: internal.length,
+      internalFailures: internal.slice(0, 200).map(task => ({ ...describe(task), code: 'HTTP_404',
+        message: '内部附件未下载，自动重试已停止；原始来源和失败记录已保留。', retryAt: 0 })) };
   }
-  async function retryFailed({ account }) {
+  async function retryFailed({ account, includeInternal = false }) {
     const state = await jobs(account);
-    for (const task of state.tasks) if (task.error) {
+    for (const task of state.tasks) if (task.error && (includeInternal ? suspended(task) : !suspended(task))) {
       // Keep the last failure visible until the retry actually succeeds. A
       // manual request permits one attempt per failed task while scans are paused.
       task.retryAt = 0; task.manualRetry = true; task.refreshSource = true;
@@ -52,15 +60,16 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
   async function status(account, manifest) {
     const unique = new Map();
     for (const entry of Object.values(manifest?.conversations || {})) for (const asset of entry.assets || []) if (isImage(asset)) unique.set(asset.id, asset);
-    const result = { external: 0, pendingCapture: 0, local: 0, uploaded: 0, pendingUpload: 0, failed: 0 };
+    const result = { external: 0, pendingCapture: 0, local: 0, uploaded: 0, pendingUpload: 0, failed: 0, internalMissing: 0 };
     const managed = new Map();
     for (const asset of unique.values()) {
       if (asset.status === 'external') result.external++;
       else if (ready(asset)) managed.set(uploadIdentity(asset), asset);
+      else if (suspended(asset)) result.internalMissing++;
       else result.pendingCapture++;
     }
     result.local = managed.size;
-    result.failed = (await jobs(account)).tasks.filter(t => t.error).length;
+    result.failed = (await jobs(account)).tasks.filter(t => activeTask(t) && t.error).length;
     const receipts = await getSetting(receiptKey(account));
     const uploaded = new Set(receipts?.uploaded || []);
     result.uploaded = [...managed.keys()].filter(identity => uploaded.has(identity)).length;
@@ -82,17 +91,30 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
         // A manifest receipt alone does not prove the binary still exists.
         // Missing bytes return to capture; differing bytes remain a conflict.
         const present = await verifiedLocalAsset({ directory, account, asset: previous, getSetting });
-        assets.push(present ? { ...asset, ...previous, references: asset.references, occurrences: asset.occurrences } : asset);
-      } else assets.push(previous?.status === 'external' ?
-        { ...asset, ...previous, references: asset.references, occurrences: asset.occurrences } : asset);
+        assets.push(present ? reconcileAssetCapturePolicy({ ...asset, ...previous, references: asset.references, occurrences: asset.occurrences }, asset) : asset);
+      } else assets.push(previous?.status === 'external' || suspended(previous) ?
+        reconcileAssetCapturePolicy({ ...asset, ...previous, references: asset.references, occurrences: asset.occurrences }, asset) : asset);
     }
     const saved = await saveConversation({ ...input, assets });
     const state = await jobs(account);
     // A ready asset may still have a pending outbox acknowledgement after a
     // crash. A new source scan must not erase that durable delivery task.
     state.tasks = state.tasks.filter(t => t.conversationId !== id || t.pendingArchives?.length || t.priorArchives?.length || assets.some(a => a.id === t.assetId));
-    for (const asset of assets) if (isImage(asset) && !ready(asset) && asset.status !== 'external' && !state.tasks.some(t => t.conversationId === id && t.assetId === asset.id)) {
-      state.tasks.push({ conversationId: id, assetId: asset.id, attempt: 0, retryAt: 0 });
+    for (const asset of assets) if (isImage(asset)) {
+      let task = state.tasks.find(t => t.conversationId === id && t.assetId === asset.id);
+      if (ready(asset) || asset.status === 'external') {
+        if (task && suspended(task)) { delete task.autoRetrySuspended; delete task.error; task.retryAt = 0; }
+        continue;
+      }
+      if (!task) { task = { conversationId: id, assetId: asset.id, attempt: 0, retryAt: 0 }; state.tasks.push(task); }
+      if (suspended(asset)) {
+        task.autoRetrySuspended = true;
+        task.error ||= safeError(collectorError('HTTP_404', '内部附件未下载。'));
+      } else if (suspended(task)) {
+        // A new user/visible assistant reference makes capture required again.
+        delete task.autoRetrySuspended; delete task.error; task.retryAt = 0;
+      }
+      delete task.policyCheckedHash;
     }
     await setSetting(key(account), state);
     await status(account, saved.manifest);
@@ -117,16 +139,54 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
     }
     if (!(bytes instanceof Uint8Array) || !bytes.length || bytes.length > MAX_ASSET_BYTES) throw collectorError('ASSET_SIZE', '图片超过处理上限或没有数据。');
     const extension = imageExtension(bytes), oid = await hashBytes(bytes);
-    const managed = { ...asset, status: 'downloaded', oid, size: bytes.length, mimeType, quality,
-      localPath: assetPath(request.account, oid, extension) };
+    const managed = reconcileAssetCapturePolicy({ ...asset, status: 'downloaded', oid, size: bytes.length, mimeType, quality,
+      localPath: assetPath(request.account, oid, extension) }, asset);
+    delete managed.errorCode;
     await writeLocalAsset({ ...request, asset: managed, bytes, getSetting, setSetting });
     return managed;
   }
   async function tick({ directory, account, tabId, manualOnly = false }) {
-    const runnable = task => (!manualOnly || task.manualRetry === true) && (task.retryAt || 0) <= now();
-    const state = await jobs(account), task = state.tasks.find(runnable);
-    if (!task) return { pending: state.tasks.length, runnable: false };
-    let finalManifest;
+    const runnable = task => (!manualOnly || task.manualRetry === true || deliveryPending(task)) &&
+      (activeTask(task) || task.manualRetry === true) && (task.retryAt || 0) <= now();
+    const needsPolicyCheck = task => !manualOnly && !suspended(task) && !task.policyCheckedHash &&
+      task.error?.code === 'HTTP_404' && (!task.errorStage || task.errorStage === 'capture') && !deliveryPending(task);
+    const state = await jobs(account);
+    // Normal GitHub synchronization can apply a winning archive directly,
+    // without hydrateAssets/save. Recheck only changed suspended descriptors
+    // before excluding them from the scheduler. Pending receipts drain first.
+    if (state.tasks.some(task => suspended(task) && !deliveryPending(task))) {
+      let manifest;
+      try { manifest = await readAccountManifest(directory, account); } catch { /* ordinary tasks report directory errors below */ }
+      let changed = false;
+      const verified = new Map();
+      for (const task of state.tasks) {
+        if (!suspended(task) || deliveryPending(task)) continue;
+        const entry = manifest?.conversations?.[task.conversationId], asset = entry?.assets?.find(item => item.id === task.assetId);
+        if (!entry || !asset || (task.policyCheckedHash === entry.contentHash && suspended(asset) && !ready(asset))) continue;
+        try {
+          let extracted = verified.get(task.conversationId);
+          if (!extracted) {
+            const nativeBytes = await readLocalBytes(directory, entry.jsonPath, 24 * 1024 * 1024);
+            if (!nativeBytes || await hashBytes(nativeBytes) !== entry.contentHash) throw collectorError('LOCAL_CONFLICT', '对话原始文件已变化，图片任务暂停以保护原文件。');
+            const native = JSON.parse(text(nativeBytes));
+            if (nativeId(native) !== task.conversationId) throw collectorError('INCOMPLETE_DETAIL', '图片来源对话不匹配。');
+            extracted = await extractAssets(native); verified.set(task.conversationId, extracted);
+          }
+          const current = reconcileAssetCapturePolicy(asset, extracted.find(item => item.id === asset.id));
+          task.policyCheckedHash = entry.contentHash;
+          if (!suspended(current)) { delete task.autoRetrySuspended; delete task.error; delete task.errorStage; task.retryAt = 0; }
+        } catch (error) {
+          // A source conflict is an actionable failure, not an internal 404.
+          delete task.autoRetrySuspended; task.error = safeError(error); task.errorStage = 'archive'; task.attempt++;
+          task.retryAt = now() + Math.min(60, 2 ** Math.min(task.attempt, 6)) * 60000;
+        }
+        changed = true;
+      }
+      if (changed) await setSetting(key(account), state);
+    }
+    const task = state.tasks.find(t => runnable(t) || needsPolicyCheck(t));
+    if (!task) return { pending: state.tasks.filter(activeTask).length, runnable: false };
+    let finalManifest, retainTask = false, operationStage = 'archive';
     try {
       const manifest = await readAccountManifest(directory, account), entry = manifest?.conversations?.[task.conversationId];
       finalManifest = manifest;
@@ -135,10 +195,19 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
         const nativeBytes = await readLocalBytes(directory, entry.jsonPath, 24 * 1024 * 1024);
         if (!nativeBytes || await hashBytes(nativeBytes) !== entry.contentHash) throw collectorError('LOCAL_CONFLICT', '对话原始文件已变化，图片任务暂停以保护原文件。');
         const native = JSON.parse(text(nativeBytes));
+        if (nativeId(native) !== task.conversationId) throw collectorError('INCOMPLETE_DETAIL', '图片来源对话不匹配，保留已有记录等待检查。');
         const original = asset;
         const reconciliation = await reconcileFileCitation(asset, entry.assets, await extractAssets(native));
         asset = reconciliation.asset;
         let fresh = reconciliation.fresh;
+        asset = reconcileAssetCapturePolicy(asset, fresh);
+        const migrate404 = !task.manualRetry && !task.policyCheckedHash && !ready(asset) && asset.status !== 'external' &&
+          asset.capturePolicy === 'internal-viewer' && task.error?.code === 'HTTP_404' && (!task.errorStage || task.errorStage === 'capture');
+        task.policyCheckedHash = entry.contentHash;
+        if (!runnable(task) && !migrate404) {
+          await setSetting(key(account), state);
+          return { pending: state.tasks.filter(activeTask).length, runnable: state.tasks.some(t => runnable(t) || needsPolicyCheck(t)) };
+        }
         if (reconciliation.retired.length && nativeId(native) !== task.conversationId) {
           throw collectorError('INCOMPLETE_DETAIL', '图片来源对话不匹配，保留已有记录等待检查。');
         }
@@ -148,25 +217,59 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
           asset = { ...asset, status: 'pending', sha256: asset.oid };
           delete asset.oid; delete asset.localPath; delete asset.size;
         }
+        const wasSuspended = suspended(asset) || suspended(task);
+        let sourceFailure;
         let retrieval = ephemeral.get(`${account.accountKey}:${task.conversationId}:${asset.id}`) || fresh?.retrieval;
-        if (!ready(original) && original.status !== 'external' && refreshConversation && (task.refreshSource || task.error)) {
-          const detail = await refreshConversation({ tabId, accountKey: account.accountKey, conversationId: task.conversationId });
-          if (detail?.identity?.accountKey !== account.accountKey) throw collectorError('ACCOUNT_CHANGED', '图片详情所属账号不匹配。');
-          if (nativeId(detail?.payload || {}) !== task.conversationId || detail.completeness !== 'complete') {
-            throw collectorError('INCOMPLETE_DETAIL', '图片来源详情未完整确认，原归档保持不变。');
+        if (!migrate404 && !(suspended(asset) && !task.manualRetry) && !ready(original) && original.status !== 'external' && refreshConversation && (task.refreshSource || task.error)) {
+          operationStage = 'source';
+          try {
+            const detail = await refreshConversation({ tabId, accountKey: account.accountKey, conversationId: task.conversationId });
+            if (detail?.identity?.accountKey !== account.accountKey) throw collectorError('ACCOUNT_CHANGED', '图片详情所属账号不匹配。');
+            if (nativeId(detail?.payload || {}) !== task.conversationId || detail.completeness !== 'complete') {
+              throw collectorError('INCOMPLETE_DETAIL', '图片来源详情未完整确认，原归档保持不变。');
+            }
+            const online = (await extractAssets(detail.payload)).find(a => a.id === asset.id);
+            if (!online) throw collectorError('ASSET_SOURCE_MISSING', '最新详情中未找到这张图片，保留已有记录等待检查。');
+            // Live references may promote an attachment to normal capture. They
+            // cannot weaken the source classification from the archived JSON.
+            if (online.capturePolicy !== 'internal-viewer') asset = reconcileAssetCapturePolicy(asset, online);
+            fresh = online; retrieval = online.retrieval;
+            if (retrieval) ephemeral.set(`${account.accountKey}:${task.conversationId}:${asset.id}`, retrieval);
+          } catch (error) {
+            if (!wasSuspended) throw error;
+            sourceFailure = error;
           }
-          const online = (await extractAssets(detail.payload)).find(a => a.id === asset.id);
-          if (!online) throw collectorError('ASSET_SOURCE_MISSING', '最新详情中未找到这张图片，保留已有记录等待检查。');
-          fresh = online; retrieval = online.retrieval;
-          if (retrieval) ephemeral.set(`${account.accountKey}:${task.conversationId}:${asset.id}`, retrieval);
         }
         // Re-enqueue a saved derivative if the worker stopped after filesystem
         // commit but before its outbox checkpoint. Capturing the bytes again is unnecessary.
         // A newly resolved Library ID is a location hint. Keep original byte
         // size/dimension/hash constraints and message anchors from the archive.
-        const completed = ready(asset) || asset.status === 'external' ? asset : await capture({ ...fresh, ...asset,
-          ...(fresh?.libraryFileId ? { libraryFileId: fresh.libraryFileId } : {}), retrieval },
-        { directory, account, tabId, conversationId: task.conversationId });
+        operationStage = 'capture';
+        let completed;
+        if (migrate404 || (suspended(asset) && !task.manualRetry)) {
+          completed = reconcileAssetCapturePolicy({ ...asset, status: 'unavailable', errorCode: 'HTTP_404', autoRetrySuspended: true }, fresh);
+          retainTask = true;
+        } else {
+          const requestAsset = { ...fresh, ...asset,
+            ...(fresh?.libraryFileId ? { libraryFileId: fresh.libraryFileId } : {}), retrieval };
+          delete requestAsset.autoRetrySuspended;
+          try {
+            if (sourceFailure) throw sourceFailure;
+            completed = ready(asset) || asset.status === 'external' ? asset : await capture(requestAsset,
+              { directory, account, tabId, conversationId: task.conversationId });
+            delete task.autoRetrySuspended;
+          } catch (error) {
+            const failure = safeError(error);
+            if (!wasSuspended && (asset.capturePolicy !== 'internal-viewer' || failure.code !== 'HTTP_404')) throw error;
+            completed = reconcileAssetCapturePolicy({ ...asset, status: 'unavailable', errorCode: failure.code,
+              autoRetrySuspended: !sourceFailure && asset.capturePolicy === 'internal-viewer' && failure.code === 'HTTP_404' }, fresh);
+            task.attempt++; task.error = failure; task.errorStage = sourceFailure ? 'source' : 'capture';
+            task.retryAt = now() + Math.min(60, 2 ** Math.min(task.attempt, 6)) * 60000;
+            delete task.autoRetrySuspended;
+            retainTask = true;
+          }
+        }
+        operationStage = 'archive';
         const duplicates = state.tasks.filter(other => other !== task && other.conversationId === task.conversationId &&
           (other.assetId === asset.id || reconciliation.retired.includes(other.assetId)));
         if (task.assetId !== asset.id || duplicates.length) {
@@ -188,6 +291,12 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
         const { recovered, ...current } = saved;
         // Preserve older durable receipts and deliver them first; the corrected
         // manifest must be the last archive for this image.
+        if (suspended(completed)) {
+          task.autoRetrySuspended = true;
+          task.error = safeError(collectorError('HTTP_404', '内部附件未下载。')); task.errorStage = 'capture'; task.retryAt = 0;
+        }
+        if (!ready(completed) && completed.status !== 'external') task.captureIncomplete = true;
+        else delete task.captureIncomplete;
         task.pendingArchives = [...(task.priorArchives || []),
           ...(recovered ? [recovered, current] : [current])];
         delete task.priorArchives;
@@ -208,10 +317,13 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
         task.pendingArchives.shift();
         await setSetting(key(account), state);
       }
-      state.tasks = state.tasks.filter(t => t !== task);
+      if (task.captureIncomplete && asset && !ready(asset) && asset.status !== 'external') retainTask = true;
+      if (suspended(task)) {
+        task.error = safeError(collectorError('HTTP_404', '内部附件未下载。')); task.errorStage = 'capture'; task.retryAt = 0;
+      } else if (!retainTask) state.tasks = state.tasks.filter(t => t !== task);
       finalManifest ||= manifest;
     } catch (error) {
-      task.attempt++; task.error = safeError(error);
+      task.attempt++; task.error = safeError(error); task.errorStage = operationStage;
       task.retryAt = now() + Math.min(60, 2 ** Math.min(task.attempt, 6)) * 60000;
     }
     delete task.manualRetry; delete task.refreshSource;
@@ -219,9 +331,9 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
     if (finalManifest) await status(account, finalManifest);
     else {
       const previous = await getSetting(`assetStatus:${account.accountKey}`) || {};
-      await setSetting(`assetStatus:${account.accountKey}`, { ...previous, failed: state.tasks.filter(t => t.error).length });
+      await setSetting(`assetStatus:${account.accountKey}`, { ...previous, failed: state.tasks.filter(t => activeTask(t) && t.error).length });
     }
-    return { pending: state.tasks.length, runnable: state.tasks.some(runnable) };
+    return { pending: state.tasks.filter(activeTask).length, runnable: state.tasks.some(t => runnable(t) || needsPolicyCheck(t)) };
   }
   async function prepareUploads({ directory, account, config, bundles }) {
     const records = new Map();
@@ -280,6 +392,38 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
   }
   async function acknowledgeUploads(account) { await setSetting(uploadKey(account), null); }
   async function hydrateAssets({ directory, account, entry, config, snapshot }) {
+    // Restoring an archive bypasses save(). Reconcile existing tasks as well as
+    // seeding missing ones: a remote ready/visible winner must release an old
+    // suspension. Keep any outstanding outbox receipts until delivery finishes.
+    const restoredJobs = await jobs(account);
+    if ((entry.assets || []).some(asset => isImage(asset) && suspended(asset)) ||
+        restoredJobs.tasks.some(task => task.conversationId === entry.conversationId && suspended(task))) {
+      const manifest = await readAccountManifest(directory, account);
+      const current = manifest?.conversations?.[entry.conversationId];
+      if (current) {
+        const nativeBytes = await readLocalBytes(directory, current.jsonPath, 24 * 1024 * 1024);
+        if (!nativeBytes || await hashBytes(nativeBytes) !== current.contentHash) throw collectorError('LOCAL_CONFLICT', '对话原始文件已变化，内部附件任务未恢复。');
+        const native = JSON.parse(text(nativeBytes));
+        if (nativeId(native) !== entry.conversationId) throw collectorError('INCOMPLETE_DETAIL', '内部附件来源对话不匹配。');
+        const extracted = await extractAssets(native);
+        const assets = (current.assets || []).map(old => reconcileAssetCapturePolicy(old, extracted.find(item => item.id === old.id)));
+        for (const task of restoredJobs.tasks) if (task.conversationId === entry.conversationId && suspended(task)) {
+          const asset = assets.find(item => item.id === task.assetId);
+          if (!suspended(asset)) {
+            delete task.autoRetrySuspended; delete task.error; task.retryAt = 0;
+          }
+        }
+        restoredJobs.tasks = restoredJobs.tasks.filter(task => task.conversationId !== entry.conversationId ||
+          deliveryPending(task) || assets.some(asset => asset.id === task.assetId));
+        for (const asset of assets) {
+          if (!isImage(asset) || !suspended(asset) || restoredJobs.tasks.some(task => task.conversationId === entry.conversationId && task.assetId === asset.id)) continue;
+          restoredJobs.tasks.push({ conversationId: entry.conversationId, assetId: asset.id, attempt: 0, retryAt: 0,
+            autoRetrySuspended: true, policyCheckedHash: current.contentHash, errorStage: 'capture',
+            error: safeError(collectorError('HTTP_404', '内部附件未下载。')) });
+        }
+        await setSetting(key(account), restoredJobs); await status(account, manifest);
+      }
+    }
     const assets = [...new Map((entry.assets || []).filter(ready).map(asset => [uploadIdentity(asset), asset])).values()];
     const checkpointKey = `assetHydration:${await hashBytes(new TextEncoder().encode(`${account.accountKey}:${entry.conversationId || assets.map(uploadIdentity).join('|')}`))}`;
     const signature = await hashBytes(new TextEncoder().encode(JSON.stringify({ repository: config.repository.toLowerCase(),

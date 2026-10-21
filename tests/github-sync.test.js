@@ -302,6 +302,67 @@ async function citedPictureBundles({ ambiguous = false, readyAlias = false } = {
     canonical, alias, ready };
 }
 
+async function internalViewerBundles({ visible = false } = {}) {
+  const initial = bundle('internal-viewer'), native = JSON.parse(initial.files[0].content);
+  native.mapping.viewer = { parent: 'a', message: { id: 'synthetic-viewer-message',
+    author: { role: 'tool', name: 'container.open_image' }, content: { content_type: 'execution_output', text: '<<ImageDisplayed>>' },
+    metadata: { attachments: [{ id: 'file_synthetic_viewer', name: 'mnt/data/synthetic.png', mime_type: 'image/png' }] } } };
+  native.current_node = 'viewer';
+  if (visible) native.mapping.a.message.content.parts.push({ content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_synthetic_viewer' });
+  const [asset] = await extractAssets(native);
+  const build = async assets => {
+    const built = await buildArchive({ conversation: native, identity: { accountKey: ACCOUNT, displayName: 'Demo' },
+      capturedAt: '2026-10-21T00:00:00Z', existingManifest: initial.manifest, productionPrefix: PREFIX, assets });
+    return { accountKey: ACCOUNT, files: built.files, manifest: built.manifest, entry: built.manifest.conversations['internal-viewer'] };
+  };
+  return { asset, build };
+}
+
+test('same native merge preserves a suspended internal 404 from either device and stays stable on replay', async () => {
+  const { asset, build } = await internalViewerBundles();
+  const stale = await build([asset]), suspended = await build([{ ...asset, status: 'unavailable',
+    autoRetrySuspended: true, errorCode: 'HTTP_404' }]);
+  for (const [local, remote] of [[stale, suspended], [suspended, stale]]) {
+    const server = gitServer({ initial: fileMap(remote) });
+    const result = await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+    const [merged] = JSON.parse(server.files()[MANIFEST]).conversations['internal-viewer'].assets;
+    assert.equal(merged.capturePolicy, 'internal-viewer');
+    assert.equal(merged.autoRetrySuspended, true);
+    assert.equal(merged.errorCode, 'HTTP_404');
+    assert.equal(result.remoteWinners[0].entry.assets[0].autoRetrySuspended, true);
+    assert.equal(server.files()[remote.entry.jsonPath], remote.files[0].content);
+    const replay = await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+    assert.equal(replay.status, 'unchanged');
+  }
+});
+
+test('same native merge clears an unsupported internal label when the image also occurs in the conversation', async () => {
+  const { asset, build } = await internalViewerBundles({ visible: true });
+  const normal = await build([asset]), mislabeled = await build([{ ...asset, capturePolicy: 'internal-viewer',
+    status: 'unavailable', autoRetrySuspended: true, errorCode: 'HTTP_404' }]);
+  const server = gitServer({ initial: fileMap(mislabeled) });
+  const result = await syncArchives({ config: CONFIG, bundles: [normal], fetchImpl: server.fetchImpl });
+  const [merged] = result.remoteWinners[0].entry.assets;
+  assert.equal(merged.capturePolicy, undefined);
+  assert.equal(merged.autoRetrySuspended, undefined);
+});
+
+test('same native merge keeps saved internal bytes over a suspended snapshot from either device', async () => {
+  const { asset, build } = await internalViewerBundles();
+  const savedAsset = { ...asset, status: 'downloaded', oid: IMAGE.oid, size: IMAGE.size, localPath: IMAGE.localPath };
+  const saved = await build([savedAsset]), suspended = await build([{ ...asset, status: 'unavailable',
+    autoRetrySuspended: true, errorCode: 'HTTP_404' }]);
+  for (const [local, remote] of [[saved, suspended], [suspended, saved]]) {
+    const server = gitServer({ initial: { ...fileMap(remote), [savedAsset.localPath]: formatLfsPointer(savedAsset), [ATTRIBUTES]: RULE } });
+    const result = await syncArchives({ config: CONFIG, bundles: [local],
+      assetPointers: local === saved ? [pointer(savedAsset)] : [], fetchImpl: server.fetchImpl });
+    const [merged] = result.remoteWinners[0].entry.assets;
+    assert.equal(merged.status, 'downloaded');
+    assert.equal(merged.oid, savedAsset.oid);
+    assert.equal(merged.autoRetrySuspended, undefined);
+  }
+});
+
 test('same native sync retires a proven remote file-citation duplicate, keeps ready bytes and stabilizes on replay', async () => {
   const { local, remote, canonical, alias, ready } = await citedPictureBundles();
   const server = gitServer({ initial: { ...fileMap(remote), [ready.localPath]: formatLfsPointer(ready), [ATTRIBUTES]: RULE } });

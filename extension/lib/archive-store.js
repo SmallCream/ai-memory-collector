@@ -1,4 +1,5 @@
 import { buildArchive } from './archive.js';
+import { extractAssets, reconcileAssetCapturePolicy } from './assets.js';
 import { getSetting, setSetting } from './storage.js';
 
 const MAX_FILE_BYTES = 24 * 1024 * 1024;
@@ -339,6 +340,9 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
     const capturedAt = sourceTime(entry.lastChangedAt) || sourceTime(entry.firstCapturedAt) || new Date().toISOString();
     const localManifest = await readAccountManifest(directory, account);
     const localEntry = localManifest?.conversations?.[entry.conversationId];
+    // Only the hash-verified native conversation decides whether an attachment
+    // belongs exclusively to the internal viewer. Remote descriptors are hints.
+    const extracted = new Map((await extractAssets(native)).map(asset => [asset.id, asset]));
     let assets = entry.assets;
     if (localEntry?.contentHash === entry.contentHash && Array.isArray(localEntry.assets)) {
       const merged = new Map((entry.assets || []).map(asset => [asset.id, asset]));
@@ -346,9 +350,14 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
         const remote = merged.get(asset.id);
         if (!remote || (asset.status === 'downloaded' && remote.status !== 'downloaded') ||
             (asset.status === 'external' && remote.status === 'pending')) merged.set(asset.id, asset);
+        else if (reconcileAssetCapturePolicy(asset, extracted.get(asset.id)).autoRetrySuspended &&
+            !['downloaded', 'ready', 'local', 'synced', 'external'].includes(remote.status)) {
+          merged.set(asset.id, { ...remote, errorCode: 'HTTP_404', autoRetrySuspended: true });
+        }
       }
       assets = [...merged.values()];
     }
+    if (Array.isArray(assets)) assets = assets.map(asset => reconcileAssetCapturePolicy(asset, extracted.get(asset.id)));
     const result = await saveConversation({ directory, account, preferredEntry: entry, assets, detail: {
       identity: { accountKey: account.accountKey, displayName: account.displayName || remoteAccount.displayName || account.alias },
       payload: native, capturedAt, completeness: entry.sourceCompleteness === 'complete' ? 'complete' : 'unknown',

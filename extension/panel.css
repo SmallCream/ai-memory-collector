@@ -4,3 +4,5 @@
 .restore-progress{margin-top:16px;padding:14px;background:var(--soft);border-radius:10px;overflow-wrap:anywhere}.restore-progress .progress-heading{flex-wrap:wrap}.destinations #asset-summary{align-items:flex-start}.destinations #asset-summary-text{line-height:1.7}
 
 .asset-failures{padding:8px 0 12px;border-top:1px solid var(--line);overflow-wrap:anywhere}.asset-failures summary{cursor:pointer;color:var(--brand);padding:4px 0}.asset-failures summary:focus-visible{outline:2px solid var(--brand);outline-offset:3px}.asset-failures ol{padding-left:20px;margin:8px 0 0;max-height:320px;overflow:auto}.asset-failures li{padding:10px 0}.asset-failures li+li{border-top:1px solid var(--line)}.asset-failures li strong{display:block;text-align:left;font-weight:600}.asset-failures li p{margin-top:4px}
+
+.asset-internal summary{color:var(--muted)}

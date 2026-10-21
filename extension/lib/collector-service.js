@@ -374,7 +374,7 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
         const { account } = await context(tabId, true);
         if (!account?.enabled) throw collectorError('ACCOUNT_DISABLED', '请先启用当前账号。');
         if (!(await directoryState()).granted) throw collectorError('DIRECTORY_PERMISSION', '请在设置中恢复保存目录权限。');
-        await assetService.retryFailed({ account }); continueSoon(); break;
+        await assetService.retryFailed({ account, ...(message.includeInternal === true ? { includeInternal: true } : {}) }); continueSoon(); break;
       }
       case 'collector:start': {
         const { account, tab, config } = await context(tabId, true);

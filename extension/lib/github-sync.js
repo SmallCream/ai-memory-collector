@@ -2,7 +2,7 @@
 import { buildArchive } from './archive.js';
 import { createGitHubClient, inspectGitHubRepository, commitProbe, GitHubProbeError } from './github.js';
 import { formatLfsPointer } from './lfs.js';
-import { extractAssets } from './assets.js';
+import { extractAssets, reconcileAssetCapturePolicy } from './assets.js';
 import { reconcileFileCitation } from './asset-reconciliation.js';
 
 const MAX_BYTES = 32 * 1024 * 1024;
@@ -87,6 +87,13 @@ async function mergeSameNativeAssets(localEntry, remoteEntry, prefix, native) {
     // A stable source resource already saved remotely must not become pending again.
     const preferred = !localAsset || READY_ASSETS.has(remoteAsset.status) || !READY_ASSETS.has(localAsset.status) ? remoteAsset : localAsset;
     const merged = { ...preferred };
+    // A stale pending snapshot must not erase the other device's explicit
+    // missing-internal-attachment result. Native evidence is checked below.
+    if ([localAsset, remoteAsset].some(asset => asset?.capturePolicy === 'internal-viewer' &&
+        asset.autoRetrySuspended === true && asset.errorCode === 'HTTP_404')) {
+      merged.autoRetrySuspended = true;
+      if (!READY_ASSETS.has(merged.status) && merged.status !== 'external') merged.errorCode = 'HTTP_404';
+    }
     for (const field of ['references', 'occurrences']) if (Array.isArray(localAsset?.[field]) || Array.isArray(remoteAsset[field])) {
       merged[field] = [...new Map([localAsset, remoteAsset].flatMap(item => Array.isArray(item?.[field]) ? item[field] : []).map(value =>
         [typeof value === 'string' ? value : JSON.stringify(value), value])).values()];
@@ -103,7 +110,8 @@ async function mergeSameNativeAssets(localEntry, remoteEntry, prefix, native) {
     result.set(reconciled.asset.id, reconciled.asset);
     for (const id of reconciled.retired) result.delete(id);
   }
-  return [...result.values()];
+  const freshById = new Map(extracted.map(asset => [asset.id, asset]));
+  return [...result.values()].map(asset => reconcileAssetCapturePolicy(asset, freshById.get(asset.id)));
 }
 function validateManifest(value, prefix, accountKey, platform) {
   if (!record(value) || value.schemaVersion !== 1 || value.accountKey !== accountKey || value.platform !== platform || !record(value.conversations)) {

@@ -394,3 +394,70 @@ test('capped image diagnostics show that only the first 200 failures are listed'
   assert.equal(app.elements.get('asset-failures-limit').textContent, '仅显示前 200 条失败记录，其余任务仍会保留。');
   assert.equal(app.elements.get('asset-summary-text').textContent, '待处理 250（其中失败 250）');
 });
+
+test('internal viewer attachments remain visibly undownloaded outside ordinary failure counts', async () => {
+  const state = initialState();
+  state.assetStatus = { local: 12, uploaded: 4, pendingUpload: 8, failed: 1, pendingCapture: 1 };
+  state.assetDiagnostics = { total: 1, pending: 0, failed: 0, failures: [], internalMissing: 1, internalFailures: [
+    { conversationTitle: '看图对话', fileName: 'internal-image.png', messageId: 'tool-message', fileId: 'file_demo', code: 'HTTP_404', attempt: 6, retryAt: Date.now() },
+  ] };
+  const app = await setup({ state });
+  assert.equal(app.elements.get('asset-summary-text').textContent, '本地图片 12 · 已上传 4 · 待上传 8 · 内部附件未下载 1');
+  assert.equal(app.elements.get('asset-failures').hidden, true);
+  assert.equal(app.elements.get('retry-images').hidden, true);
+  assert.equal(app.elements.get('asset-internal').hidden, false);
+  assert.equal(app.elements.get('asset-internal-heading').textContent, '内部附件未下载（1）');
+  const parts = app.elements.get('asset-internal-list').children[0].children.map(child => child.textContent);
+  assert.deepEqual(parts.slice(0, 2), ['看图对话', 'internal-image.png']);
+  assert.match(parts[2], /container.open_image.*尚未取得原始图片/);
+  assert.equal(parts[3], 'HTTP_404 · 已尝试 6 次 · 已停止自动重试');
+  assert.equal(parts[4], '消息：tool-message · 文件：file_demo');
+  assert(!parts.join('').includes('重试等待至'));
+  assert.match(html, /已停止自动重试；来源记录已保留/);
+});
+
+test('internal retry is an explicit account-scoped image action independent of normal failures', async () => {
+  const state = initialState(); state.job = { status: 'paused' };
+  state.assetDiagnostics = { total: 2, pending: 1, failed: 1, failures: [], internalMissing: 1, internalFailures: [] };
+  const app = await setup({ state, url: 'chrome-extension://test/panel.html?tab=22' });
+  assert.equal(app.elements.get('retry-internal-images').disabled, false);
+  await app.click('retry-images'); await app.click('retry-internal-images');
+  assert.deepEqual(app.messages.filter(message => message.type === 'collector:retry-images'), [
+    { type: 'collector:retry-images', tabId: 22 },
+    { type: 'collector:retry-images', tabId: 22, includeInternal: true },
+  ]);
+  assert(!app.messages.some(message => ['collector:start', 'collector:resume'].includes(message.type)));
+});
+
+test('internal retry requires matching enabled account, directory access and source tab', async () => {
+  for (const change of [
+    state => { state.account.enabled = false; }, state => { state.account = null; },
+    state => { state.identity = null; }, state => { state.identity.accountKey = 'other'; },
+    state => { state.directory.granted = false; }, state => { state.tabId = null; },
+  ]) {
+    const state = initialState(); state.assetDiagnostics = { internalMissing: 1, internalFailures: [] }; change(state);
+    const app = await setup({ state });
+    assert.equal(app.elements.get('retry-internal-images').disabled, true);
+    await app.click('retry-internal-images');
+    assert(!app.messages.some(message => message.type === 'collector:retry-images'));
+  }
+});
+
+test('internal attachment diagnostics sanitize source labels and clear after successful retry', async () => {
+  const state = initialState();
+  state.assetDiagnostics = { internalMissing: 250, internalFailures: [
+    { conversationTitle: '<script>unsafe</script>', fileName: 'https://example.com/?sig=private',
+      messageId: 'Bearer private', fileId: 'ghp_private', message: 'raw private response', code: 'HTTP_404', attempt: 1 },
+  ] };
+  const app = await setup({ state });
+  const parts = app.elements.get('asset-internal-list').children[0].children.map(child => child.textContent);
+  assert.equal(parts[0], '<script>unsafe</script>');
+  assert(!parts.join('').includes('private'));
+  assert.equal(app.elements.get('asset-internal-limit').hidden, false);
+  assert.equal(app.elements.get('asset-internal-limit').textContent, '仅显示前 1 条记录，其余来源记录仍会保留。');
+  state.assetDiagnostics = { pending: 0, failed: 0, failures: [], internalMissing: 0, internalFailures: [] };
+  app.setState(state); app.poll(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.elements.get('asset-internal').hidden, true);
+  assert.equal(app.elements.get('asset-internal-list').children.length, 0);
+  assert.equal(app.elements.get('retry-internal-images').disabled, true);
+});

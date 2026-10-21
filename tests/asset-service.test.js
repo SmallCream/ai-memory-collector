@@ -587,3 +587,283 @@ test('one missing pointer cannot starve later good images and failures retain pe
   assert.deepEqual(await env.service.hydrateAssets({ ...input, snapshot: { ...snapshot(assets), commitSha: 'b'.repeat(40) } }),
     { downloaded: 1, pending: 0, failed: 0 });
 });
+
+function internalDetail() {
+  const value = detail(['Text is archived normally.']);
+  value.payload.current_node = 'viewer';
+  value.payload.mapping.viewer = { parent: 'reply', message: { id: 'message-viewer',
+    author: { role: 'tool', name: 'container.open_image' }, status: 'finished_successfully',
+    content: { content_type: 'execution_output', text: '<<ImageDisplayed>>' },
+    metadata: { attachments: [{ id: 'file_internal', name: '/mnt/data/internal.png', mime_type: 'image/png', size: PNG.length }] } } };
+  return value;
+}
+function failCapture(env, code) {
+  env.dependencies.resolveAsset = async input => {
+    env.captures.push(input);
+    throw Object.assign(new Error('https://example.invalid/?sig=private Bearer private'), { code });
+  };
+  env.restart();
+}
+
+test('internal viewer capture 404 preserves source, records missing bytes, and stops automatic retries across restarts', async () => {
+  const env = setup(), source = internalDetail(), saved = await env.save(source), original = env.fs.text(saved.entry.jsonPath);
+  failCapture(env, 'HTTP_404');
+  assert.deepEqual(await env.tick(), { pending: 0, runnable: false });
+  let entry = (await env.manifest()).conversations['conversation-one'], asset = entry.assets[0];
+  assert.equal(asset.status, 'unavailable'); assert.equal(asset.capturePolicy, 'internal-viewer');
+  assert.equal(asset.autoRetrySuspended, true); assert.equal(asset.errorCode, 'HTTP_404');
+  assert.equal(asset.fileId, 'file_internal'); assert.equal(asset.messageId, 'message-viewer');
+  assert.equal(asset.fileName, '/mnt/data/internal.png'); assert.equal(asset.oid, undefined); assert.equal(asset.localPath, undefined);
+  assert.equal(env.fs.text(entry.jsonPath), original); assert.equal(env.enqueued.length, 1);
+  assert.equal(env.enqueued[0].archive.entry.assets[0].autoRetrySuspended, true);
+  const diagnostic = await env.service.diagnostics({ directory: env.fs.directory, account });
+  assert.equal(diagnostic.pending, 0); assert.equal(diagnostic.failed, 0); assert.equal(diagnostic.internalMissing, 1);
+  assert.equal(diagnostic.internalFailures[0].fileId, 'file_internal'); assert.equal(diagnostic.internalFailures[0].messageId, 'message-viewer');
+  assert(!JSON.stringify(diagnostic).includes('private'));
+  const state = await env.fs.getSetting(`assetStatus:${account.accountKey}`);
+  assert.equal(state.pendingCapture, 0); assert.equal(state.internalMissing, 1); assert.equal(state.local, 0);
+  env.time(99_000_000); env.restart(); await env.tick(); await env.save(source); await env.tick();
+  assert.equal(env.captures.length, 1); assert.equal((await env.service.diagnostics({ account })).internalMissing, 1);
+});
+
+test('ordinary retries leave suspended internal attachments alone and explicit internal retry can download and upload real bytes', async () => {
+  const env = setup(); await env.save(internalDetail()); failCapture(env, 'HTTP_404'); await env.tick();
+  await env.service.retryFailed({ account }); await env.tick(); assert.equal(env.captures.length, 1);
+  await env.service.retryFailed({ account, includeInternal: true });
+  const manual = () => env.service.tick({ directory: env.fs.directory, account, tabId: 7, manualOnly: true });
+  await manual(); assert.equal(env.captures.length, 2); await manual(); assert.equal(env.captures.length, 2);
+  env.dependencies.resolveAsset = async input => { env.captures.push(input); return { bytes: PNG, mimeType: 'image/png', quality: 'original' }; };
+  env.restart(); await env.service.retryFailed({ account, includeInternal: true }); await manual();
+  const entry = (await env.manifest()).conversations['conversation-one'], asset = entry.assets[0];
+  assert.equal(asset.status, 'downloaded'); assert.equal(asset.autoRetrySuspended, undefined); assert.equal(asset.errorCode, undefined);
+  assert.deepEqual(env.fs.files.get(asset.localPath), PNG);
+  assert.equal((await env.fs.getSetting(`assetJobs:${account.accountKey}`)).tasks.length, 0);
+  const pointers = await env.service.prepareUploads({ directory: env.fs.directory, account, config, bundles: [env.enqueued.at(-1).archive] });
+  assert.equal(pointers.length, 1); assert.equal(env.uploads.length, 1); assert.deepEqual(env.uploads[0].bytes, PNG);
+});
+
+test('visible user or assistant images and unknown tool attachments never suspend capture after HTTP 404', async t => {
+  for (const kind of ['user', 'assistant', 'other-tool', 'shared-user']) await t.test(kind, async () => {
+    const env = setup(), source = internalDetail(), viewer = source.payload.mapping.viewer.message;
+    if (kind === 'user' || kind === 'assistant') viewer.author = { role: kind };
+    if (kind === 'other-tool') viewer.author.name = 'image_generator';
+    if (kind === 'shared-user') source.payload.mapping.reply.message.content = { content_type: 'multimodal_text', parts: [
+      { content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_internal' }] };
+    await env.save(source); failCapture(env, 'HTTP_404'); await env.tick();
+    const diagnostic = await env.service.diagnostics({ account });
+    assert.equal(diagnostic.internalMissing, 0); assert.equal(diagnostic.failed, 1);
+    assert.equal((await env.manifest()).conversations['conversation-one'].assets[0].autoRetrySuspended, undefined);
+    env.time(1_000_000); await env.tick(); assert.equal(env.captures.length, 2);
+  });
+});
+
+test('internal authentication, rate limit and network failures keep ordinary retry semantics', async t => {
+  for (const code of ['HTTP_401', 'HTTP_403', 'HTTP_429', 'NETWORK']) await t.test(code, async () => {
+    const env = setup(); await env.save(internalDetail()); failCapture(env, code); await env.tick();
+    const diagnostic = await env.service.diagnostics({ account });
+    assert.equal(diagnostic.internalMissing, 0); assert.equal(diagnostic.failed, 1);
+    env.time(1_000_000); await env.tick(); assert.equal(env.captures.length, 2);
+  });
+});
+
+test('a hash-verified legacy internal 404 migrates before backoff expires without a new network request', async () => {
+  const env = setup(), saved = await env.save(internalDetail()), original = env.fs.text(saved.entry.jsonPath);
+  const state = await env.fs.getSetting(`assetJobs:${account.accountKey}`);
+  Object.assign(state.tasks[0], { attempt: 6, retryAt: 99_000_000, error: { code: 'HTTP_404', message: 'old failure' } });
+  await env.fs.setSetting(`assetJobs:${account.accountKey}`, state);
+  let refreshes = 0; env.dependencies.refreshConversation = async () => { refreshes++; throw new Error('must not refresh'); }; env.restart();
+  await env.tick(); assert.equal(env.captures.length, 0); assert.equal(refreshes, 0);
+  assert.equal(env.fs.text(saved.entry.jsonPath), original);
+  const diagnostic = await env.service.diagnostics({ account });
+  assert.equal(diagnostic.internalMissing, 1); assert.equal(diagnostic.internalFailures[0].attempt, 6);
+});
+
+test('legacy 404 migration verifies native bytes and never trusts a forged manifest capture policy', async t => {
+  for (const kind of ['modified-native', 'normal-source']) await t.test(kind, async () => {
+    const env = setup(), saved = await env.save(kind === 'normal-source' ? detail() : internalDetail());
+    if (kind === 'modified-native') env.fs.put(saved.entry.jsonPath, '{"modified":true}');
+    else {
+      const manifest = await env.manifest(); manifest.conversations['conversation-one'].assets[0].capturePolicy = 'internal-viewer';
+      env.fs.put(`${saved.entry.jsonPath.split('/conversations/')[0]}/archive/manifest.json`, JSON.stringify(manifest));
+    }
+    const state = await env.fs.getSetting(`assetJobs:${account.accountKey}`);
+    Object.assign(state.tasks[0], { attempt: 3, retryAt: 99_000_000, error: { code: 'HTTP_404', message: 'old failure' } });
+    await env.fs.setSetting(`assetJobs:${account.accountKey}`, state); await env.tick();
+    assert.equal((await env.service.diagnostics({ account })).internalMissing, 0); assert.equal(env.captures.length, 0);
+    if (kind === 'modified-native') assert.equal((await env.service.diagnostics({ account })).failures[0].code, 'LOCAL_CONFLICT');
+  });
+});
+
+test('a rescan with a visible reference promotes a suspended internal attachment to ordinary capture', async () => {
+  const env = setup(), source = internalDetail(); await env.save(source); failCapture(env, 'HTTP_404'); await env.tick();
+  source.payload.mapping.reply.message.author.role = 'user';
+  source.payload.mapping.reply.message.content = { content_type: 'multimodal_text', parts: [
+    { content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_internal' }] };
+  await env.save(source);
+  assert.equal((await env.service.diagnostics({ account })).internalMissing, 0);
+  await env.tick(); assert.equal(env.captures.length, 2);
+  const asset = (await env.manifest()).conversations['conversation-one'].assets[0];
+  assert.equal(asset.capturePolicy, undefined); assert.equal(asset.autoRetrySuspended, undefined);
+  assert.equal((await env.service.diagnostics({ account })).failed, 1);
+});
+
+test('a suspended metadata archive resumes delivery while paused after an outbox failure and worker restart', async () => {
+  const env = setup(); await env.save(internalDetail()); failCapture(env, 'HTTP_404'); env.enqueueFailure(true);
+  await env.tick(); const jobKey = `assetJobs:${account.accountKey}`;
+  assert.equal((await env.fs.getSetting(jobKey)).tasks[0].pendingArchives.length, 1);
+  env.enqueueFailure(false); env.time(1_000_000); env.restart();
+  await env.service.tick({ directory: env.fs.directory, account, tabId: 7, manualOnly: true });
+  assert.equal(env.enqueued.length, 1); assert.equal(env.captures.length, 1);
+  const task = (await env.fs.getSetting(jobKey)).tasks[0]; assert.equal(task.autoRetrySuspended, true); assert.equal(task.pendingArchives.length, 0);
+  assert.equal((await env.service.diagnostics({ account })).pending, 0);
+});
+
+test('HTTP 404 from source refresh or archive delivery does not suspend an ordinary internal capture task', async t => {
+  for (const stage of ['refresh', 'delivery']) await t.test(stage, async () => {
+    const env = setup(); await env.save(internalDetail());
+    if (stage === 'refresh') {
+      env.resolveFailure(true); await env.tick(); env.resolveFailure(false);
+      env.dependencies.refreshConversation = async () => { throw Object.assign(new Error('missing conversation'), { code: 'HTTP_404' }); };
+      env.restart(); await env.service.retryFailed({ account });
+    } else {
+      env.dependencies.enqueueArchive = async () => { throw Object.assign(new Error('outbox unavailable'), { code: 'HTTP_404' }); }; env.restart();
+    }
+    await env.tick(); env.time(1_000_000); await env.tick();
+    assert.equal((await env.service.diagnostics({ account })).internalMissing, 0);
+    assert.equal((await env.service.diagnostics({ account })).failed, 1);
+  });
+});
+
+test('restore hydration recreates suspended manual retry jobs from verified native data and stays idempotent', async () => {
+  const env = setup(); await env.save(internalDetail()); failCapture(env, 'HTTP_404'); await env.tick();
+  const entry = (await env.manifest()).conversations['conversation-one'];
+  await env.fs.setSetting(`assetJobs:${account.accountKey}`, null); env.restart();
+  const input = { directory: env.fs.directory, account, entry, config, snapshot: { entries: [] } };
+  await env.service.hydrateAssets(input); await env.service.hydrateAssets(input);
+  assert.equal((await env.fs.getSetting(`assetJobs:${account.accountKey}`)).tasks.length, 1);
+  assert.equal((await env.service.diagnostics({ directory: env.fs.directory, account })).internalMissing, 1);
+  await env.tick(); assert.equal(env.captures.length, 1);
+  await env.service.retryFailed({ account, includeInternal: true }); await env.tick(); assert.equal(env.captures.length, 2);
+});
+
+test('a worker stop after writing suspended metadata recovers its outbox without downloading again', async () => {
+  const env = setup(); await env.save(internalDetail()); failCapture(env, 'HTTP_404');
+  const jobKey = `assetJobs:${account.accountKey}`; let interrupt = true;
+  env.dependencies.setSetting = async (key, value) => {
+    if (interrupt && key === jobKey && value?.tasks.some(task => task.pendingArchives?.length)) throw new Error('synthetic stop');
+    return env.fs.setSetting(key, value);
+  };
+  env.restart(); await assert.rejects(env.tick(), /synthetic stop/);
+  assert.equal((await env.manifest()).conversations['conversation-one'].assets[0].autoRetrySuspended, true);
+  interrupt = false; env.restart(); await env.tick();
+  assert.equal(env.captures.length, 1); assert.equal(env.enqueued.length, 1);
+  assert.equal((await env.service.diagnostics({ account })).internalMissing, 1);
+});
+
+test('manual retry source failures release stale suspension and persist the actual error for ordinary backoff', async t => {
+  for (const code of ['HTTP_401', 'HTTP_403', 'HTTP_404']) await t.test(code, async () => {
+    const env = setup(); await env.save(internalDetail()); failCapture(env, 'HTTP_404'); await env.tick();
+    let refreshes = 0;
+    env.dependencies.refreshConversation = async () => { refreshes++; throw Object.assign(new Error('source unavailable'), { code }); };
+    env.restart(); await env.service.retryFailed({ account, includeInternal: true }); await env.tick();
+    const diagnostic = await env.service.diagnostics({ account });
+    assert.equal(diagnostic.internalMissing, 0); assert.equal(diagnostic.failed, 1); assert.equal(diagnostic.failures[0].code, code);
+    const asset = (await env.manifest()).conversations['conversation-one'].assets[0];
+    assert.equal(asset.autoRetrySuspended, undefined); assert.equal(asset.errorCode, code);
+    env.time(9_000_000); await env.tick(); assert.equal(refreshes, 2);
+    assert.equal((await env.service.diagnostics({ account })).internalMissing, 0);
+  });
+});
+
+test('manual retry with a live visible reference persists promotion even when image download still returns 404', async () => {
+  const env = setup(); await env.save(internalDetail()); failCapture(env, 'HTTP_404'); await env.tick();
+  const online = internalDetail(); online.payload.mapping.viewer.message.author = { role: 'user' };
+  env.dependencies.refreshConversation = async () => online; env.restart();
+  await env.service.retryFailed({ account, includeInternal: true }); await env.tick();
+  assert.equal((await env.service.diagnostics({ account })).internalMissing, 0);
+  assert.equal((await env.manifest()).conversations['conversation-one'].assets[0].autoRetrySuspended, undefined);
+  env.time(9_000_000); await env.tick(); assert.equal(env.captures.length, 3);
+  assert.equal((await env.service.diagnostics({ account })).internalMissing, 0);
+});
+
+test('restore releases old suspended jobs when remote native makes the attachment visible', async () => {
+  const env = setup(); await env.save(internalDetail()); failCapture(env, 'HTTP_404'); await env.tick();
+  const source = internalDetail(); source.payload.mapping.viewer.message.author = { role: 'user' };
+  const saved = await env.store.saveConversation({ directory: env.fs.directory, account, detail: source, assets: await extractAssets(source.payload) });
+  await env.service.hydrateAssets({ directory: env.fs.directory, account, entry: saved.entry, config, snapshot: { entries: [] } });
+  assert.equal((await env.service.diagnostics({ account })).internalMissing, 0);
+  await env.tick(); assert.equal(env.captures.length, 2);
+  assert.equal((await env.service.diagnostics({ account })).failed, 1);
+});
+
+test('ready winners clear stale internal jobs during restore and rescan without another download', async t => {
+  for (const method of ['restore', 'rescan']) await t.test(method, async () => {
+    const env = setup(), source = internalDetail(); await env.save(source); failCapture(env, 'HTTP_404'); await env.tick();
+    const old = (await env.manifest()).conversations['conversation-one'].assets[0], oid = await hashBytes(PNG);
+    const asset = { ...old, status: 'downloaded', oid, size: PNG.length, localPath: assetPath(account, oid, 'png') };
+    delete asset.autoRetrySuspended; delete asset.errorCode; env.fs.put(asset.localPath, PNG);
+    const saved = await env.store.saveConversation({ directory: env.fs.directory, account, detail: source, assets: [asset] });
+    if (method === 'restore') await env.service.hydrateAssets({ directory: env.fs.directory, account, entry: saved.entry, config, snapshot: { entries: [] } });
+    else await env.save(source);
+    assert.equal((await env.service.diagnostics({ account })).internalMissing, 0);
+    await env.tick(); assert.equal(env.captures.length, 1);
+    assert.equal((await env.fs.getSetting(`assetJobs:${account.accountKey}`)).tasks.length, 0);
+    assert.equal((await env.manifest()).conversations['conversation-one'].assets[0].status, 'downloaded');
+  });
+});
+
+test('a rescan cannot turn a known source-refresh 404 into legacy internal attachment migration', async () => {
+  const env = setup(), source = internalDetail(); await env.save(source); env.resolveFailure(true); await env.tick();
+  let refreshes = 0;
+  env.dependencies.refreshConversation = async () => { refreshes++; throw Object.assign(new Error('conversation missing'), { code: 'HTTP_404' }); };
+  env.restart(); await env.service.retryFailed({ account }); await env.tick();
+  assert.equal((await env.fs.getSetting(`assetJobs:${account.accountKey}`)).tasks[0].errorStage, 'source');
+  await env.save(source); env.time(9_000_000); env.restart(); await env.tick();
+  assert.equal(refreshes, 2); assert.equal(env.captures.length, 1);
+  assert.equal((await env.service.diagnostics({ account })).internalMissing, 0);
+  assert.equal((await env.service.diagnostics({ account })).failed, 1);
+  assert.equal((await env.manifest()).conversations['conversation-one'].assets[0].autoRetrySuspended, undefined);
+});
+
+test('tick reconciles suspended jobs after direct GitHub winner application without restore hydration or rescan', async t => {
+  for (const winner of ['visible', 'ready']) await t.test(winner, async () => {
+    const env = setup(), source = internalDetail(); await env.save(source); failCapture(env, 'HTTP_404'); await env.tick();
+    let assets;
+    if (winner === 'visible') {
+      source.payload.mapping.viewer.message.author = { role: 'user' }; assets = await extractAssets(source.payload);
+    } else {
+      const old = (await env.manifest()).conversations['conversation-one'].assets[0], oid = await hashBytes(PNG);
+      const asset = { ...old, status: 'downloaded', oid, size: PNG.length, localPath: assetPath(account, oid, 'png') };
+      delete asset.autoRetrySuspended; delete asset.errorCode; env.fs.put(asset.localPath, PNG); assets = [asset];
+    }
+    await env.store.saveConversation({ directory: env.fs.directory, account, detail: source, assets });
+    env.restart(); await env.tick();
+    assert.equal((await env.service.diagnostics({ account })).internalMissing, 0);
+    if (winner === 'visible') { assert.equal(env.captures.length, 2); assert.equal((await env.service.diagnostics({ account })).failed, 1); }
+    else { assert.equal(env.captures.length, 1); assert.equal((await env.fs.getSetting(`assetJobs:${account.accountKey}`)).tasks.length, 0); }
+  });
+});
+
+test('direct remote promotion drains older suspended receipts before starting required capture', async () => {
+  const env = setup(), source = internalDetail(); await env.save(source); failCapture(env, 'HTTP_404'); env.enqueueFailure(true); await env.tick();
+  source.payload.mapping.viewer.message.author = { role: 'user' };
+  await env.store.saveConversation({ directory: env.fs.directory, account, detail: source, assets: await extractAssets(source.payload) });
+  env.enqueueFailure(false); env.time(9_000_000); env.restart(); await env.tick();
+  assert.equal(env.enqueued.length, 1); assert.equal(env.captures.length, 1);
+  await env.tick(); assert.equal(env.captures.length, 2);
+  assert.equal((await env.service.diagnostics({ account })).internalMissing, 0);
+});
+
+test('unavailable metadata delivery after restart retains the ordinary capture task until bytes are fetched', async () => {
+  const env = setup(); await env.save(internalDetail()); failCapture(env, 'HTTP_404'); await env.tick();
+  let refreshes = 0;
+  env.dependencies.refreshConversation = async () => { refreshes++; throw Object.assign(new Error('session expired'), { code: 'HTTP_401' }); };
+  env.restart(); env.enqueueFailure(true); await env.service.retryFailed({ account, includeInternal: true }); await env.tick();
+  const jobKey = `assetJobs:${account.accountKey}`;
+  assert.equal((await env.fs.getSetting(jobKey)).tasks[0].captureIncomplete, true);
+  env.restart(); env.enqueueFailure(false); env.time(9_000_000); await env.tick();
+  assert.equal((await env.fs.getSetting(jobKey)).tasks.length, 1);
+  assert.equal((await env.service.diagnostics({ account })).internalMissing, 0);
+  assert.equal(refreshes, 1); await env.tick(); assert.equal(refreshes, 2);
+  assert.equal((await env.fs.getSetting(jobKey)).tasks.length, 1);
+});

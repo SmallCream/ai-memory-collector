@@ -1,6 +1,6 @@
 {
   "name": "ai-memory-collector",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "private": true,
   "type": "module",
   "description": "Browser extension for scheduled, account-isolated AI conversation archives",
