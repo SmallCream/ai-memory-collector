@@ -6,6 +6,7 @@ import { probeRepository, commitProbe } from './lib/github.js';
 const $ = (id) => document.getElementById(id);
 let identity = null, nextOffset = null, directory = null, pending = null, busy = false, locked = true;
 let activeFeedback = null;
+let preferencesQueue = Promise.resolve(), preferencesRevision = 0;
 const buttons = [...document.querySelectorAll('button')];
 function showFeedback(element, text, error = false) {
   if (!element) return;
@@ -21,6 +22,66 @@ function startupStatus(text, error = false) {
   for (const element of document.querySelectorAll('[data-action-status]')) showFeedback(element, error ? text : '', error);
   window.dispatchEvent(new Event('collector:ready'));
 }
+function preferencesSnapshot() {
+  const rememberToken = $('remember-token').checked;
+  return {
+    schemaVersion: 1,
+    repository: $('repository').value.trim(),
+    branch: $('branch').value.trim(),
+    detailFormat: $('detail-format').value === 'tree' ? 'tree' : 'flat',
+    rememberToken,
+    ...(rememberToken ? { token: $('github-token').value.trim() } : {}),
+  };
+}
+function savePreferences() {
+  // Each snapshot is committed in order. An uncheck/forget cannot be undone by
+  // an earlier in-flight input save. This record is never part of an archive.
+  const snapshot = preferencesSnapshot();
+  const revision = ++preferencesRevision;
+  showFeedback($('preferences-status'), '正在保存本机设置…');
+  preferencesQueue = preferencesQueue.then(async () => {
+    try {
+      await setSetting('formPreferences', snapshot);
+      if (revision === preferencesRevision) {
+        showFeedback($('preferences-status'), snapshot.rememberToken && snapshot.token ?
+          '设置与 Token 已保存在此浏览器。' : '设置已保存；Token 不保存在此浏览器。');
+      }
+      return true;
+    } catch {
+      if (revision === preferencesRevision) {
+        showFeedback($('preferences-status'), snapshot.rememberToken ?
+          '本机设置保存失败，请重试；刷新后可能需要重新填写。' :
+          '本机设置保存失败；若此前保存过 Token，可能仍保留，请点击“清除已保存 Token”重试。', true);
+      }
+      return false;
+    }
+  });
+  return preferencesQueue;
+}
+async function restorePreferences() {
+  const saved = await getSetting('formPreferences');
+  const target = saved?.schemaVersion === 1 ? saved : await getSetting('githubTarget');
+  $('repository').value = typeof target?.repository === 'string' ? target.repository : '';
+  $('branch').value = typeof target?.branch === 'string' ? target.branch : '';
+  $('detail-format').value = saved?.detailFormat === 'tree' ? 'tree' : 'flat';
+  const rememberToken = saved?.schemaVersion === 1 && saved.rememberToken === true;
+  $('remember-token').checked = rememberToken;
+  $('github-token').value = rememberToken && typeof saved.token === 'string' ? saved.token : '';
+  showFeedback($('preferences-status'), rememberToken && $('github-token').value ?
+    '已恢复本机设置与 Token。' : '仓库、分支和详情接口会自动保存；Token 需勾选后才记住。');
+}
+for (const id of ['repository', 'branch', 'github-token']) {
+  for (const event of ['input', 'change']) $(id).addEventListener(event, () => {
+    if (!busy && !locked) {
+      $('github-status').textContent = '设置已更改，请重新检查连接。';
+      showFeedback($('github-feedback'), '');
+      return savePreferences();
+    }
+  });
+}
+for (const id of ['detail-format', 'remember-token']) $(id).addEventListener('change', () => {
+  if (!busy && !locked) return savePreferences();
+});
 function errorText(error) {
   let message = error?.message || '操作未完成，请重试。';
   const token = $('github-token').value.trim();
@@ -131,6 +192,10 @@ action('use-current', async () => {
 });
 function displayPending() {
   $('capture-summary').textContent = pending ? JSON.stringify(pending.summary, null, 2) : '尚无采集结果';
+  const summary = pending?.summary;
+  $('capture-overview').textContent = pending ?
+    `已有采集副本：${summary?.title || '未命名对话'}${Number.isInteger(summary?.displayedMessageCount) ? ` · 阅读版 ${summary.displayedMessageCount} 条消息` : ''}。保存状态见下方。` :
+    '尚无采集结果。选择一条对话后开始采集。';
 }
 action('capture', async () => {
   if (pending) throw new Error('已有待保存副本。请先保存并清除暂存，或明确清除后再采集。');
@@ -166,6 +231,13 @@ action('discard', async () => {
   await setSetting('pendingArchive', null); pending = null; displayPending();
   $('local-status').textContent = '已清除本机暂存；没有删除本地文件。'; status('暂存副本已清除。');
 });
+action('forget-token', async () => {
+  $('remember-token').checked = false;
+  $('github-token').value = '';
+  $('github-status').textContent = 'Token 已清空，填写后请重新检查连接。';
+  if (await savePreferences()) status('已清除本机保存的 Token。');
+  else status('未能确认 Token 已从本机清除，请重试。', true);
+});
 function githubOptions() {
   const match = /^([A-Za-z0-9][A-Za-z0-9-]*)\/([A-Za-z0-9_.-]+)$/.exec($('repository').value.trim());
   if (!match) throw new Error('仓库请填写 用户名/仓库名。');
@@ -174,20 +246,22 @@ function githubOptions() {
   return { owner: match[1], repo: match[2], branch: $('branch').value.trim() || undefined, token };
 }
 async function githubAction(write) {
-  const options = githubOptions();
-  status('正在请求 GitHub 站点权限；如出现浏览器授权弹窗，请选择允许。');
-  await permissions('https://api.github.com/*');
-  status(write ? '正在验证仓库、写入测试文件并读回；请勿重复点击。' : '正在检查 GitHub 仓库连接…');
-  const result = await (write ? commitProbe(options) : probeRepository(options));
-  $('github-status').textContent = write ?
-    `测试结果：${result.status}，读回确认：${result.readbackVerified ? '通过' : '未通过'}。${result.writeVerified ? '本次写入已验证。' : '文件已存在且相同，本次未验证新写入权限。'}` :
-    `私有仓库连接成功，分支 ${result.branch}。${result.empty ? '仓库为空，可进行测试写入。' : '尚未执行写入。'}`;
-  status(write ? 'GitHub 连接测试完成，没有上传真实对话。' : '仓库只读检查完成。');
-  // Remote success must remain visible even if remembering the form values fails.
+  // Enqueue without awaiting: permissions.request must keep the click gesture.
+  const saving = savePreferences();
   try {
-    await setSetting('githubTarget', { repository: `${options.owner}/${options.repo}`, branch: options.branch || '' });
-  } catch {
-    status('GitHub 操作已成功，但本机未能记住仓库设置。下次打开需重新填写。');
+    const options = githubOptions();
+    status('正在请求 GitHub 站点权限；如出现浏览器授权弹窗，请选择允许。');
+    await permissions('https://api.github.com/*');
+    status(write ? '正在验证仓库、写入测试文件并读回；请勿重复点击。' : '正在检查 GitHub 仓库连接…');
+    const result = await (write ? commitProbe(options) : probeRepository(options));
+    $('github-status').textContent = write ?
+      `测试结果：${result.status}，读回确认：${result.readbackVerified ? '通过' : '未通过'}。${result.writeVerified ? '本次写入已验证。' : '文件已存在且相同，本次未验证新写入权限。'}` :
+      `私有仓库连接成功，分支 ${result.branch}。${result.empty ? '仓库为空，可进行测试写入。' : '尚未执行写入。'}`;
+    status(write ? 'GitHub 连接测试完成，没有上传真实对话。' : '仓库只读检查完成。');
+    // Remote success must remain visible even if remembering the form fails.
+    if (!await saving) status('GitHub 操作已成功，但本机未能记住设置。下次打开需重新填写。');
+  } finally {
+    await saving;
   }
 }
 action('check-github', () => githubAction(false));
@@ -198,10 +272,12 @@ else {
   navigator.locks.request('ai-memory-collector-p0-panel', { ifAvailable: true }, async lock => {
     if (!lock) { locked = true; startupStatus('另一个采集台正在打开。请关闭此页，使用已有采集台。', true); refreshControls(); return; }
     try {
-      [directory, pending] = await Promise.all([getSetting('directory'), getSetting('pendingArchive')]);
-      const target = await getSetting('githubTarget');
+      [directory, pending] = await Promise.all([getSetting('directory'), getSetting('pendingArchive'), restorePreferences()]);
       if (directory) $('directory').textContent = `${directory.name}（保存前检查权限）`;
-      if (target) { $('repository').value = target.repository; $('branch').value = target.branch; }
+      // Identity and personal-space confirmation are live checks, not preferences.
+      $('personal-space').checked = false;
+      $('source-tab').value = '';
+      clearIdentity();
       displayPending();
       locked = false;
       startupStatus(pending ? '已恢复待保存副本，可重新选择或授权目录后保存。' : '准备就绪，从连接 ChatGPT 开始。');
@@ -211,3 +287,4 @@ else {
   }).catch(() => { locked = true; refreshControls(); startupStatus('无法取得采集台锁，请关闭其他采集台后重试。', true); });
 }
 refreshControls();
+

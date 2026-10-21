@@ -1,6 +1,6 @@
 {
   "name": "ai-memory-collector",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "type": "module",
   "description": "P0 browser extension for user-owned AI conversation archives",
@@ -11,3 +11,4 @@
   },
   "engines": { "node": ">=22" }
 }
+

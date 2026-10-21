@@ -10,6 +10,7 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 
 async function panel(overrides = {}) {
   const nodes = new Map();
+  const store = overrides.store ?? new Map();
   function element(id, tag, text = '') {
     const classes = new Set();
     return { id, tag, textContent: text, value: '', disabled: false, checked: false, listeners: {}, attributes: {},
@@ -38,8 +39,14 @@ async function panel(overrides = {}) {
     window: { dispatchEvent() {}, confirm: () => true }, Event: class { constructor(type) { this.type = type; } },
     navigator: { locks: { request: (_name, _options, callback) => callback(overrides.lock === false ? null : {}) } },
     chrome: { permissions: { request: async (...args) => { calls.permissions++; return permissions(...args); } } },
-    getSetting: overrides.getSetting ?? (async () => undefined),
-    setSetting: async (key, value) => { calls.settings.push({ key, value }); if (overrides.settingsFail) throw new Error('quota'); },
+    getSetting: overrides.getSetting ?? (async key => store.get(key)),
+    setSetting: async (key, value) => {
+      const copy = structuredClone(value);
+      calls.settings.push({ key, value: copy });
+      if (overrides.settingsFail) throw new Error('quota');
+      if (overrides.beforeSave) await overrides.beforeSave(key, copy);
+      store.set(key, copy);
+    },
     probeRepository: async (...args) => { calls.probe++; return probeRepository(...args); },
     commitProbe: async (...args) => { calls.write++; return commitProbe(...args); },
     Option: class {}, URL, location: { href: 'chrome-extension://test/panel.html' }, TextEncoder,
@@ -47,9 +54,19 @@ async function panel(overrides = {}) {
   });
   vm.runInContext(source, context);
   await tick();
-  nodes.get('repository').value = 'demo-owner/demo-private';
-  nodes.get('github-token').value = 'synthetic-test-token';
-  return { nodes, calls, async click(id) { const node = nodes.get(id); assert.equal(node.disabled, false); await node.listeners.click(); } };
+  if (overrides.prefill !== false) {
+    nodes.get('repository').value = 'demo-owner/demo-private';
+    nodes.get('github-token').value = 'synthetic-test-token';
+  }
+  return { nodes, calls, store,
+    async click(id) { const node = nodes.get(id); assert.equal(node.disabled, false); await node.listeners.click(); },
+    async change(id, value, event = 'change') {
+      const node = nodes.get(id);
+      assert.equal(node.disabled, false);
+      if (typeof value === 'boolean') node.checked = value; else node.value = value;
+      await node.listeners[event]();
+    },
+  };
 }
 
 test('GitHub click immediately shows nearby progress and busy state while awaiting permission', async () => {
@@ -105,5 +122,97 @@ test('error display redacts actual input token and never persists it', async () 
   const p = await panel({ probe: async () => { throw new Error('network synthetic-test-token'); } });
   await p.click('check-github');
   assert.ok(!p.nodes.get('github-feedback').textContent.includes('synthetic-test-token'));
-  assert.equal(p.calls.settings.length, 0);
+  assert.ok(!JSON.stringify(p.calls.settings).includes('synthetic-test-token'));
 });
+
+test('ordinary settings survive a failed GitHub check and reopen without restoring trusted session state', async () => {
+  const store = new Map();
+  const p = await panel({ store, probe: async () => { throw new Error('offline'); } });
+  p.nodes.get('github-status').textContent = '私有仓库连接成功，分支 main。';
+  await p.change('repository', 'demo-owner/another-private', 'input');
+  assert.match(p.nodes.get('github-status').textContent, /设置已更改/);
+  await p.change('branch', 'archive', 'input');
+  await p.change('detail-format', 'tree');
+  p.nodes.get('personal-space').checked = true;
+  p.nodes.get('source-tab').value = '99';
+  await p.click('check-github');
+  const reopened = await panel({ store, prefill: false });
+  assert.equal(reopened.nodes.get('repository').value, 'demo-owner/another-private');
+  assert.equal(reopened.nodes.get('branch').value, 'archive');
+  assert.equal(reopened.nodes.get('detail-format').value, 'tree');
+  assert.equal(reopened.nodes.get('github-token').value, '');
+  assert.equal(reopened.nodes.get('remember-token').checked, false);
+  assert.equal(reopened.nodes.get('personal-space').checked, false);
+  assert.equal(reopened.nodes.get('source-tab').value, '');
+  assert.equal(reopened.nodes.get('list').disabled, true);
+  assert.ok(!JSON.stringify([...store]).includes('synthetic-test-token'));
+  assert.deepEqual(Object.keys(store.get('formPreferences')).sort(), ['branch', 'detailFormat', 'rememberToken', 'repository', 'schemaVersion']);
+});
+
+test('Token is restored only after opt-in and unchecking removes the persisted value', async () => {
+  const store = new Map();
+  const p = await panel({ store });
+  await p.change('remember-token', true);
+  const reopened = await panel({ store, prefill: false });
+  assert.equal(reopened.nodes.get('remember-token').checked, true);
+  assert.equal(reopened.nodes.get('github-token').value, 'synthetic-test-token');
+  await reopened.change('remember-token', false);
+  // Unchecking stops persistence while allowing this page to keep using its input.
+  assert.equal(reopened.nodes.get('github-token').value, 'synthetic-test-token');
+  const again = await panel({ store, prefill: false });
+  assert.equal(again.nodes.get('github-token').value, '');
+  assert.equal(again.nodes.get('remember-token').checked, false);
+  assert.ok(!Object.hasOwn(store.get('formPreferences'), 'token'));
+});
+
+test('forget Token follows in-flight saves and cannot be undone by an older snapshot', async () => {
+  const store = new Map();
+  let release;
+  let count = 0;
+  const p = await panel({ store, beforeSave: async () => {
+    if (++count === 1) await new Promise(resolve => { release = resolve; });
+  } });
+  const saving = p.change('remember-token', true);
+  await tick();
+  const clearing = p.click('forget-token');
+  assert.equal(p.nodes.get('github-token').value, '');
+  assert.equal(p.nodes.get('remember-token').checked, false);
+  assert.match(p.nodes.get('github-status').textContent, /Token 已清空/);
+  release();
+  await Promise.all([saving, clearing]);
+  assert.equal(count, 2);
+  assert.ok(!Object.hasOwn(store.get('formPreferences'), 'token'));
+  const reopened = await panel({ store, prefill: false });
+  assert.equal(reopened.nodes.get('github-token').value, '');
+  assert.match(p.nodes.get('github-feedback').textContent, /已清除本机保存/);
+});
+
+test('legacy target and existing pending/directory survive the settings upgrade', async () => {
+  const pending = { summary: { title: '虚构测试', displayedMessageCount: 3 } };
+  const directory = { name: 'existing-test-folder' };
+  const store = new Map([
+    ['githubTarget', { repository: 'old-owner/private-data', branch: 'main' }],
+    ['pendingArchive', pending], ['directory', directory],
+  ]);
+  const p = await panel({ store, prefill: false });
+  assert.equal(p.nodes.get('repository').value, 'old-owner/private-data');
+  assert.equal(p.nodes.get('branch').value, 'main');
+  assert.match(p.nodes.get('directory').textContent, /existing-test-folder/);
+  assert.match(p.nodes.get('capture-overview').textContent, /虚构测试.*阅读版 3 条消息/);
+  assert.equal(p.nodes.get('save-local').disabled, false);
+  assert.equal(store.get('pendingArchive'), pending);
+  assert.equal(store.get('directory'), directory);
+  await p.change('branch', 'archive');
+  const reopened = await panel({ store, prefill: false });
+  assert.equal(reopened.nodes.get('branch').value, 'archive');
+});
+
+test('forget failure is shown without claiming that the persisted Token was removed', async () => {
+  const p = await panel({ settingsFail: true });
+  await p.click('forget-token');
+  assert.match(p.nodes.get('github-feedback').textContent, /未能确认.*清除/);
+  assert.equal(p.nodes.get('github-feedback').classList.contains('error'), true);
+  assert.equal(p.nodes.get('preferences-status').classList.contains('error'), true);
+  assert.match(p.nodes.get('preferences-status').textContent, /可能仍保留/);
+});
+
