@@ -147,3 +147,61 @@ test('an invalid script result rechecks whether the source tab closed or left Ch
     });
   }
 });
+
+function lifetimeFixture() {
+  const deadlines = new Map(), heartbeats = new Map();
+  let next = 0, release, entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const result = new Promise(resolve => { release = resolve; });
+  const timers = {
+    setTimeout: (callback, ms) => { const id = ++next; deadlines.set(id, { callback, ms }); return id; },
+    clearTimeout: id => deadlines.delete(id),
+    setInterval: (callback, ms) => { const id = ++next; heartbeats.set(id, { callback, ms }); return id; },
+    clearInterval: id => heartbeats.delete(id),
+  };
+  let calls = 0, beats = 0, sourceOpen = true;
+  const browser = {
+    tabs: { get: async () => { if (!sourceOpen) throw new Error('closed'); return { url: 'https://chatgpt.com/c/demo' }; } },
+    runtime: { getPlatformInfo() { assert.equal(this, browser.runtime); beats++; return Promise.resolve({ os: 'synthetic' }); } },
+    scripting: { executeScript: async () => { calls++; entered(); return result; } },
+  };
+  return { adapter: createChatGPTAdapter(browser, { timers }), deadlines, heartbeats, started, release,
+    calls: () => calls, beats: () => beats, close: () => { sourceOpen = false; } };
+}
+
+test('only detail injection uses bounded lifetime support and cleans it before returning its result', async () => {
+  for (const kind of ['identity', 'list', 'detail']) {
+    const f = lifetimeFixture();
+    const request = kind === 'identity' ? f.adapter.identify(1) : kind === 'list'
+      ? f.adapter.list(1, { accountKey: identity.accountKey })
+      : f.adapter.detail(1, { accountKey: identity.accountKey, conversationId: 'demo' });
+    await f.started;
+    assert.deepEqual([...f.deadlines.values()].map(item => item.ms), kind === 'detail' ? [660_000] : []);
+    assert.deepEqual([...f.heartbeats.values()].map(item => item.ms), kind === 'detail' ? [20_000] : []);
+    for (const heartbeat of f.heartbeats.values()) heartbeat.callback();
+    await Promise.resolve();
+    assert.equal(f.beats(), kind === 'detail' ? 1 : 0);
+    const payload = kind === 'list' ? { items: [], total: 0, nextOffset: null }
+      : { conversation_id: 'demo', mapping: { root: { message: null } } };
+    f.release([{ frameId: 0, result: { ok: true, identity, payload, completeness: 'complete' } }]);
+    await request;
+    assert.equal(f.deadlines.size, 0); assert.equal(f.heartbeats.size, 0);
+  }
+});
+
+test('a hung detail becomes TIMEOUT without fallback or accepting late success; closed sources take precedence', async () => {
+  for (const closed of [false, true]) {
+    const f = lifetimeFixture();
+    const request = f.adapter.detail(1, { accountKey: identity.accountKey, conversationId: 'demo' });
+    await f.started;
+    if (closed) f.close();
+    const rejected = assert.rejects(request, { code: closed ? 'TAB_CLOSED' : 'TIMEOUT' });
+    [...f.deadlines.values()][0].callback();
+    await rejected;
+    assert.equal(f.calls(), 1, 'a watchdog must not start a narrower endpoint');
+    assert.equal(f.deadlines.size, 0); assert.equal(f.heartbeats.size, 0);
+    f.release([{ frameId: 0, result: { ok: true, identity, payload: { conversation_id: 'demo', mapping: {} }, completeness: 'complete' } }]);
+    await Promise.resolve();
+    assert.equal(f.calls(), 1);
+  }
+});

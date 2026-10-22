@@ -1,6 +1,7 @@
 import { probeChatGPT } from '../lib/chatgpt.js';
 import { collectMessagePages, fullMessageSync } from '../lib/message-sync.js';
 import { sanitizeDetailFailure } from '../lib/detail-errors.js';
+import { waitForDetailRequest, DetailRequestTimeoutError } from '../lib/detail-request-lifetime.js';
 
 export class AdapterError extends Error {
   constructor(code, message, reason) {
@@ -22,7 +23,7 @@ function validIdentity(value) {
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 /** Injectable Chrome dependency supports tests without a live logged-in account. */
-export function createChatGPTAdapter(browser, { now = Date.now } = {}) {
+export function createChatGPTAdapter(browser, { now = Date.now, timers = globalThis } = {}) {
   async function run(tabId, request) {
     const api = browser ?? globalThis.chrome;
     if (!Number.isSafeInteger(tabId) || tabId < 0) throw new AdapterError('TAB_REQUIRED', '请打开已登录的 ChatGPT 标签页。');
@@ -34,9 +35,16 @@ export function createChatGPTAdapter(browser, { now = Date.now } = {}) {
     }
     let results;
     try {
-      results = await api.scripting.executeScript({ target: { tabId, frameIds: [0] }, world: 'ISOLATED',
+      const execute = () => api.scripting.executeScript({ target: { tabId, frameIds: [0] }, world: 'ISOLATED',
         func: probeChatGPT, args: [request] });
-    } catch {
+      results = request.kind === 'detail'
+        ? await waitForDetailRequest(execute, { runtime: api.runtime, timers })
+        : await execute();
+    } catch (error) {
+      if (error instanceof DetailRequestTimeoutError) {
+        await checkSourceAfterRead();
+        throw new AdapterError('TIMEOUT', '详情读取等待超时，已保留进度，稍后重试。');
+      }
       // Browser exceptions may contain page URLs; do not pass them into logs/UI.
       throw new AdapterError('TAB_UNAVAILABLE', '暂时无法读取 ChatGPT 页面，请检查网站权限、登录状态或重新载入页面。');
     }

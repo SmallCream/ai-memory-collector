@@ -588,7 +588,7 @@ test('real AbortController numeric code 20 becomes a safe TIMEOUT for identity a
   for (const kind of ['identity', 'detail']) {
     const f = timedProbe((path, options, clock) => {
       if (kind === 'detail' && path === '/api/auth/session') return jsonResponse(session());
-      clock.advance(kind === 'detail' ? 60_000 : 20_000);
+      clock.advance(kind === 'detail' ? 600_000 : 20_000);
       assert.equal(options.signal.aborted, true);
       assert.equal(options.signal.reason.name, 'AbortError');
       assert.equal(options.signal.reason.code, 20, 'use the native exception, not a plain Error mock');
@@ -596,7 +596,7 @@ test('real AbortController numeric code 20 becomes a safe TIMEOUT for identity a
     });
     timeoutReply(await f.run(kind === 'identity' ? { kind } : autoRequest));
     assert.equal(f.calls.length, kind === 'identity' ? 1 : 2, 'timeout must not trigger another endpoint');
-    assert.deepEqual(f.scheduled, kind === 'identity' ? [20_000] : [20_000, 60_000]);
+    assert.deepEqual(f.scheduled, kind === 'identity' ? [20_000] : [20_000, 600_000]);
     assert.equal(f.cleared.length, f.scheduled.length);
     assert.equal(f.timers.size, 0);
   }
@@ -609,7 +609,7 @@ test('a stream reader abort cannot expose a numeric code or partial conversation
     return { ok: true, headers: new Headers({ 'content-type': 'application/json' }), body: { getReader: () => ({
       read: async () => {
         if (++reads === 1) return { done: false, value: new TextEncoder().encode('{"conversation_id":"private-partial') };
-        clock.advance(60_000);
+        clock.advance(600_000);
         throw options.signal.reason;
       },
     }) } };
@@ -659,7 +659,7 @@ test('foreign AbortError and TimeoutError exceptions retain only fixed timeout d
   }
 });
 
-test('identity and list retain 20-second budgets while a 30-second detail succeeds inside its 60-second budget', async () => {
+test('identity and list retain 20-second budgets while a nine-minute detail succeeds inside its ten-minute budget', async () => {
   const identityProbe = timedProbe(() => jsonResponse(session()));
   assert.equal((await identityProbe.run({ kind: 'identity' })).ok, true);
   assert.deepEqual(identityProbe.scheduled, [20_000]);
@@ -671,7 +671,7 @@ test('identity and list retain 20-second budgets while a 30-second detail succee
   for (const format of ['auto', 'tree', 'flat', 'page']) {
     const f = timedProbe((path, options, clock) => {
       if (path === '/api/auth/session') return jsonResponse(session());
-      clock.advance(30_000);
+      clock.advance(540_000);
       assert.equal(options.signal.aborted, false);
       return jsonResponse(['auto', 'tree'].includes(format) ? completeTree() : messagePage(['m1', 'm2'], {
         has_previous_page: false, has_next_page: false,
@@ -680,7 +680,7 @@ test('identity and list retain 20-second budgets while a 30-second detail succee
     const result = await f.run({ ...autoRequest, format, requireComplete: true });
     assert.equal(result.ok, true);
     assert.equal(result.completeness, format === 'page' ? 'page' : 'complete');
-    assert.deepEqual(f.scheduled, [20_000, 60_000, 20_000], 'identity checks must retain their shorter budgets');
+    assert.deepEqual(f.scheduled, [20_000, 600_000, 20_000], 'identity checks must retain their shorter budgets');
     assert.equal(f.timers.size, 0);
     assert.equal(f.cleared.length, 3);
   }
@@ -691,13 +691,13 @@ test('responses arriving after the deadline are discarded even when a transport 
     const f = timedProbe((path, options, clock) => {
       if (path === '/api/auth/session') return jsonResponse(session());
       const response = jsonResponse(completeTree());
-      if (phase === 'headers') { clock.advance(60_000); return response; }
+      if (phase === 'headers') { clock.advance(600_000); return response; }
       if (phase === 'text') return { ok: true, headers: response.headers, body: null,
-        text: async () => { clock.advance(60_000); return JSON.stringify(completeTree()); } };
+        text: async () => { clock.advance(600_000); return JSON.stringify(completeTree()); } };
       let reads = 0;
       return { ok: true, headers: response.headers, body: { getReader: () => ({ read: async () => {
         if (++reads === 1) return { done: false, value: new TextEncoder().encode(JSON.stringify(completeTree())) };
-        clock.advance(60_000); return { done: true };
+        clock.advance(600_000); return { done: true };
       } }) } };
     });
     timeoutReply(await f.run(autoRequest));
@@ -720,7 +720,7 @@ test('stream progress does not reset the total detail deadline and generic post-
     const result = await f.run(autoRequest);
     timeoutReply(result);
     assert.doesNotMatch(JSON.stringify(result), /private/);
-    assert.deepEqual(f.scheduled, [20_000, 60_000]);
+    assert.deepEqual(f.scheduled, [20_000, 600_000]);
     assert.equal(f.timers.size, 0);
     assert.equal(f.cleared.length, 2);
   }

@@ -282,7 +282,7 @@ export async function probeChatGPT(request) {
         const suffix = type === 'flat' ? `conversations/${request.conversationId}?num_turns=100${request.before ? `&before=${encodeURIComponent(request.before)}` : ''}` : `conversation/${request.conversationId}`;
         // Long histories need more time than identity/list requests. This is a
         // total deadline for headers and body, not a renewed per-chunk timeout.
-        const value = await getJSON(`/backend-api/${suffix}`, before.token, 60000);
+        const value = await getJSON(`/backend-api/${suffix}`, before.token, 600000);
         detailShape(value, type);
         return value;
       };
