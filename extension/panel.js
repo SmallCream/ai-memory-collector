@@ -54,26 +54,26 @@ function assetFailureCode(value) { return typeof value === 'string' && /^[A-Z][A
 function assetFailureMessage(code) {
   // Error strings can originate in network/extension APIs. Only fixed messages
   // reach this diagnostic view; response bodies, signed URLs and tokens do not.
-  if (/^(?:HTTP_401|HTTP_403|IDENTITY)$/.test(code)) return '请确认 ChatGPT 已登录，且当前账号可以打开原图。';
-  if (code === 'HTTP_404') return '图片下载入口未找到；原图可能需要打开后补采，或等待接口适配。';
-  if (code === 'HTTP_429') return '图片请求受到限流，请稍后重试。';
-  if (/^HTTP_5\d\d$/.test(code)) return '图片服务暂时不可用，请稍后重试。';
-  if (code === 'ACCOUNT_CHANGED') return '账号已切换，已停止处理。请回到图片所属账号后重试。';
+  if (/^(?:HTTP_401|HTTP_403|IDENTITY)$/.test(code)) return '请确认 ChatGPT 已登录，且当前账号可以打开原始附件。';
+  if (code === 'HTTP_404') return '附件下载入口未找到；原始附件可能需要打开后补采，或等待接口适配。';
+  if (code === 'HTTP_429') return '附件请求受到限流，请稍后重试。';
+  if (/^HTTP_5\d\d$/.test(code)) return '附件服务暂时不可用，请稍后重试。';
+  if (code === 'ACCOUNT_CHANGED') return '账号已切换，已停止处理。请回到附件所属账号后重试。';
   if (/^(?:TAB_|ORIGIN)/.test(code)) return '请打开所属账号的 ChatGPT 标签页，并确认站点访问权限。';
-  if (code === 'ASSET_PENDING') return '尚未取得可确认归属的原图。可打开对应对话和图片后重试；部分资源仍需适配。';
-  if (code === 'ASSET_SOURCE_MISSING') return '最新对话中未找到这张图片，已有文件和任务已保留。请打开对应对话检查后重试。';
+  if (code === 'ASSET_PENDING') return '尚未取得可确认归属的原始附件。可打开对应对话和附件后重试；部分资源仍需适配。';
+  if (code === 'ASSET_SOURCE_MISSING') return '最新对话中未找到此附件，已有文件和任务已保留。请打开对应对话检查后重试。';
   if (code === 'INCOMPLETE_DETAIL') return '本次返回的对话详情不完整，未覆盖已保存数据。请稍后重试。';
-  if (/^(?:ASSET_URL|ASSET_REDIRECT|ASSET_PROTOCOL)$/.test(code)) return '图片下载地址或跳转尚未支持。可打开原图后重试；部分资源仍需适配。';
-  if (/^(?:ASSET_NETWORK|ASSET_TIMEOUT)$/.test(code)) return '图片下载未完成，请检查网络后重试。';
+  if (/^(?:ASSET_URL|ASSET_REDIRECT|ASSET_PROTOCOL)$/.test(code)) return '附件下载地址或跳转尚未支持。可打开原始附件后重试；部分资源仍需适配。';
+  if (/^(?:ASSET_NETWORK|ASSET_TIMEOUT)$/.test(code)) return '附件下载未完成，请检查网络后重试。';
   if (code === 'ASSET_LINK_UNKNOWN') return '外链暂时无法验证。请检查设置中的外链图片权限；原链接已保留。';
-  if (/^(?:ASSET_SIZE|ASSET_TOO_LARGE)$/.test(code)) return '图片数据为空或超过当前处理上限。';
-  if (/^(?:ASSET_FORMAT|ASSET_RESPONSE|ASSET_NOT_IMAGE|ASSET_STREAM)$/.test(code)) return '未取得受支持的完整图片，任务已保留。';
-  if (/^(?:ASSET_VARIANT|ASSET_HASH|ASSET_HASH_MISMATCH)$/.test(code)) return '图片与原始附件信息不一致，未作为原图保存。';
-  if (/^(?:LOCAL_CONFLICT|ASSET_LOCAL_CONFLICT)$/.test(code)) return '本地文件已变化，已保留原文件。请检查对应对话或图片。';
+  if (/^(?:ASSET_SIZE|ASSET_TOO_LARGE)$/.test(code)) return '附件数据为空或超过当前处理上限。';
+  if (/^(?:ASSET_FORMAT|ASSET_RESPONSE|ASSET_NOT_IMAGE|ASSET_NOT_FILE|ASSET_STREAM)$/.test(code)) return '未取得受支持的完整附件，任务已保留。';
+  if (/^(?:ASSET_VARIANT|ASSET_HASH|ASSET_HASH_MISMATCH)$/.test(code)) return '下载内容与原始附件信息不一致，未保存。';
+  if (/^(?:LOCAL_CONFLICT|ASSET_LOCAL_CONFLICT)$/.test(code)) return '本地文件已变化，已保留原文件。请检查对应对话或附件。';
   if (code === 'DIRECTORY_PERMISSION') return '请恢复保存目录的读写权限。';
-  if (code === 'DIRECTORY_CHANGED') return '图片写入尚未完成，请恢复原保存目录后重试。';
-  if (code === 'ASSET_WRITE') return '图片写入未完成，请检查保存目录后重试。';
-  return '本次图片处理未完成，任务已保留。可根据错误代码继续排查。';
+  if (code === 'DIRECTORY_CHANGED') return '附件写入尚未完成，请恢复原保存目录后重试。';
+  if (code === 'ASSET_WRITE') return '附件写入未完成，请检查保存目录后重试。';
+  return '本次附件处理未完成，任务已保留。可根据错误代码继续排查。';
 }
 function assetLabel(value, fallback) {
   return safeMessage(typeof value === 'string' && value ? value : fallback)
@@ -93,7 +93,7 @@ function renderAssetFailures(diagnostics) {
     const title = document.createElement('strong');
     title.textContent = assetLabel(failure.conversationTitle, '未命名对话');
     const filename = document.createElement('p');
-    filename.textContent = assetLabel(failure.fileName, '未命名图片');
+    filename.textContent = assetLabel(failure.fileName, '未命名附件');
     const code = assetFailureCode(failure.code);
     const explanation = document.createElement('p'); explanation.textContent = assetFailureMessage(code);
     const metadata = document.createElement('p'); metadata.classList.add('muted');
@@ -130,13 +130,13 @@ function renderInternalAttachments(diagnostics, missing) {
   }
 }
 const activityStages = { identify: '核验账号与保存位置', list: '读取对话列表', detail: '读取对话详情',
-  save: '保存对话文件', download: '下载对话图片', 'save-image': '保存图片到本地',
-  'upload-image': '上传图片到 GitHub LFS', 'restore-image': '从 GitHub 下载图片',
+  save: '保存对话文件', download: '下载对话附件', 'save-image': '保存附件到本地',
+  'upload-image': '上传附件到 GitHub LFS', 'restore-image': '从 GitHub 下载附件',
   github: '同步 GitHub', sync: '提交对话到 GitHub', 'sync-archives': '提交对话到 GitHub',
-  commit: '提交对话到 GitHub', 'apply-remote': '写入远端合并结果', 'refresh-source': '刷新图片下载来源',
-  'prepare-upload': '准备图片上传', 'restore-snapshot': '读取仓库目录', 'restore-metadata': '读取归档清单',
+  commit: '提交对话到 GitHub', 'apply-remote': '写入远端合并结果', 'refresh-source': '刷新附件下载来源',
+  'prepare-upload': '准备附件上传', 'restore-snapshot': '读取仓库目录', 'restore-metadata': '读取归档清单',
   'restore-conversation': '恢复对话文件', restore: '恢复仓库文件',
-  'restore-scan': '读取仓库目录', 'restore-file': '下载对话归档', 'restore-save': '保存恢复的对话', 'restore-assets': '补齐归档图片' };
+  'restore-scan': '读取仓库目录', 'restore-file': '下载对话归档', 'restore-save': '保存恢复的对话', 'restore-assets': '补齐归档附件' };
 const taskStatuses = { pending: '排队中', retry: '等待重试', failed: '失败待处理', saved: '已保存',
   skipped: '无变化，已跳过', downloaded: '已下载', uploaded: '已上传', 'internal-missing': '内部附件未下载',
   suspended: '内部附件未下载', delivering: '正在交付归档', queued: '排队中', waiting: '等待处理',
@@ -250,7 +250,7 @@ function renderDetailedProgress() {
   else if (job?.status === 'blocked') collectionWait = assetLabel(job.error?.message, '采集等待登录或保存权限恢复。');
   else if (!liveCollection && Number(job?.nextRetryAt) > Date.now()) collectionWait = `等待重试至 ${clock(job.nextRetryAt)}，剩余 ${duration(job.nextRetryAt - Date.now())}。`;
   else if (job?.status === 'running' && !liveCollection) collectionWait = '当前没有进行中的请求，等待后台调度下一项。';
-  else if (job?.status === 'completed') collectionWait = '本轮对话采集完成；图片下载、上传和对话提交进度见下方详情。';
+  else if (job?.status === 'completed') collectionWait = '本轮对话采集完成；附件下载、上传和对话提交进度见下方详情。';
   else if (job?.status === 'partial') collectionWait = '本轮仍有未完成项，可查看失败原因并继续采集。';
   else if (liveCollection) collectionWait = '正在执行下方步骤，面板收起后任务仍可继续。';
   if (job?.status === 'running' && !liveCollection && Number(job?.nextRetryAt) > Date.now()) text('collection-details-status', '等待重试');
@@ -263,8 +263,8 @@ function renderDetailedProgress() {
   renderTaskList('collection-queue', 'collection-queue-note', diagnostics.items, diagnostics.total,
     job?.phase === 'list' ? '正在获取列表，发现对话后显示队列。' : '暂无对话队列记录。');
   renderTaskList('collection-recent', 'collection-recent-note', collection?.recent, 0, '暂无步骤完成记录。', 'recent');
-  const transferChannels = [['对话图片下载', activity.download], ['图片上传', activity.upload], ['GitHub 对话提交', activity.github],
-    ['仓库恢复（全部账号）', activity.restore], ['当前账号图片恢复', activity.restoreImages]];
+  const transferChannels = [['对话附件下载', activity.download], ['附件上传', activity.upload], ['GitHub 对话提交', activity.github],
+    ['仓库恢复（全部账号）', activity.restore], ['当前账号附件恢复', activity.restoreImages]];
   const running = transferChannels.filter(([, log]) => log?.current?.status === 'running');
   const interrupted = transferChannels.some(([, log]) => log?.current?.status === 'interrupted');
   const asset = current.assetDiagnostics || {}, github = current.githubStatus || {}, outbox = current.outboxSummary || {};
@@ -273,15 +273,15 @@ function renderDetailedProgress() {
   if (running.length) { badge = '正在处理'; wait = '当前正在执行下方步骤；完成当前文件后会更新数量。'; }
   else if (Number(retryAt) > Date.now()) { badge = '等待重试'; wait = `GitHub 同步等待至 ${clock(retryAt)}，剩余 ${duration(retryAt - Date.now())}。`; }
   else if (interrupted) { badge = '等待继续'; wait = '上次传输未记录结束，进度已保留，等待后台继续处理。'; }
-  else if (!current.config?.github?.enabled) { badge = '本地采集'; wait = 'GitHub 自动同步未启用；本地图片采集和手动恢复可独立进行。'; }
-  else if (job?.status === 'running' && Number(outbox.total ?? github.pending) > 0) { badge = '等待提交'; wait = '对话采集中，完成本轮后提交 GitHub；图片下载仍可继续处理。'; }
-  else if (Number(asset.pending) > 0 || Number(outbox.total ?? github.pending) > 0) { badge = '等待处理'; wait = '等待后台处理队列。图片已上传后，还需要提交 JSON、Markdown 与清单。'; }
+  else if (!current.config?.github?.enabled) { badge = '本地采集'; wait = 'GitHub 自动同步未启用；本地附件采集和手动恢复可独立进行。'; }
+  else if (job?.status === 'running' && Number(outbox.total ?? github.pending) > 0) { badge = '等待提交'; wait = '对话采集中，完成本轮后提交 GitHub；附件下载仍可继续处理。'; }
+  else if (Number(asset.pending) > 0 || Number(outbox.total ?? github.pending) > 0) { badge = '等待处理'; wait = '等待后台处理队列。附件已上传后，还需要提交 JSON、Markdown 与清单。'; }
   else if (github.status === 'synced') { badge = '已同步'; wait = '当前已知的对话提交已完成；未下载附件仍保留各自状态。'; }
   text('transfer-details-status', badge); text('transfer-wait', wait);
-  text('transfer-detail-counts', `图片待处理 ${count(asset.pending)} · 失败 ${count(asset.failed)} · 内部附件未下载 ${count(asset.internalMissing)} · 待提交对话 ${count(outbox.total ?? github.pending)}`);
+  text('transfer-detail-counts', `附件待处理 ${count(asset.pending)} · 失败 ${count(asset.failed)} · 内部附件未下载 ${count(asset.internalMissing)} · 待提交对话 ${count(outbox.total ?? github.pending)}`);
   renderActivityCards('transfer-current', transferChannels);
-  renderTaskList('download-queue', 'download-queue-note', asset.captureItems, asset.captureTotal, '暂无图片下载任务。');
-  renderTaskList('upload-queue', 'upload-queue-note', asset.uploadItems, asset.uploadTotal, '暂无可上传的本地图片。');
+  renderTaskList('download-queue', 'download-queue-note', asset.captureItems, asset.captureTotal, '暂无附件下载任务。');
+  renderTaskList('upload-queue', 'upload-queue-note', asset.uploadItems, asset.uploadTotal, '暂无可上传的本地附件。');
   renderTaskList('outbox-queue', 'outbox-queue-note', outbox.items, outbox.total, '暂无待提交的对话。', 'outbox');
   const restore = current.restoreStatus;
   text('transfer-restore-detail', restore ? `已处理 ${count(restore.processed)} / ${count(restore.total)} 条 · 待处理 ${count(restore.pending)} · 失败 ${count(restore.failed)}${Number(restore.nextRetryAt) > Date.now() ? ` · 重试时间 ${clock(restore.nextRetryAt)}` : ''}${restore.error?.code ? ` · ${assetFailureCode(restore.error.code)}` : ''}` : '尚未执行仓库恢复。');
@@ -412,7 +412,7 @@ function render() {
   const failedImages = Number(diagnostics?.failed ?? assets.failed) || 0;
   const internalMissing = Number(diagnostics?.internalMissing ?? assets.internalMissing) || 0;
   const assetParts = [];
-  if (Number(assets.local) > 0) assetParts.push(`本地图片 ${count(assets.local)}`);
+  if (Number(assets.local) > 0) assetParts.push(`本地附件 ${count(assets.local)}`);
   if (Number(assets.uploaded) > 0) assetParts.push(`已上传 ${count(assets.uploaded)}`);
   if (Number(assets.downloaded) > 0) assetParts.push(`已恢复 ${count(assets.downloaded)}`);
   if (Number(assets.external) > 0) assetParts.push(`外链 ${count(assets.external)}`);
@@ -445,7 +445,7 @@ function render() {
   const restoreLabels = { completed: '恢复完成', complete: '恢复完成', success: '恢复完成',
     partial: '部分恢复完成', failed: '恢复未完成', error: '恢复未完成', paused: '恢复已暂停',
     blocked: '恢复需要处理', interrupted: '恢复已中断', 'waiting-permission': '等待权限', needsPermission: '等待权限', empty: '仓库暂无可恢复内容' };
-  text('restore-phase', restoreRunning ? '正在恢复对话与图片' : restoreLabels[restore?.status] || '恢复进度已保留');
+  text('restore-phase', restoreRunning ? '正在恢复对话与附件' : restoreLabels[restore?.status] || '恢复进度已保留');
   text('restore-count', restoreTotal ? `${restoreCompleted} / ${restoreTotal}` : '');
   if (restoreTotal > 0) { $('restore-meter').max = Math.max(restoreTotal, restoreCompleted, 1); $('restore-meter').value = restoreCompleted; }
   else $('restore-meter').removeAttribute('value');
@@ -453,8 +453,8 @@ function render() {
   text('restore-detail', safeMessage(restore?.message || restore?.error?.message ||
     (restoreFailed ? `${restoreFailed} 项未完成，已恢复的文件会保留。` : restoreRunning ? '收起面板不会主动暂停恢复。' : '')));
   show('restore-retry', restoreNeedsRetry && !restoreRunning);
-  text('external-images-status', externalImagePermission ? '已允许匿名检测。可在浏览器扩展设置中撤销网站访问权限。' : '尚未授权，外链图片保留为链接。');
-  text('grant-external-images', externalImagePermission ? '已允许检测外链图片' : '允许检测外链图片');
+  text('external-images-status', externalImagePermission ? '已允许匿名检测。可在浏览器扩展设置中撤销网站访问权限。' : '尚未授权，外链附件保留为链接。');
+  text('grant-external-images', externalImagePermission ? '已允许检测外链附件' : '允许检测外链附件');
   const result = current.lastResult || (['completed', 'complete', 'done', 'partial', 'failed'].includes(job?.status) ? job : null);
   show('last-result', Boolean(result));
   if (result) {
@@ -565,7 +565,7 @@ async function restoreDirectory() {
 }
 async function grantGithub(lfs = false) {
   const granted = await chrome.permissions.request({ origins: lfs ? githubOrigins : ['https://api.github.com/*'] });
-  if (!granted) throw new Error('未获得 GitHub 访问权限。已有数据会保留，可再次点击授权或关闭图片同步后保存配置。');
+  if (!granted) throw new Error('未获得 GitHub 访问权限。已有数据会保留，可再次点击授权或关闭附件同步后保存配置。');
 }
 async function restoreGithub(retry = false) {
   // Start the permission request directly from this click, before any network await.
@@ -631,7 +631,7 @@ action('restore-github', () => restoreGithub(false));
 action('restore-retry', () => restoreGithub(true));
 action('grant-external-images', async () => {
   const granted = await chrome.permissions.request({ origins: ['https://*/*'] });
-  if (!granted) throw new Error('未获得外链图片检测权限。对话与链接仍可正常归档。');
+  if (!granted) throw new Error('未获得外链附件检测权限。对话与链接仍可正常归档。');
   externalImagePermission = true;
   await send('collector:permissions-changed');
 });

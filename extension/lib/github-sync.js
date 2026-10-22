@@ -2,6 +2,7 @@
 import { buildArchive } from './archive.js';
 import { createGitHubClient, inspectGitHubRepository, commitProbe, GitHubProbeError } from './github.js';
 import { formatLfsPointer } from './lfs.js';
+import { ASSET_EXTENSIONS } from './asset-store.js';
 import { extractAssets, reconcileAssetCapturePolicy } from './assets.js';
 import { reconcileFileCitation } from './asset-reconciliation.js';
 import { selectMessageSync } from './message-sync-receipt.js';
@@ -51,8 +52,8 @@ function assetsOf(entry, prefix) {
     if (READY_ASSETS.has(asset.status)) {
       if (!/^[a-f0-9]{64}$/.test(asset.oid || '') || !Number.isSafeInteger(asset.size) || asset.size < 0 ||
           typeof asset.localPath !== 'string' ||
-          !new RegExp(`^${asset.oid}\\.(png|jpg|gif|webp|avif|bin)$`).test(asset.localPath.slice(prefix.length + '/assets/'.length))) {
-        fail('ARCHIVE_ASSET', '已保存图片缺少有效的路径、内容摘要或大小。');
+          !new RegExp(`^${asset.oid}\\.(${ASSET_EXTENSIONS})$`).test(asset.localPath.slice(prefix.length + '/assets/'.length))) {
+        fail('ARCHIVE_ASSET', '已保存附件缺少有效的路径、内容摘要或大小。');
       }
     }
   }
@@ -243,10 +244,10 @@ async function plan(api, remote, bundles, assetPlan) {
     if (!READY_ASSETS.has(asset.status)) return;
     const expected = formatLfsPointer(asset);
     const current = await read(asset.localPath);
-    if (current !== null && current !== expected) fail('ASSET_IMMUTABLE_CONFLICT', '远端图片路径已有不同内容，已保留原文件。');
+    if (current !== null && current !== expected) fail('ASSET_IMMUTABLE_CONFLICT', '远端附件路径已有不同内容，已保留原文件。');
     if (current === null) {
       const pointer = assetPlan.pointers.get(asset.localPath);
-      if (!pointer || pointer.content !== expected) fail('LFS_ASSET_MISSING', '图片尚未上传 LFS，暂不提交引用该图片的归档。');
+      if (!pointer || pointer.content !== expected) fail('LFS_ASSET_MISSING', '附件尚未上传 LFS，暂不提交引用该附件的归档。');
       await put(asset.localPath, pointer.content);
     }
     assetPrefixes.add(prefix);
@@ -327,7 +328,7 @@ async function plan(api, remote, bundles, assetPlan) {
           existingManifest: { ...manifest, conversations: { ...manifest.conversations, [id]: previous || localEntry } },
           productionPrefix: prefix, assets: mergedAssets });
         const rebuiltMD = rebuilt.files.find(file => file.path === markdownPath)?.content;
-        if (typeof rebuiltMD !== 'string') fail('REMOTE_DERIVATIVE_MISSING', '图片阅读文件无法重新生成，待同步任务已保留。');
+        if (typeof rebuiltMD !== 'string') fail('REMOTE_DERIVATIVE_MISSING', '附件阅读文件无法重新生成，待同步任务已保留。');
         const rebuiltEntry = rebuilt.manifest.conversations[id];
         // Receipts belong to exact native bytes. A derivative-only merge must
         // retain the strongest full-history check rather than favoring a device.
@@ -386,7 +387,7 @@ async function plan(api, remote, bundles, assetPlan) {
     for (const path of remote.entries.keys()) if (path.startsWith(`${prefix}/assets/`) && path.endsWith('/.gitattributes')) {
       const text = await read(path);
       if (text?.split(/\r?\n/).some(line => line.trim() && !line.trimStart().startsWith('#'))) {
-        fail('LFS_ATTRIBUTES_CONFLICT', '图片目录包含自定义 Git 属性规则，请先处理后再启用 LFS。');
+        fail('LFS_ATTRIBUTES_CONFLICT', '附件目录包含自定义 Git 属性规则，请先处理后再启用 LFS。');
       }
     }
     const previous = await read(attributesPath);
@@ -402,7 +403,7 @@ async function plan(api, remote, bundles, assetPlan) {
       { path: `${prefix}/account.json`, content: await read(`${prefix}/account.json`) });
   }
   if (changes.size > MAX_FILES || [...changes.values()].reduce((total, text) => total + encoder.encode(text).byteLength, 0) > MAX_BYTES) {
-    fail('ARCHIVE_SIZE', '包含图片指针的本批同步内容过多，请分批重试。');
+    fail('ARCHIVE_SIZE', '包含附件指针的本批同步内容过多，请分批重试。');
   }
   return { changes, conflicts, remoteWinners };
 }

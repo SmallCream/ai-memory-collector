@@ -256,7 +256,7 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
       } catch (error) {
         if (error.code === 'LFS_UPLOAD_PENDING') {
           await setSetting(key, { ...previous, status: 'pending', pending: pending.length,
-            message: '图片正在分批上传，完成后自动提交对话。', nextRetryAt: 0 });
+            message: '附件正在分批上传，完成后自动提交对话。', nextRetryAt: 0 });
           continueSoon(); return;
         }
         const attempt = (previous?.attempt || 0) + 1;
@@ -402,7 +402,7 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
       }
       case 'collector:permissions-changed': await registerContent(); break;
       case 'collector:retry-images': {
-        if (!assetService?.retryFailed) throw collectorError('ASSET_UNAVAILABLE', '当前版本不支持图片补采。');
+        if (!assetService?.retryFailed) throw collectorError('ASSET_UNAVAILABLE', '当前版本不支持附件补采。');
         if (!await browser.permissions.contains({ origins: [ORIGIN] })) throw collectorError('SITE_PERMISSION_REQUIRED', '请先恢复 ChatGPT 站点访问权限。');
         const { account } = await context(tabId, true);
         if (!account?.enabled) throw collectorError('ACCOUNT_DISABLED', '请先启用当前账号。');

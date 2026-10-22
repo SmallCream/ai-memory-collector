@@ -10,6 +10,32 @@ const attrEscape = value => String(value).replace(/&/g, '&amp;').replace(/"/g, '
 const textEscape = value => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const markdownLabel = value => String(value || '').replace(/[\r\n]/g, ' ').replace(/([\\\[\]])/g, '\\$1');
 const normalizedLabel = value => value.trim().replace(/\s+/g, ' ').toLowerCase();
+const DOWNLOAD_EXTENSION = /\.(?:zip|pdf|docx?|xlsx?|pptx?|odt|ods|odp|rtf|txt|csv|tsv|md|jsonl?|ya?ml|xml|py|[cm]?js|tsx?|jsx|css|html?|sql|sh|r)$/i;
+
+// Ordinary hyperlinks remain hyperlinks. Platform file pointers and explicit
+// document downloads are also archive resources; a filename never implies a
+// platform file ID or authorizes matching another resource by basename.
+export function isDownloadReference(value, explicitDownload = false) {
+  if (typeof value !== 'string') return false;
+  const ref = decodeHTMLEntities(value).trim();
+  if (!ref || /[\u0000-\u001f\u007f]/.test(ref)) return false;
+  if (/^(?:sandbox|sediment|file-service|platform-file|library):/i.test(ref)) return true;
+  if (/^blob:https:\/\/chatgpt\.com\//i.test(ref)) return true;
+  try {
+    const url = new URL(ref);
+    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) return false;
+    return explicitDownload || DOWNLOAD_EXTENSION.test(decodeURIComponent(url.pathname));
+  } catch { return false; }
+}
+
+export function referenceFileName(value) {
+  if (typeof value !== 'string') return undefined;
+  try {
+    const path = /^sandbox:\//i.test(value) ? value.slice('sandbox:'.length).split(/[?#]/)[0] : new URL(value).pathname;
+    const name = decodeURIComponent(path.split('/').at(-1));
+    return name && !/[\\/\u0000-\u001f\u007f]/.test(name) ? name : undefined;
+  } catch { return undefined; }
+}
 
 export function decodeHTMLEntities(value) {
   return String(value).replace(/&(#x[0-9a-f]+|#[0-9]+|[a-z]+);/gi, (whole, name) => {
@@ -255,6 +281,10 @@ function htmlReferences(token, parentTags = []) {
       mime.startsWith('video/') || parentTags.includes('video') ? 'video' :
         mime.startsWith('audio/') || parentTags.includes('audio') ? 'audio' : 'attachment' : token.tag;
   for (const attr of token.attributes) {
+    if (attr.name === 'href' && token.tag === 'a' && isDownloadReference(attr.value,
+      token.attributes.some(attribute => attribute.name === 'download'))) {
+      result.push({ ref: attr.value, kind: 'attachment', attribute: attr.name });
+    }
     if (attr.name === 'src' && ['img', 'audio', 'video', 'source'].includes(token.tag)) result.push({ ref: attr.value, kind, attribute: attr.name });
     if (attr.name === 'poster' && token.tag === 'video') result.push({ ref: attr.value, kind: 'image', attribute: 'poster' });
     if (attr.name === 'srcset' && ['img', 'source'].includes(token.tag)) {
@@ -268,7 +298,10 @@ export function extractRichReferences(text) {
   const result = [], stack = [];
   for (const token of tokenizeRichText(text)) {
     if (token.type === 'image' && token.ref) result.push({ ref: token.ref, kind: 'image', syntax: 'markdown' });
-    else if (token.type === 'link') result.push(...extractRichReferences(token.alt));
+    else if (token.type === 'link') {
+      if (isDownloadReference(token.ref)) result.push({ ref: token.ref, kind: 'attachment', syntax: 'markdown' });
+      result.push(...extractRichReferences(token.alt));
+    }
     else if (token.type === 'html') {
       result.push(...htmlReferences(token, stack).map(item => ({ ...item, syntax: 'html' })));
       if (token.closing) { const at = stack.lastIndexOf(token.tag); if (at >= 0) stack.splice(at); }
@@ -307,9 +340,11 @@ export function renderRichText(value, { resolveAsset = () => null } = {}) {
       return target ? `![${markdownLabel(token.alt)}](${destinationEscape(target)})` : `〔图片${token.alt ? `：${markdownLabel(token.alt)}` : ''}，待补采〕`;
     }
     if (token.type === 'link') {
-      const target = token.ref?.startsWith('#') ? token.ref : safePublicURL(token.ref);
+      const attachment = isDownloadReference(token.ref);
+      const target = (attachment ? resolveAsset(token.ref, { kind: 'attachment' }) : null) ||
+        (token.ref?.startsWith('#') ? token.ref : safePublicURL(token.ref));
       const label = renderRichText(token.alt, { resolveAsset });
-      return target ? `[${label}](${destinationEscape(target)})` : label;
+      return target ? `[${label}](${destinationEscape(target)})` : `${label}${attachment ? '〔附件待补采〕' : ''}`;
     }
     if (token.type !== 'html') return '';
     if (!SAFE_TAGS.has(token.tag)) return textEscape(token.raw);
@@ -319,7 +354,7 @@ export function renderRichText(value, { resolveAsset = () => null } = {}) {
       return stack.splice(at).reverse().map(tag => `</${tag}>`).join('');
     }
     const attrs = [];
-    let hasImage = false;
+    let hasImage = false, pendingAttachment = false;
     for (const attr of token.attributes) {
       const name = attr.name, value = attr.value;
       if (['alt', 'title'].includes(name)) attrs.push(`${name}="${attrEscape(value)}"`);
@@ -329,8 +364,11 @@ export function renderRichText(value, { resolveAsset = () => null } = {}) {
       else if (name === 'controls' && ['audio', 'video'].includes(token.tag)) attrs.push('controls');
       else if (name === 'type' && token.tag === 'source' && /^[a-z]+\/[a-z0-9.+-]+$/i.test(value)) attrs.push(`type="${attrEscape(value)}"`);
       else if (name === 'href' && token.tag === 'a') {
-        const href = value.startsWith('#') ? value : safePublicURL(value);
+        const attachment = isDownloadReference(value, token.attributes.some(attribute => attribute.name === 'download'));
+        const href = (attachment ? resolveAsset(value, { kind: 'attachment' }) : null) ||
+          (value.startsWith('#') ? value : safePublicURL(value));
         if (href) attrs.push(`href="${attrEscape(href)}"`, 'rel="noreferrer noopener"');
+        else if (attachment) pendingAttachment = true;
       } else if ((name === 'src' && ['img', 'audio', 'video', 'source'].includes(token.tag)) || (name === 'poster' && token.tag === 'video')) {
         const target = resolveAsset(value, { kind: name === 'poster' ? 'image' : token.tag });
         if (target) { attrs.push(`${name}="${attrEscape(target)}"`); hasImage = true; }
@@ -345,7 +383,7 @@ export function renderRichText(value, { resolveAsset = () => null } = {}) {
     if (token.tag === 'img' && !hasImage) return '〔图片，待补采〕';
     if (['audio', 'video'].includes(token.tag) && !attrs.includes('controls')) attrs.push('controls');
     if (!token.selfClosing) stack.push(token.tag);
-    return `<${token.tag}${attrs.length ? ' ' + attrs.join(' ') : ''}>`;
+    return `<${token.tag}${attrs.length ? ' ' + attrs.join(' ') : ''}>${pendingAttachment ? '〔附件待补采〕' : ''}`;
   });
   output.push(...stack.reverse().map(tag => `</${tag}>`));
   return output.join('').replace(/^\n+|\n+$/g, '');

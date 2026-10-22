@@ -473,10 +473,43 @@ test('verified public external image retains link and never uploads its bytes', 
   assert.ok(![...env.fs.files.keys()].some(path => path.includes('/assets/')));
 });
 
-test('non-image attachments stay references and do not create retry tasks', async () => {
-  const env = setup(); await env.save(detail([{ content_type: 'file', file_id: 'file_document', mime_type: 'application/pdf', name: 'manual.pdf' }]));
-  assert.equal((await env.fs.getSetting(`assetJobs:${account.accountKey}`)).tasks.length, 0);
-  assert.equal((await env.tick()).runnable, false); assert.equal(env.captures.length, 0);
+test('downloadable ZIP/PDF attachments use capture, Markdown, LFS upload and new-machine restore', async t => {
+  const files = [
+    { fileName: 'bundle.zip', mimeType: 'application/zip', bytes: new Uint8Array(Buffer.from('UEsDBBQAAAAAAIaLVl2fm+xuBwAAAAcAAAAKAAAAUkVBRE1FLnR4dGV4YW1wbGVQSwECFAMUAAAAAACGi1Zdn5vsbgcAAAAHAAAACgAAAAAAAAAAAAAAgAEAAAAAUkVBRE1FLnR4dFBLBQYAAAAAAQABADgAAAAvAAAAAAA=', 'base64')) },
+    { fileName: 'manual.pdf', mimeType: 'application/pdf', bytes: new TextEncoder().encode('%PDF-1.7\n1 0 obj <<>> endobj\n%%EOF\n') },
+  ];
+  for (const file of files) await t.test(file.fileName, async () => {
+    const env = setup();
+    env.dependencies.resolveAsset = async input => { env.captures.push(input); return { bytes: file.bytes, mimeType: file.mimeType, quality: 'original' }; }; env.restart();
+    const source = detail([{ content_type: 'file', file_id: 'file_document', mime_type: file.mimeType, name: file.fileName }]);
+    const saved = await env.save(source), native = env.fs.text(saved.entry.jsonPath);
+    assert.equal((await env.fs.getSetting(`assetJobs:${account.accountKey}`)).tasks.length, 1);
+    env.restart(); assert.equal((await env.tick()).pending, 0);
+    const entry = (await env.manifest()).conversations['conversation-one'], asset = entry.assets[0];
+    assert.equal(asset.status, 'downloaded'); assert.ok(asset.localPath.endsWith(`.${file.fileName.split('.').at(-1)}`));
+    assert.deepEqual(env.fs.files.get(asset.localPath), file.bytes);
+    assert.equal(env.fs.text(entry.jsonPath), native);
+    assert.ok(env.fs.text(entry.markdownPath).includes(asset.localPath.split('/').at(-1)));
+    const pointers = await env.service.prepareUploads({ directory: env.fs.directory, account, config, bundles: bundle(entry.assets) });
+    assert.equal(pointers.length, 1); assert.equal(env.uploads.length, 1); assert.deepEqual(env.uploads[0].bytes, file.bytes);
+    const other = memoryBinaryFs();
+    assert.equal((await env.service.hydrateAssets({ directory: other.directory, account, entry, config, snapshot: snapshot(entry.assets) })).downloaded, 1);
+    assert.deepEqual(other.files.get(asset.localPath), file.bytes);
+    const report = await env.service.diagnostics({ directory: env.fs.directory, account, github: config });
+    assert.equal(report.uploadTotal, 1); assert.equal(report.uploadItems[0].fileName, file.fileName);
+  });
+});
+
+test('an HTML login response for a ZIP remains a retryable attachment and never enters LFS', async () => {
+  const env = setup();
+  env.dependencies.resolveAsset = async () => ({ bytes: new TextEncoder().encode('<html>Sign in</html>'), mimeType: 'application/zip' }); env.restart();
+  const saved = await env.save(detail([{ content_type: 'file', file_id: 'file_document', mime_type: 'application/zip', name: 'bundle.zip' }]));
+  const native = env.fs.text(saved.entry.jsonPath);
+  assert.equal((await env.tick()).pending, 1);
+  assert.equal((await env.fs.getSetting(`assetJobs:${account.accountKey}`)).tasks[0].error.code, 'ASSET_FORMAT');
+  assert.equal(env.fs.text(saved.entry.jsonPath), native);
+  assert.ok(![...env.fs.files.keys()].some(path => path.includes('/assets/')));
+  assert.deepEqual(await env.service.prepareUploads({ directory: env.fs.directory, account, config, bundles: bundle((await env.manifest()).conversations['conversation-one'].assets) }), []);
 });
 
 test('manual native JSON changes stop image processing before resolver or outbox changes', async () => {

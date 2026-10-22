@@ -405,3 +405,97 @@ test('unterminated code fences are closed for the next speaker but never scanned
   assert.equal(renderRichText(source), source + '\n```');
   assert.equal(tokenizeRichText(source)[0].type, 'code');
 });
+
+test('download links become attachment resources while examples and ordinary hyperlinks remain untouched', () => {
+  const source = [
+    '[下载 ZIP](sandbox:/workspace/scratch/synthetic/dist/archive.zip)',
+    '[报告][document]',
+    '[document]: <sandbox:/mnt/data/report%20final.pdf>',
+    '<a href="sandbox:/mnt/data/table.xlsx">表格</a>',
+    '<a href="https://files.example.test/export" download="bundle.zip">导出</a>',
+    '[说明](https://example.test/guide)',
+    '[公开文档](https://files.example.test/report.docx)',
+    '`[示例](sandbox:/mnt/data/code.zip)`',
+    '```markdown', '[示例](sandbox:/mnt/data/fenced.zip)', '```',
+    '<pre><a href="sandbox:/mnt/data/example.zip">example</a></pre>',
+    '<a href="javascript:alert(1)" download>unsafe</a>',
+  ].join('\n');
+  const references = extractRichReferences(source);
+  assert.deepEqual(references.map(reference => reference.ref), [
+    'sandbox:/workspace/scratch/synthetic/dist/archive.zip', 'sandbox:/mnt/data/report%20final.pdf',
+    'sandbox:/mnt/data/table.xlsx', 'https://files.example.test/export', 'https://files.example.test/report.docx',
+  ]);
+  assert.ok(references.every(reference => reference.kind === 'attachment'));
+  assert.equal(references[2].attribute, 'href');
+});
+
+test('sandbox attachment identities retain exact full paths and never borrow IDs from matching filenames', async () => {
+  const source = conversation('[first](sandbox:/mnt/data/one/archive.zip)\n[second](sandbox:/mnt/data/two/archive.zip)\n' +
+    '[encoded](sandbox:/mnt/data/%E6%96%87%E4%BB%B6%20final.docx)');
+  source.messages[0].metadata = { attachments: [{ id: 'file_synthetic_other_archive', name: 'archive.zip', mime_type: 'application/zip' }] };
+  const snapshot = structuredClone(source);
+  const assets = await extractAssets(source);
+  assert.equal(assets.length, 4);
+  assert.equal(new Set(assets.map(asset => asset.id)).size, 4);
+  for (const asset of assets.slice(0, 3)) {
+    assert.equal(asset.kind, 'attachment'); assert.equal(asset.sourceType, 'platform');
+    assert.equal(asset.fileId, undefined); assert.equal(asset.libraryFileId, undefined);
+    assert.equal(asset.retrieval.url, asset.sourceRef); assert.equal(asset.status, 'pending');
+  }
+  assert.deepEqual(assets.slice(0, 3).map(asset => asset.fileName), ['archive.zip', 'archive.zip', '文件 final.docx']);
+  assert.deepEqual(source, snapshot);
+});
+
+test('downloaded Markdown and HTML attachments render local hyperlinks, preserving native JSON and account isolation', async () => {
+  const source = conversation('[下载 ZIP](sandbox:/workspace/scratch/synthetic/dist/archive.zip)\n' +
+    '<a href="sandbox:/mnt/data/report.pdf" download="report.pdf" onclick="bad()">报告</a>');
+  const snapshot = structuredClone(source), assets = await extractAssets(source);
+  for (const [index, asset] of assets.entries()) {
+    asset.status = 'downloaded'; asset.localPath = `${prefix}/assets/${'a'.repeat(64)}.${index ? 'pdf' : 'zip'}`;
+  }
+  const archive = await build(source, JSON.parse(JSON.stringify(assets)));
+  assert.match(archive.files[1].content, /\[下载 ZIP\]\(\.\.\/\.\.\/\.\.\/assets\/[a-f0-9]+\.zip\)/);
+  assert.match(archive.files[1].content, /<a href="\.\.\/\.\.\/\.\.\/assets\/[a-f0-9]+\.pdf" rel="noreferrer noopener">报告<\/a>/);
+  assert.doesNotMatch(archive.files[1].content, /onclick|sandbox:|待补采/);
+  assert.deepEqual(JSON.parse(archive.files[0].content), snapshot);
+  assets[0].localPath = `data/web/chatgpt/other/assets/${'a'.repeat(64)}.zip`;
+  const blocked = await build(source, assets);
+  assert.match(blocked.files[1].content, /下载 ZIP〔附件待补采〕/);
+  assert.doesNotMatch(blocked.files[1].content, /other\/assets/);
+});
+
+test('unavailable download links retain their labels with a pending marker and never expose signed credentials', () => {
+  const text = '[下载 ZIP](sandbox:/mnt/data/archive.zip)\n' +
+    '<a href="sandbox:/mnt/data/report.pdf">报告</a>\n' +
+    '[私有文档](https://files.example.test/report.docx?sig=synthetic-secret)\n' +
+    '[普通网页](https://example.test/article)';
+  const rendered = renderRichText(text);
+  assert.match(rendered, /下载 ZIP〔附件待补采〕/);
+  assert.match(rendered, /<a>〔附件待补采〕报告<\/a>/);
+  assert.match(rendered, /私有文档〔附件待补采〕/);
+  assert.match(rendered, /\[普通网页\]\(https:\/\/example.test\/article\)/);
+  assert.doesNotMatch(rendered, /synthetic-secret|sandbox:/);
+});
+
+test('a repeated sandbox path keeps each generating message version separate in Markdown', async () => {
+  const ref = 'sandbox:/mnt/data/archive.zip';
+  const source = conversation(`[first](${ref}) [same file](${ref})`);
+  source.messages.push({ id: 'assistant-next', role: 'assistant', content: `[second](${ref})` });
+  const assets = await extractAssets(source);
+  assert.equal(assets.length, 2); assert.notEqual(assets[0].id, assets[1].id);
+  for (const [index, asset] of assets.entries()) {
+    asset.status = 'downloaded'; asset.localPath = `${prefix}/assets/${String(index + 1).repeat(64)}.zip`;
+  }
+  const resolver = createAssetResolver(assets, markdownPath);
+  assert.equal(resolver(ref), null);
+  assert.equal(resolver(ref, { messageId: 'missing-message' }), null);
+  assert.equal(resolver(ref, { messageId: 'user-msg' }), `../../../assets/${'1'.repeat(64)}.zip`);
+  const archive = await build(source, assets);
+  assert.ok(archive.files[1].content.includes(`[first](../../../assets/${'1'.repeat(64)}.zip)`));
+  assert.ok(archive.files[1].content.includes(`[same file](../../../assets/${'1'.repeat(64)}.zip)`));
+  assert.ok(archive.files[1].content.includes(`[second](../../../assets/${'2'.repeat(64)}.zip)`));
+  assets[1].status = 'pending'; delete assets[1].localPath;
+  const incomplete = await build(source, assets);
+  assert.ok(incomplete.files[1].content.includes(`[first](../../../assets/${'1'.repeat(64)}.zip)`));
+  assert.match(incomplete.files[1].content, /second〔附件待补采〕/);
+});

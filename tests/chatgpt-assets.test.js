@@ -630,3 +630,222 @@ test('private host literals, signed URLs and embedded credentials are not probed
   }
   assert.equal(calls, 0);
 });
+
+const ZIP = new Uint8Array([0x50, 0x4b, 0x05, 0x06, ...Array(18).fill(0)]);
+const PDF = new TextEncoder().encode('%PDF-1.7\nsynthetic document\n%%EOF\n');
+const sandbox = { sourceRef: 'sandbox:/mnt/data/synthetic%20report.zip', kind: 'attachment',
+  fileName: 'synthetic report.zip', messageId: 'synthetic-assistant-message' };
+const interpreterURL = `https://chatgpt.com/backend-api/conversation/${conversationId}/interpreter/download?download_intent=true&message_id=synthetic-assistant-message&sandbox_path=%2Fmnt%2Fdata%2Fsynthetic+report.zip`;
+const fileResponse = (bytes = ZIP, type = 'application/zip', headers = {}) => new Response(bytes, { headers: { 'content-type': type, ...headers } });
+
+test('generated ZIP uses its exact conversation, message and sandbox path, then follows the actual resource mapping', async t => {
+  for (const mode of ['direct', 'json-link', 'location', 'native-follow']) await t.test(mode, async () => {
+    const h = harness({ serve: (url, options) => {
+      if (url === interpreterURL) {
+        if (mode === 'json-link') return jsonResponse({ download_url: estuaryURL });
+        if (mode === 'location') return new Response(null, { status: 302, headers: { location: estuaryURL } });
+        if (mode === 'native-follow') return options.redirect === 'manual' ? { type: 'opaqueredirect' } : locatedResponse(fileResponse(), estuaryURL);
+        return fileResponse();
+      }
+      if (url === estuaryURL) return fileResponse();
+      throw new Error('unexpected attachment request');
+    } });
+    let probeResult;
+    const resolver = createChatGPTAssetResolver(browserFor(h, { mutate: value => { probeResult = value; return value; } }), { allowFileDownload: true });
+    const value = await resolver.resolve({ tabId: 3, account: ACCOUNT, conversationId, asset: sandbox });
+    assert.deepEqual(value.bytes, ZIP); assert.equal(value.fileName, sandbox.fileName);
+    assert.equal(value.mimeType, 'application/zip'); assert.equal(value.via, 'interpreter-download');
+    assert.equal(value.sha256, await hash(ZIP));
+    assert.deepEqual(h.calls.filter(call => call.url !== sessionURL).map(call => call.url), mode === 'direct' ? [interpreterURL] :
+      mode === 'native-follow' ? [interpreterURL, interpreterURL] : [interpreterURL, estuaryURL]);
+    for (const item of [probeResult, value]) assert.doesNotMatch(JSON.stringify(item), /https:\/\/|synthetic-estuary-secret|synthetic-secret-token|sandbox_path/);
+  });
+});
+
+test('reused sandbox paths produce distinct request identities for each source message', async () => {
+  const h = harness({ serve: () => fileResponse() });
+  const resolver = createChatGPTAssetResolver(browserFor(h), { allowFileDownload: true });
+  for (const messageId of ['synthetic-message-A', 'synthetic-message-B']) {
+    await resolver.resolve({ tabId: 3, account: ACCOUNT, conversationId, asset: { ...sandbox, messageId } });
+  }
+  const entries = h.calls.filter(call => call.url !== sessionURL).map(call => new URL(call.url));
+  assert.deepEqual(entries.map(url => url.searchParams.get('message_id')), ['synthetic-message-A', 'synthetic-message-B']);
+  assert.ok(entries.every(url => url.searchParams.get('sandbox_path') === '/mnt/data/synthetic report.zip'));
+});
+
+test('sandbox acquisition requires explicit file opt-in plus task conversation and message IDs', async t => {
+  for (const value of [
+    { name: 'disabled', options: {}, conversationId, asset: sandbox },
+    { name: 'missing conversation', options: { allowFileDownload: true }, asset: sandbox },
+    { name: 'missing message', options: { allowFileDownload: true }, conversationId, asset: { ...sandbox, messageId: undefined } },
+  ]) await t.test(value.name, async () => {
+    const h = harness();
+    await assert.rejects(createChatGPTAssetResolver(browserFor(h), value.options).resolve({ tabId: 3, account: ACCOUNT,
+      conversationId: value.conversationId, asset: value.asset }), { code: 'ASSET_PENDING' });
+    assert.deepEqual(h.calls.map(call => call.url), [sessionURL, sessionURL]);
+  });
+  for (const patch of [ { sourceRef: 'sandbox:/mnt/../secret.zip' }, { sourceRef: 'sandbox://other/secret.zip' },
+    { sourceRef: 'sandbox:/mnt/%2e%2e/secret.zip' }, { sourceRef: 'sandbox:/mnt/a%00.zip' },
+    { messageId: '../other' }, { messageId: 'x?secret=value' } ]) {
+    const h = harness();
+    await assert.rejects(createChatGPTAssetResolver(browserFor(h), { allowFileDownload: true }).resolve({ tabId: 3, account: ACCOUNT,
+      conversationId, asset: { ...sandbox, ...patch } }), { code: 'ASSET_INPUT' });
+    assert.equal(h.calls.length, 0);
+  }
+});
+
+test('sandbox response cannot bless an arbitrary origin, unrelated route, ambiguous ID or a known conflicting file ID', async t => {
+  for (const value of [
+    { name: 'external', url: 'https://attacker.example/report.zip' },
+    { name: 'other same-origin endpoint', url: 'https://chatgpt.com/backend-api/other/download?id=file_testA' },
+    { name: 'ambiguous ID', url: `${estuaryURL}&id=file_testA` },
+    { name: 'known conflicting ID', url: estuaryURL, patch: { fileId: 'file_expected' } },
+  ]) await t.test(value.name, async () => {
+    let reads = 0;
+    const h = harness({ serve: (url, options) => {
+      if (url !== interpreterURL) return new Response('', { status: 404 });
+      if (options.redirect === 'manual') return { type: 'opaqueredirect' };
+      return { type: 'basic', url: value.url, ok: true, status: 200, headers: new Headers({ 'content-type': 'application/zip' }),
+        get body() { reads++; return null; } };
+    } });
+    await assert.rejects(createChatGPTAssetResolver(browserFor(h), { allowFileDownload: true }).resolve({ tabId: 3, account: ACCOUNT,
+      conversationId, asset: { ...sandbox, ...value.patch } }));
+    assert.equal(reads, 0);
+    assert.ok(h.calls.every(call => call.url.startsWith('https://chatgpt.com/')));
+  });
+});
+
+test('generated attachments retain account, content, size, hash and format gates before archival', async t => {
+  for (const value of [
+    { name: 'initial wrong account', sessions: ['synthetic-user-B'], code: 'ACCOUNT_CHANGED', noDownload: true },
+    { name: 'account switch', sessions: ['synthetic-user-A', 'synthetic-user-B'], code: 'ACCOUNT_CHANGED' },
+    { name: 'expired source', response: () => new Response('', { status: 404 }), code: 'HTTP_404' },
+    { name: 'login page', response: () => fileResponse(new TextEncoder().encode('<html>login</html>'), 'text/html'), code: 'ASSET_FORMAT' },
+    { name: 'HTML mislabeled zip', response: () => fileResponse(new TextEncoder().encode('<html>login</html>')), code: 'ASSET_FORMAT' },
+    { name: 'corrupt ZIP', response: () => fileResponse(new Uint8Array([0x50, 0x4b, 3, 4, 0])), code: 'ASSET_FORMAT' },
+    { name: 'wrong MIME', response: () => fileResponse(ZIP, 'application/pdf'), code: 'ASSET_FORMAT' },
+    { name: 'wrong original size', patch: { expectedSize: ZIP.length + 1 }, code: 'ASSET_VARIANT' },
+    { name: 'wrong original hash', patch: { sha256: '0'.repeat(64) }, code: 'ASSET_HASH_MISMATCH' },
+    { name: 'stream bound', limit: 10, code: 'ASSET_TOO_LARGE' },
+  ]) await t.test(value.name, async () => {
+    const h = harness({ sessions: value.sessions, serve: value.response || (() => fileResponse()) });
+    await assert.rejects(createChatGPTAssetResolver(browserFor(h), { allowFileDownload: true, maxBytes: value.limit || 1024 }).resolve({
+      tabId: 3, account: ACCOUNT, conversationId, asset: { ...sandbox, ...value.patch } }), { code: value.code });
+    if (value.noDownload) assert.deepEqual(h.calls.map(call => call.url), [sessionURL]);
+  });
+});
+
+test('PDF and source files use existing exact file IDs with canonical types and full byte validation', async t => {
+  for (const value of [
+    { name: 'report.pdf', bytes: PDF, mime: 'application/pdf' },
+    { name: 'readme.md', bytes: new TextEncoder().encode('# Synthetic\n'), mime: 'text/markdown' },
+    { name: 'script.py', bytes: new TextEncoder().encode('print("synthetic")\n'), mime: 'text/x-python' },
+    { name: 'settings.yaml', bytes: new TextEncoder().encode('synthetic: true\n'), mime: 'application/yaml' },
+    { name: 'query.sql', bytes: new TextEncoder().encode('select 1;\n'), mime: 'application/sql' },
+    { name: 'script.sh', bytes: new TextEncoder().encode('echo synthetic\n'), mime: 'application/x-sh' },
+  ]) await t.test(value.name, async () => {
+    const h = harness({ serve: () => fileResponse(value.bytes, value.mime) });
+    const resolver = createChatGPTAssetResolver(browserFor(h), { allowFileDownload: true });
+    const result = await resolver.resolve({ tabId: 3, account: ACCOUNT, conversationId,
+      asset: { kind: 'attachment', fileId: 'file_testA', fileName: value.name, mimeType: value.mime, expectedSize: value.bytes.length } });
+    assert.deepEqual(result.bytes, value.bytes); assert.equal(result.fileName, value.name);
+    assert.equal(result.mimeType, value.mime); assert.equal(result.quality, 'original');
+    assert.deepEqual(h.calls.map(call => call.url), [sessionURL, fileDownloadURL, sessionURL]);
+  });
+});
+
+test('JSON attachments are distinguished from JSON download envelopes without navigating their contents', async () => {
+  const content = { url: 'https://attacker.example/do-not-follow', synthetic: true };
+  const cdn = 'https://sdmntprtest.oaiusercontent.com/settings.json';
+  for (const explicitAttachment of [true, false]) {
+    const h = harness({ serve: url => url === interpreterURL && !explicitAttachment ? jsonResponse({ download_url: cdn }) :
+      fileResponse(new TextEncoder().encode(JSON.stringify(content)), 'application/json', explicitAttachment ? { 'content-disposition': 'attachment; filename="settings.json"' } : {}) });
+    const source = { ...sandbox, fileName: 'settings.json' };
+    // The source path is independent from the presentation filename.
+    const resolver = createChatGPTAssetResolver(browserFor(h), { allowFileDownload: true });
+    const result = await resolver.resolve({ tabId: 3, account: ACCOUNT, conversationId, asset: source });
+    assert.deepEqual(JSON.parse(new TextDecoder().decode(result.bytes)), content);
+    assert.equal(result.mimeType, 'application/json');
+    assert.ok(h.calls.every(call => call.url !== content.url));
+  }
+});
+
+test('public ZIP links are anonymously verified as external and invalid payloads remain unknown', async () => {
+  for (const bytes of [ZIP, new Uint8Array([0x50, 0x4b, 3, 4])]) {
+    let options;
+    const result = await validateExternalAsset({ url: 'https://images.example/archive.zip', browser: externalBrowser(true),
+      asset: { kind: 'attachment', fileName: 'archive.zip' }, fetchImpl: async (_, input) => { options = input; return fileResponse(bytes); } });
+    assert.equal(result.status, bytes === ZIP ? 'external' : 'unknown');
+    assert.equal(options.credentials, 'omit'); assert.deepEqual(options.headers, {});
+    assert.equal(result.bytes, undefined);
+  }
+});
+
+test('a JSON file cannot turn an HTTP 200 error envelope at its canonical download entry into archived content', async () => {
+  const h = harness({ serve: () => jsonResponse({ error: 'synthetic-expired-file' }) });
+  await assert.rejects(createChatGPTAssetResolver(browserFor(h), { allowFileDownload: true }).resolve({ tabId: 3, account: ACCOUNT,
+    conversationId, asset: { ...sandbox, fileName: 'settings.json' } }), { code: 'ASSET_PROTOCOL' });
+  assert.deepEqual(h.calls.map(call => call.url), [sessionURL, interpreterURL, sessionURL]);
+});
+
+test('known response MIME can identify an unnamed private ZIP while bytes still undergo container validation', async () => {
+  const h = harness({ serve: () => fileResponse() });
+  const value = await createChatGPTAssetResolver(browserFor(h), { allowFileDownload: true }).resolve({ tabId: 3, account: ACCOUNT,
+    conversationId, asset: { fileId: 'file_testA', kind: 'attachment' } });
+  assert.deepEqual(value.bytes, ZIP); assert.equal(value.fileName, 'file_testA.zip');
+});
+
+function syntheticOfficeZip(names) {
+  const parts = [], central = []; let offset = 0, centralSize = 0;
+  for (const name of names) {
+    const encoded = new TextEncoder().encode(name), local = new Uint8Array(30 + encoded.length), directory = new Uint8Array(46 + encoded.length);
+    const lv = new DataView(local.buffer), dv = new DataView(directory.buffer);
+    lv.setUint32(0, 0x04034b50, true); lv.setUint16(4, 20, true); lv.setUint16(26, encoded.length, true); local.set(encoded, 30);
+    dv.setUint32(0, 0x02014b50, true); dv.setUint16(4, 20, true); dv.setUint16(6, 20, true);
+    dv.setUint16(28, encoded.length, true); dv.setUint32(42, offset, true); directory.set(encoded, 46);
+    parts.push(local); central.push(directory); offset += local.length; centralSize += directory.length;
+  }
+  const end = new Uint8Array(22), ev = new DataView(end.buffer);
+  ev.setUint32(0, 0x06054b50, true); ev.setUint16(8, names.length, true); ev.setUint16(10, names.length, true);
+  ev.setUint32(12, centralSize, true); ev.setUint32(16, offset, true);
+  const bytes = new Uint8Array(offset + centralSize + 22); let cursor = 0;
+  for (const part of [...parts, ...central, end]) { bytes.set(part, cursor); cursor += part.length; }
+  return bytes;
+}
+
+test('Office attachments permit ZIP transport only when the returned container matches the requested document format', async t => {
+  for (const value of [
+    { name: 'report.docx', entry: 'word/document.xml', mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },
+    { name: 'report.xlsx', entry: 'xl/workbook.xml', mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
+    { name: 'report.pptx', entry: 'ppt/presentation.xml', mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' },
+  ]) await t.test(value.name, async () => {
+    const bytes = syntheticOfficeZip(['[Content_Types].xml', value.entry]);
+    for (const transport of ['application/zip', 'application/x-zip-compressed']) {
+      const h = harness({ serve: () => fileResponse(bytes, transport) });
+      const source = { ...sandbox, fileName: value.name, mimeType: value.mime };
+      const result = await createChatGPTAssetResolver(browserFor(h), { allowFileDownload: true }).resolve({
+        tabId: 3, account: ACCOUNT, conversationId, asset: source });
+      assert.deepEqual(result.bytes, bytes); assert.equal(result.mimeType, value.mime); assert.equal(result.fileName, value.name);
+    }
+    const wrong = harness({ serve: () => fileResponse(ZIP) });
+    await assert.rejects(createChatGPTAssetResolver(browserFor(wrong), { allowFileDownload: true }).resolve({
+      tabId: 3, account: ACCOUNT, conversationId, asset: { ...sandbox, fileName: value.name, mimeType: value.mime } }), { code: 'ASSET_FORMAT' });
+  });
+});
+
+test('Office ZIP metadata and extensionless Office MIME keep the document type after verification', async () => {
+  const mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  const bytes = syntheticOfficeZip(['[Content_Types].xml', 'word/document.xml']);
+  for (const patch of [{ fileName: 'report.docx', mimeType: 'application/zip' }, { fileName: '', mimeType }]) {
+    const h = harness({ serve: () => fileResponse(bytes) });
+    const result = await createChatGPTAssetResolver(browserFor(h), { allowFileDownload: true }).resolve({
+      tabId: 3, account: ACCOUNT, conversationId, asset: { kind: 'attachment', fileId: 'file_testA', ...patch } });
+    assert.deepEqual(result.bytes, bytes); assert.equal(result.mimeType, mimeType); assert.match(result.fileName, /\.docx$/);
+  }
+});
+
+test('an unrelated image at a public ZIP URL does not verify the requested attachment', async () => {
+  const value = await validateExternalAsset({ url: 'https://images.example/archive.zip', browser: externalBrowser(true),
+    asset: { kind: 'attachment', fileName: 'archive.zip' }, fetchImpl: async () => pngResponse() });
+  assert.deepEqual(value, { status: 'unknown', reason: 'content-mismatch' });
+});

@@ -2,7 +2,7 @@
 import { renderRichText } from './rich-content.js';
 import { createAssetResolver, sanitizeAssetRecords, extractAssets } from './assets.js';
 import { inspectMessageGeneration } from './message-generation.js';
-export const RENDERER_VERSION = 'rich-1';
+export const RENDERER_VERSION = 'rich-2';
 const PLATFORM = 'chatgpt';
 const SECRET_KEYS = new Set(['accesstoken', 'access_token', 'refreshtoken', 'refresh_token',
   'authorization', 'cookie', 'set-cookie', 'sessiontoken', 'session_token',
@@ -295,7 +295,8 @@ export async function buildArchive({ conversation, identity, capturedAt, existin
     }
   }
   const resolveAsset = createAssetResolver(renderRecords, markdownPath);
-  const displayed = selectedMessages.map(({ node }) => displayedMessage(node.message, resolveAsset, assets !== undefined)).filter(Boolean);
+  const displayed = selectedMessages.map(({ node, nodeKey }) => displayedMessage(node.message,
+    (ref, options) => resolveAsset(ref, { ...options, messageId: String(node.message.id ?? nodeKey) }), assets !== undefined)).filter(Boolean);
   const lines = [`# ${label(title)}`, ''];
   for (const [index, message] of displayed.entries()) {
     if (index) lines.push('---', '');

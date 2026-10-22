@@ -1,9 +1,24 @@
-/** Experimental read-only image retrieval. No download URL or session credential leaves the page. */
+import { assetExtension, inspectAttachmentBytes } from './asset-store.js';
+
+/** Read-only attachment retrieval. No download URL or session credential leaves the page. */
 export const DEFAULT_ASSET_LIMIT = 16 * 1024 * 1024;
 const ACCOUNT = /^acct-[a-f0-9]{24}$/;
 const FILE = /^file[-_][A-Za-z0-9_-]{1,160}$/;
 const LIBRARY = /^libfile_[A-Za-z0-9_-]{1,160}$/;
 const CONVERSATION = /^[a-zA-Z0-9_-]{1,100}$/;
+const FILE_MIMES = { zip: 'application/zip', pdf: 'application/pdf',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  txt: 'text/plain', md: 'text/markdown', csv: 'text/csv', tsv: 'text/tab-separated-values', json: 'application/json',
+  js: 'text/javascript', mjs: 'text/javascript', cjs: 'text/javascript', ts: 'text/plain', tsx: 'text/plain', jsx: 'text/javascript',
+  py: 'text/x-python', css: 'text/css', yaml: 'application/yaml', yml: 'application/yaml', sql: 'application/sql', sh: 'application/x-sh', xml: 'application/xml', log: 'text/plain' };
+function sandboxPath(reference) {
+  if (typeof reference !== 'string' || !reference.startsWith('sandbox:/')) return null;
+  let path; try { path = decodeURIComponent(reference.slice(8)); } catch { return null; }
+  return path.startsWith('/') && !path.startsWith('//') && !/[\\\u0000-\u001f\u007f?#]/.test(path) &&
+    !path.split('/').some(part => part === '.' || part === '..') ? path : null;
+}
 
 export class ChatGPTAssetError extends Error {
   constructor(code, message, state = 'pending') {
@@ -14,23 +29,29 @@ const failure = (code, message, state) => { throw new ChatGPTAssetError(code, me
 const isSource = value => { try { return new URL(value).origin === 'https://chatgpt.com'; } catch { return false; } };
 
 function descriptor(input) {
-  if (!input || typeof input !== 'object') failure('ASSET_INPUT', '缺少图片来源信息。', 'unavailable');
+  if (!input || typeof input !== 'object') failure('ASSET_INPUT', '缺少附件来源信息。', 'unavailable');
   const reference = input.sourceRef ?? input.assetPointer ?? input.asset_pointer;
   const referenceId = typeof reference === 'string' ? /^(?:sediment|file-service):\/\/(file[-_][A-Za-z0-9_-]+)$/.exec(reference)?.[1] : undefined;
   // Manifest `id` is a content-independent SHA-256 key, not a platform file ID.
   const fileId = input.fileId ?? input.sourceId ?? input.retrieval?.fileId ?? referenceId ?? (FILE.test(input.id || '') ? input.id : undefined);
   const libraryFileId = input.libraryFileId ?? input.library_file_id ?? input.retrieval?.libraryFileId ??
     (typeof reference === 'string' ? /^library:(libfile_[A-Za-z0-9_-]+)$/.exec(reference)?.[1] : undefined);
+  const sourcePath = sandboxPath(reference);
+  if (sourcePath && input.messageId != null && (typeof input.messageId !== 'string' || !CONVERSATION.test(input.messageId))) {
+    failure('ASSET_INPUT', '附件来源消息标识不合法。', 'unavailable');
+  }
   const retrievalURL = typeof input.retrieval?.url === 'string' && /^(?:https:|blob:)/.test(input.retrieval.url) ? input.retrieval.url : null;
   if ((fileId !== undefined && !FILE.test(fileId)) || (libraryFileId !== undefined && !LIBRARY.test(libraryFileId)) ||
-      (!fileId && !libraryFileId && !retrievalURL) || (referenceId && referenceId !== fileId)) {
-    failure('ASSET_INPUT', '图片来源标识不合法或不一致。', 'unavailable');
+      (!fileId && !libraryFileId && !retrievalURL && !sourcePath) || (referenceId && referenceId !== fileId)) {
+    failure('ASSET_INPUT', '附件来源标识不合法或不一致。', 'unavailable');
   }
   const positive = value => Number.isSafeInteger(value) && value > 0 ? value : null;
   const expectedHash = input.sha256 ?? input.contentHash;
-  if (expectedHash !== undefined && !/^[a-f0-9]{64}$/.test(expectedHash)) failure('ASSET_INPUT', '图片哈希格式无效。', 'unavailable');
-  return { fileId: fileId || null, libraryFileId: libraryFileId || null, retrievalURL,
-    fileName: String(input.fileName ?? input.name ?? '').slice(0, 200),
+  if (expectedHash !== undefined && !/^[a-f0-9]{64}$/.test(expectedHash)) failure('ASSET_INPUT', '附件哈希格式无效。', 'unavailable');
+  return { fileId: fileId || null, libraryFileId: libraryFileId || null, retrievalURL, sandboxPath: sourcePath,
+    kind: input.kind === 'image' ? 'image' : 'attachment',
+    messageId: typeof input.messageId === 'string' && CONVERSATION.test(input.messageId) ? input.messageId : null,
+    fileName: String(input.fileName ?? input.name ?? sourcePath?.split('/').at(-1) ?? '').slice(0, 200),
     mimeType: typeof (input.mimeType ?? input.mime_type) === 'string' ? (input.mimeType ?? input.mime_type).toLowerCase() : null,
     size: positive(input.expectedSize ?? input.size ?? input.sizeBytes ?? input.size_bytes), width: positive(input.width), height: positive(input.height),
     expectedHash: expectedHash || null };
@@ -44,7 +65,7 @@ function descriptor(input) {
 export function createChatGPTAssetResolver(browser, { allowLibraryDownload = false, allowFileDownload = false,
   maxBytes = DEFAULT_ASSET_LIMIT } = {}) {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > DEFAULT_ASSET_LIMIT) {
-    failure('ASSET_INPUT', '图片大小上限必须介于 1 字节和 16 MiB。', 'unavailable');
+    failure('ASSET_INPUT', '附件大小上限必须介于 1 字节和 16 MiB。', 'unavailable');
   }
   async function resolve({ tabId, account, asset, conversationId }) {
     const api = browser ?? globalThis.chrome;
@@ -54,14 +75,14 @@ export function createChatGPTAssetResolver(browser, { allowLibraryDownload = fal
       failure('IDENTITY', '缺少经过核验的 ChatGPT 账号。');
     }
     if (conversationId != null && (typeof conversationId !== 'string' || !CONVERSATION.test(conversationId))) {
-      failure('ASSET_INPUT', '图片所属对话标识不合法。', 'unavailable');
+      failure('ASSET_INPUT', '附件所属对话标识不合法。', 'unavailable');
     }
     const source = descriptor(asset);
-    if (source.size > maxBytes) failure('ASSET_TOO_LARGE', '图片超过本次自动获取的大小上限。');
+    if (source.size > maxBytes) failure('ASSET_TOO_LARGE', '附件超过本次自动获取的大小上限。');
     async function tabCheck() {
       let tab;
-      try { tab = await api.tabs.get(tabId); } catch { failure('TAB_CLOSED', '图片来源标签页已关闭。'); }
-      if (!isSource(tab.url) || (tab.pendingUrl && !isSource(tab.pendingUrl))) failure('TAB_CHANGED', '图片来源页面已离开 ChatGPT。');
+      try { tab = await api.tabs.get(tabId); } catch { failure('TAB_CLOSED', '附件来源标签页已关闭。'); }
+      if (!isSource(tab.url) || (tab.pendingUrl && !isSource(tab.pendingUrl))) failure('TAB_CHANGED', '附件来源页面已离开 ChatGPT。');
     }
     await tabCheck();
     let result;
@@ -70,19 +91,19 @@ export function createChatGPTAssetResolver(browser, { allowLibraryDownload = fal
         func: probeChatGPTAsset, args: [{ expectedAccountKey: accountKey, asset: source, conversationId: conversationId ?? null,
           allowLibraryDownload: allowLibraryDownload === true, allowFileDownload: allowFileDownload === true, maxBytes }] });
       result = values?.find(item => item.frameId === 0)?.result;
-    } catch { failure('TAB_UNAVAILABLE', '无法读取图片来源页面，请检查站点权限和登录状态。'); }
+    } catch { failure('TAB_UNAVAILABLE', '无法读取附件来源页面，请检查站点权限和登录状态。'); }
     await tabCheck();
     if (!result?.ok) {
       const code = /^[A-Z][A-Z0-9_]{0,60}$/.test(result?.error?.code || '') ? result.error.code : 'ASSET_PENDING';
-      failure(code, typeof result?.error?.message === 'string' ? result.error.message : '图片尚未取得，等待补采。',
+      failure(code, typeof result?.error?.message === 'string' ? result.error.message : '附件尚未取得，等待补采。',
         result?.error?.state === 'unavailable' ? 'unavailable' : 'pending');
     }
-    if (result.accountKey !== accountKey) failure('ACCOUNT_CHANGED', '图片采集期间账号发生变化，结果已丢弃。');
+    if (result.accountKey !== accountKey) failure('ACCOUNT_CHANGED', '附件采集期间账号发生变化，结果已丢弃。');
     const value = result.binary;
     if (!value || !Number.isSafeInteger(value.byteLength) || value.byteLength < 1 || value.byteLength > maxBytes ||
         !Array.isArray(value.chunks) || value.chunks.length < 1 || value.chunks.length > Math.ceil(maxBytes / 49152) ||
-        !/^[a-f0-9]{64}$/.test(value.sha256 || '') || !['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(value.mimeType) ||
-        !['original', 'unverified'].includes(value.quality)) failure('ASSET_RESPONSE', '图片返回格式无效，未保存。');
+        !/^[a-f0-9]{64}$/.test(value.sha256 || '') || !['image/png', 'image/jpeg', 'image/gif', 'image/webp', ...Object.values(FILE_MIMES)].includes(value.mimeType) ||
+        !['original', 'unverified'].includes(value.quality)) failure('ASSET_RESPONSE', '附件返回格式无效，未保存。');
     const bytes = new Uint8Array(value.byteLength);
     let offset = 0;
     try {
@@ -92,13 +113,16 @@ export function createChatGPTAssetResolver(browser, { allowLibraryDownload = fal
         if (offset + decoded.length > bytes.length) throw new Error();
         for (let i = 0; i < decoded.length; i++) bytes[offset++] = decoded.charCodeAt(i);
       }
-    } catch { failure('ASSET_RESPONSE', '图片传输数据无效，未保存。'); }
-    if (offset !== bytes.length) failure('ASSET_RESPONSE', '图片传输不完整，等待重试。');
+    } catch { failure('ASSET_RESPONSE', '附件传输数据无效，未保存。'); }
+    if (offset !== bytes.length) failure('ASSET_RESPONSE', '附件传输不完整，等待重试。');
     const sha256 = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(x => x.toString(16).padStart(2, '0')).join('');
-    if (sha256 !== value.sha256 || (source.expectedHash && sha256 !== source.expectedHash)) failure('ASSET_HASH_MISMATCH', '图片内容校验失败，未保存。');
-    const extension = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp' }[value.mimeType];
+    if (sha256 !== value.sha256 || (source.expectedHash && sha256 !== source.expectedHash)) failure('ASSET_HASH_MISMATCH', '附件内容校验失败，未保存。');
+    let suffix;
+    try { suffix = assetExtension(bytes, { kind: source.kind, fileName: source.fileName, mimeType: value.mimeType }); }
+    catch { failure('ASSET_FORMAT', '附件类型或文件内容无法确认，未保存。'); }
+    const extension = `.${suffix}`;
     let fileName = source.fileName.replace(/[\\/:*?"<>|\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, '_').replace(/^[. ]+|[. ]+$/g, '');
-    if (!fileName) fileName = source.fileId || source.libraryFileId || `image-${sha256.slice(0, 16)}`;
+    if (!fileName) fileName = source.fileId || source.libraryFileId || `attachment-${sha256.slice(0, 16)}`;
     if (!fileName.toLowerCase().endsWith(extension)) fileName += extension;
     return { bytes, mimeType: value.mimeType, fileName, quality: value.quality, sha256,
       width: value.width ?? null, height: value.height ?? null, byteLength: bytes.byteLength, via: value.via };
@@ -118,7 +142,7 @@ export async function resolveChatGPTAsset({ browser, allowLibraryDownload = fals
  * This helper does not request permissions or retain a copy of the image.
  */
 export async function validateExternalAsset({ url, browser = globalThis.chrome, fetchImpl = globalThis.fetch,
-  maxBytes = DEFAULT_ASSET_LIMIT } = {}) {
+  maxBytes = DEFAULT_ASSET_LIMIT, asset = {} } = {}) {
   const unknown = reason => ({ status: 'unknown', reason });
   let source;
   try { source = new URL(url); } catch { return unknown('invalid-url'); }
@@ -143,7 +167,7 @@ export async function validateExternalAsset({ url, browser = globalThis.chrome, 
     const declaredSize = response.headers.get('content-length');
     if (declaredSize && /^\d+$/.test(declaredSize) && Number(declaredSize) > maxBytes) return unknown('too-large');
     const declaredMime = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-    if (!['', 'application/octet-stream', 'binary/octet-stream', 'image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(declaredMime)) return unknown('unsupported-content');
+    if (!['', 'application/octet-stream', 'binary/octet-stream', 'image/png', 'image/jpeg', 'image/gif', 'image/webp', ...Object.values(FILE_MIMES), 'application/x-zip-compressed', 'application/javascript', 'text/x-python', 'application/x-python-code', 'application/yaml', 'application/x-yaml', 'text/yaml', 'text/xml'].includes(declaredMime)) return unknown('unsupported-content');
     reader = response.body?.getReader();
     if (!reader) return unknown('stream-unavailable');
     const chunks = []; let byteLength = 0;
@@ -164,7 +188,15 @@ export async function validateExternalAsset({ url, browser = globalThis.chrome, 
     else if (bytes.length >= 10 && ['GIF87a', 'GIF89a'].includes(ascii(0, 6))) mimeType = 'image/gif';
     else if (bytes.length >= 12 && ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP') mimeType = 'image/webp';
     else if (bytes.length >= 4 && starts([255, 216, 255])) mimeType = 'image/jpeg';
-    if (!mimeType || (declaredMime && !['application/octet-stream', 'binary/octet-stream', mimeType].includes(declaredMime))) return unknown('content-mismatch');
+    if (asset.kind === 'attachment' && FILE_MIMES[/\.([a-z0-9]+)$/i.exec(asset.fileName || '')?.[1].toLowerCase()]) mimeType = null;
+    if (!mimeType && asset.kind !== 'image') {
+      try {
+        const inspected = inspectAttachmentBytes(bytes, { ...asset, mimeType: declaredMime || asset.mimeType });
+        if (!inspected) return unknown('content-mismatch');
+        mimeType = inspected.mimeType;
+      } catch { return unknown('content-mismatch'); }
+    }
+    if (!mimeType || (mimeType.startsWith('image/') && declaredMime && !['application/octet-stream', 'binary/octet-stream', mimeType].includes(declaredMime))) return unknown('content-mismatch');
     const sha256 = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(x => x.toString(16).padStart(2, '0')).join('');
     return { status: 'external', verifiedAt: new Date().toISOString(), mimeType, byteLength, sha256 };
   } catch { return unknown(controller.signal.aborted ? 'timeout' : 'network-or-cors'); }
@@ -179,16 +211,23 @@ export async function probeChatGPTAsset(request) {
   const filePattern = /^file[-_][A-Za-z0-9_-]{1,160}$/;
   const libraryPattern = /^libfile_[A-Za-z0-9_-]{1,160}$/;
   const conversationPattern = /^[a-zA-Z0-9_-]{1,100}$/;
-  let asset, maximum, fileDownloadURL;
-  function safeURL(value, { blob = false } = {}) {
-    let url; try { url = new URL(value, 'https://chatgpt.com'); } catch { fail('ASSET_URL', '图片地址无法识别。'); }
+  const fileMimes = { zip: 'application/zip', pdf: 'application/pdf',
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    txt: 'text/plain', md: 'text/markdown', csv: 'text/csv', tsv: 'text/tab-separated-values', json: 'application/json',
+    js: 'text/javascript', mjs: 'text/javascript', cjs: 'text/javascript', ts: 'text/plain', tsx: 'text/plain', jsx: 'text/javascript',
+    py: 'text/x-python', css: 'text/css', yaml: 'application/yaml', yml: 'application/yaml', sql: 'application/sql', sh: 'application/x-sh', xml: 'application/xml', log: 'text/plain' };
+  let asset, maximum, fileDownloadURL, interpreterDownloadURL, resolvedFileId;
+  function safeURL(value, { blob = false, interpreterResult = false } = {}) {
+    let url; try { url = new URL(value, 'https://chatgpt.com'); } catch { fail('ASSET_URL', '附件地址无法识别。'); }
     if (blob && url.protocol === 'blob:' && /^blob:https:\/\/chatgpt\.com\/[A-Za-z0-9-]+$/.test(url.href)) return url;
-    if (url.protocol !== 'https:' || url.username || url.password || (url.port && url.port !== '443')) fail('ASSET_URL', '图片地址不在允许的来源范围内。');
+    if (url.protocol !== 'https:' || url.username || url.password || (url.port && url.port !== '443')) fail('ASSET_URL', '附件地址不在允许的来源范围内。');
     const host = url.hostname;
     const cdn = host === 'oaiusercontent.com' || host.endsWith('.oaiusercontent.com') ||
       /^oai(?:sdmntpr|sdsorpr|dalleapi)[a-z0-9-]*\.blob\.core\.windows\.net$/.test(host) ||
       /^oaisdmntpr[a-z0-9-]*aws\.s3\.[a-z0-9-]+\.amazonaws\.com$/.test(host);
-    if (host !== 'chatgpt.com' && !cdn) fail('ASSET_URL', '图片下载目标尚未支持，等待适配。');
+    if (host !== 'chatgpt.com' && !cdn) fail('ASSET_URL', '附件下载目标尚未支持，等待适配。');
     if (host === 'chatgpt.com') {
       const exactLibrary = asset.libraryFileId && url.pathname === `/api/library/files/${asset.libraryFileId}/download`;
       const observedFile = url.pathname.startsWith('/backend-api/files/') &&
@@ -196,23 +235,27 @@ export async function probeChatGPTAsset(request) {
       // This observed redirect route identifies the resource in the query, not
       // the path. Reject ambiguous IDs; its signed URL stays inside this probe.
       const contentIds = url.searchParams.getAll('id');
-      const observedContent = url.pathname === '/backend-api/estuary/content' && contentIds.length === 1 &&
-        filePattern.test(contentIds[0]) && contentIds[0] === asset.fileId;
-      if (!exactLibrary && !observedFile && !observedContent) fail('ASSET_URL', '图片下载地址与当前资源不匹配。');
+      const validContentId = url.pathname === '/backend-api/estuary/content' && contentIds.length === 1 && filePattern.test(contentIds[0]);
+      // The interpreter entry itself is bound to conversation + message + full
+      // sandbox path. Only its actual response may establish a new file ID.
+      if (interpreterResult && validContentId && !asset.fileId && !resolvedFileId) resolvedFileId = contentIds[0];
+      const observedContent = validContentId && contentIds[0] === (asset.fileId || resolvedFileId);
+      const exactInterpreter = interpreterDownloadURL && url.href === interpreterDownloadURL;
+      if (!exactLibrary && !observedFile && !observedContent && !exactInterpreter) fail('ASSET_URL', '附件下载地址与当前资源不匹配。');
     }
     return url;
   }
   async function bytesOf(response, limit) {
     const declared = response.headers.get('content-length');
-    if (declared && /^\d+$/.test(declared) && Number(declared) > limit) fail('ASSET_TOO_LARGE', '图片响应超过大小上限。');
+    if (declared && /^\d+$/.test(declared) && Number(declared) > limit) fail('ASSET_TOO_LARGE', '附件响应超过大小上限。');
     const reader = response.body?.getReader();
-    if (!reader) fail('ASSET_STREAM', '当前环境不能安全读取有界图片响应。');
+    if (!reader) fail('ASSET_STREAM', '当前环境不能安全读取有界附件响应。');
     const chunks = []; let size = 0;
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > limit) { await reader.cancel(); fail('ASSET_TOO_LARGE', '图片响应超过大小上限。'); }
+      if (size > limit) { await reader.cancel(); fail('ASSET_TOO_LARGE', '附件响应超过大小上限。'); }
       chunks.push(value);
     }
     const result = new Uint8Array(size); let offset = 0;
@@ -229,7 +272,7 @@ export async function probeChatGPTAsset(request) {
       let response = await fetch(url, options);
       if (response.type === 'opaqueredirect' && !sessionRequest && allowNativeRedirectFollow &&
           ((asset.libraryFileId && url === `https://chatgpt.com/api/library/files/${asset.libraryFileId}/download`) ||
-            (fileDownloadURL && url === fileDownloadURL))) {
+            (fileDownloadURL && url === fileDownloadURL) || (interpreterDownloadURL && url === interpreterDownloadURL))) {
         // Browser fetch hides Location on manual redirects. Only these canonical
         // platform download entries may delegate a redirect chain to the browser.
         // Fetch removes Authorization on cross-origin redirects; same-origin
@@ -237,30 +280,32 @@ export async function probeChatGPTAsset(request) {
         // are not prevalidated; the final destination is checked before reading.
         response = await fetch(url, { ...options, redirect: 'follow', credentials: 'same-origin' });
         if (response.type === 'opaqueredirect' || response.type === 'opaque' || (response.status >= 300 && response.status < 400)) {
-          fail('ASSET_REDIRECT', '图片下载跳转未完成，等待补采。');
+          fail('ASSET_REDIRECT', '附件下载跳转未完成，等待补采。');
         }
-        if (typeof response.url !== 'string' || !/^https:\/\//.test(response.url)) fail('ASSET_URL', '图片下载的最终地址无法确认，未读取内容。');
-        safeURL(response.url);
+        if (typeof response.url !== 'string' || !/^https:\/\//.test(response.url)) fail('ASSET_URL', '附件下载的最终地址无法确认，未读取内容。');
+        safeURL(response.url, { interpreterResult: url === interpreterDownloadURL });
       }
       if (response.type === 'opaqueredirect') fail('ASSET_REDIRECT', '网页返回了不可检查的跳转，请等待资源适配或打开原图补采。');
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get('location');
-        if (!location) fail('ASSET_REDIRECT', '图片下载跳转无法解析。');
+        if (!location) fail('ASSET_REDIRECT', '附件下载跳转无法解析。');
         return { redirect: new URL(location, url).href };
       }
-      if (!response.ok) fail(`HTTP_${response.status}`, response.status === 429 ? '图片请求受到限流，请稍后重试。' :
-        response.status === 401 || response.status === 403 ? '图片暂时无法访问，请检查登录和访问权限。' : '图片资源暂时不可用，等待补采。');
+      if (!response.ok) fail(`HTTP_${response.status}`, response.status === 429 ? '附件请求受到限流，请稍后重试。' :
+        response.status === 401 || response.status === 403 ? '附件暂时无法访问，请检查登录和访问权限。' : '附件资源暂时不可用，等待补采。');
       const mime = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-      if (mime === 'text/html') fail('ASSET_FORMAT', '图片请求返回了网页，未作为图片保存。');
-      return { bytes: await bytesOf(response, mime === 'application/json' ? Math.min(limit, 1024 * 1024) : limit), mime };
+      if (mime === 'text/html') fail('ASSET_FORMAT', '附件请求返回了网页，未作为附件保存。');
+      const disposition = response.headers.get('content-disposition') || '';
+      return { bytes: await bytesOf(response, sessionRequest ? Math.min(limit, 1024 * 1024) : limit), mime,
+        attachment: /^attachment(?:;|$)/i.test(disposition) };
     } finally { clearTimeout(timer); controller.abort(); }
   }
   async function session() {
     const response = await requestData('https://chatgpt.com/api/auth/session', null, 1024 * 1024, true);
-    if (response.mime !== 'application/json') fail('IDENTITY', '无法核验当前图片所属账号。');
-    let value; try { value = JSON.parse(new TextDecoder().decode(response.bytes)); } catch { fail('IDENTITY', '无法核验当前图片所属账号。'); }
+    if (response.mime !== 'application/json') fail('IDENTITY', '无法核验当前附件所属账号。');
+    let value; try { value = JSON.parse(new TextDecoder().decode(response.bytes)); } catch { fail('IDENTITY', '无法核验当前附件所属账号。'); }
     if (!record(value?.user) || typeof value.user.id !== 'string' || !value.user.id || typeof value.accessToken !== 'string' || !value.accessToken) {
-      fail('IDENTITY', '请先登录 ChatGPT，再补采图片。');
+      fail('IDENTITY', '请先登录 ChatGPT，再补采附件。');
     }
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`chatgpt:${value.user.id}`));
     const accountKey = 'acct-' + [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, '0')).join('').slice(0, 24);
@@ -297,36 +342,64 @@ export async function probeChatGPTAsset(request) {
       }
     }
     if (!mime || (declared && !['application/octet-stream', 'binary/octet-stream', mime].includes(declared))) {
-      fail('ASSET_FORMAT', '图片类型或文件头无法确认，未保存为原图。');
+      fail('ASSET_FORMAT', '附件类型或文件头无法确认，未保存为原图。');
     }
     if ((width !== null && (!width || !height || width * height > 100000000)) ||
         (asset.width && width !== null && asset.width !== width) || (asset.height && height !== null && asset.height !== height)) {
-      fail('ASSET_VARIANT', '取得的图片尺寸与原图不一致，等待获取原图。');
+      fail('ASSET_VARIANT', '取得的附件尺寸与原图不一致，等待获取原图。');
     }
-    if (asset.mimeType && asset.mimeType !== mime) fail('ASSET_VARIANT', '取得的图片格式与来源信息不一致。');
-    if (asset.size && asset.size !== bytes.byteLength) fail('ASSET_VARIANT', '取得的图片大小与原始附件不一致，等待获取原图。');
+    if (asset.mimeType && asset.mimeType !== mime) fail('ASSET_VARIANT', '取得的附件格式与来源信息不一致。');
+    if (asset.size && asset.size !== bytes.byteLength) fail('ASSET_VARIANT', '取得的附件大小与原始附件不一致，等待获取原图。');
     return { mime, width, height };
+  }
+  function contentInfo(bytes, declared) {
+    const suffix = /\.([a-z0-9]+)$/i.exec(asset.fileName || '')?.[1].toLowerCase();
+    const aliases = { 'application/x-zip-compressed': 'application/zip', 'application/javascript': 'text/javascript',
+      'application/x-python-code': 'text/x-python', 'text/yaml': 'application/yaml', 'application/x-yaml': 'application/yaml', 'text/xml': 'application/xml' };
+    const normalized = aliases[declared] || declared;
+    const expectedMime = fileMimes[suffix] || Object.values(fileMimes).find(mime => mime === (aliases[asset.mimeType] || asset.mimeType)) ||
+      Object.values(fileMimes).find(mime => mime === normalized);
+    if (asset.kind === 'image' || /^image\//i.test(asset.mimeType || '') || !expectedMime) return imageInfo(bytes, declared);
+    const sourceMime = aliases[asset.mimeType] || asset.mimeType;
+    const officeType = ['docx', 'xlsx', 'pptx'].some(key => fileMimes[key] === expectedMime);
+    if (sourceMime && !['application/octet-stream', 'binary/octet-stream', expectedMime].includes(sourceMime) && !(officeType && sourceMime === 'application/zip') && !(sourceMime === 'text/plain' && !['zip', 'pdf', 'docx', 'xlsx', 'pptx'].includes(suffix))) {
+      fail('ASSET_VARIANT', '附件格式与来源信息不一致，未保存。');
+    }
+    const binaryType = ['application/zip', 'application/pdf', ...['docx', 'xlsx', 'pptx'].map(key => fileMimes[key])].includes(expectedMime);
+    const compatibleText = normalized === 'text/plain' && !binaryType;
+    const officeZip = officeType && normalized === 'application/zip';
+    if (!bytes.length || (normalized && !['application/octet-stream', 'binary/octet-stream', expectedMime].includes(normalized) && !compatibleText && !officeZip)) {
+      fail('ASSET_FORMAT', '附件类型与来源信息不一致，未保存。');
+    }
+    const head = new TextDecoder().decode(bytes.subarray(0, 512)).trimStart();
+    if (/^(?:<!doctype\s+html|<html(?:\s|>)|<head(?:\s|>)|<body(?:\s|>))/i.test(head)) fail('ASSET_FORMAT', '附件请求返回了网页，未保存。');
+    if (asset.size && asset.size !== bytes.byteLength) fail('ASSET_VARIANT', '附件大小与来源信息不一致，未保存。');
+    // Final byte/signature/container validation runs in the extension before a
+    // single byte is written. The isolated probe only returns a bounded payload.
+    return { mime: expectedMime, width: null, height: null };
   }
   async function download(value, token, via) {
     let url = safeURL(value, { blob: true }).href;
     const seen = new Set();
     for (let attempt = 0; attempt < 4; attempt++) {
-      if (seen.has(url)) fail('ASSET_REDIRECT', '图片地址发生循环跳转。');
+      if (seen.has(url)) fail('ASSET_REDIRECT', '附件地址发生循环跳转。');
       seen.add(url);
       const result = await requestData(url, token, maximum, false,
-        (via === 'library-download' || via === 'file-download') && attempt === 0);
+        (via === 'library-download' || via === 'file-download' || via === 'interpreter-download') && attempt === 0);
       let next = result.redirect;
-      if (result.mime === 'application/json') {
-        let payload; try { payload = JSON.parse(new TextDecoder().decode(result.bytes)); } catch { fail('ASSET_PROTOCOL', '图片下载响应无法解析。'); }
+      const jsonFile = /\.json$/i.test(asset.fileName || '') || asset.mimeType === 'application/json';
+      const entryRoute = url === interpreterDownloadURL || url === fileDownloadURL || (asset.libraryFileId && url === `https://chatgpt.com/api/library/files/${asset.libraryFileId}/download`);
+      if (result.mime === 'application/json' && !(jsonFile && (result.attachment || !entryRoute))) {
+        let payload; try { payload = JSON.parse(new TextDecoder().decode(result.bytes)); } catch { fail('ASSET_PROTOCOL', '附件下载响应无法解析。'); }
         const links = record(payload) ? ['download_url', 'downloadUrl', 'download_uri', 'downloadUri', 'url'].map(key => payload[key]).filter(value => typeof value === 'string') : [];
         const unique = [...new Set(links)];
-        if (unique.length !== 1) fail('ASSET_PROTOCOL', '图片下载响应结构尚未支持，等待适配。');
+        if (unique.length !== 1) fail('ASSET_PROTOCOL', '附件下载响应结构尚未支持，等待适配。');
         next = unique[0];
       }
-      if (next) { url = safeURL(next).href; continue; }
-      const info = imageInfo(result.bytes, result.mime);
+      if (next) { url = safeURL(next, { interpreterResult: url === interpreterDownloadURL }).href; continue; }
+      const info = contentInfo(result.bytes, result.mime);
       const sha256 = [...new Uint8Array(await crypto.subtle.digest('SHA-256', result.bytes))].map(x => x.toString(16).padStart(2, '0')).join('');
-      if (asset.expectedHash && sha256 !== asset.expectedHash) fail('ASSET_HASH_MISMATCH', '图片内容哈希与已知原图不一致。');
+      if (asset.expectedHash && sha256 !== asset.expectedHash) fail('ASSET_HASH_MISMATCH', '附件内容哈希与已知原图不一致。');
       const chunks = [];
       for (let offset = 0; offset < result.bytes.length; offset += 49152) {
         const chunk = result.bytes.subarray(offset, offset + 49152);
@@ -335,9 +408,9 @@ export async function probeChatGPTAsset(request) {
       }
       return { chunks, byteLength: result.bytes.byteLength, sha256, mimeType: info.mime,
         width: info.width, height: info.height, via,
-        quality: asset.expectedHash || (asset.size && asset.width && asset.height && info.width === asset.width && info.height === asset.height) ? 'original' : 'unverified' };
+        quality: asset.expectedHash || (asset.size && !info.mime.startsWith('image/')) || (asset.size && asset.width && asset.height && info.width === asset.width && info.height === asset.height) ? 'original' : 'unverified' };
     }
-    fail('ASSET_REDIRECT', '图片跳转次数超过限制，等待适配。');
+    fail('ASSET_REDIRECT', '附件跳转次数超过限制，等待适配。');
   }
   function visibleImages() {
     if (typeof document === 'undefined') return [];
@@ -366,24 +439,34 @@ export async function probeChatGPTAsset(request) {
     return [...new Set(urls)].slice(0, 4);
   }
   try {
-    if (location.origin !== 'https://chatgpt.com') fail('ORIGIN', '请在已登录的 ChatGPT 页面中读取图片。');
-    if (!record(request) || !/^acct-[a-f0-9]{24}$/.test(request.expectedAccountKey || '') || !record(request.asset)) fail('ASSET_INPUT', '图片请求缺少有效账号和资源信息。', 'unavailable');
+    if (location.origin !== 'https://chatgpt.com') fail('ORIGIN', '请在已登录的 ChatGPT 页面中读取附件。');
+    if (!record(request) || !/^acct-[a-f0-9]{24}$/.test(request.expectedAccountKey || '') || !record(request.asset)) fail('ASSET_INPUT', '附件请求缺少有效账号和资源信息。', 'unavailable');
     asset = request.asset; maximum = request.maxBytes;
     if ((request.conversationId != null && (typeof request.conversationId !== 'string' || !conversationPattern.test(request.conversationId))) ||
-        (!asset.fileId && !asset.libraryFileId && !asset.retrievalURL) || (asset.fileId && !filePattern.test(asset.fileId)) ||
+        (!asset.fileId && !asset.libraryFileId && !asset.retrievalURL && !asset.sandboxPath) || (asset.fileId && !filePattern.test(asset.fileId)) ||
         (asset.libraryFileId && !libraryPattern.test(asset.libraryFileId)) || !Number.isSafeInteger(maximum) || maximum < 1 || maximum > maxAllowed ||
         (asset.expectedHash && !/^[a-f0-9]{64}$/.test(asset.expectedHash)) ||
+        (asset.messageId != null && (typeof asset.messageId !== 'string' || !conversationPattern.test(asset.messageId))) ||
+        (asset.sandboxPath && (typeof asset.sandboxPath !== 'string' || !asset.sandboxPath.startsWith('/') || asset.sandboxPath.startsWith('//') ||
+          /[\\\u0000-\u001f\u007f?#]/.test(asset.sandboxPath) || asset.sandboxPath.split('/').some(part => part === '.' || part === '..'))) ||
         ['size', 'width', 'height'].some(key => asset[key] != null && (!Number.isSafeInteger(asset[key]) || asset[key] < 1))) {
-      fail('ASSET_INPUT', '图片请求参数不合法。', 'unavailable');
+      fail('ASSET_INPUT', '附件请求参数不合法。', 'unavailable');
     }
-    if (asset.size > maximum) fail('ASSET_TOO_LARGE', '图片超过本次自动获取的大小上限。');
+    if (asset.size > maximum) fail('ASSET_TOO_LARGE', '附件超过本次自动获取的大小上限。');
     if (request.allowFileDownload === true && asset.fileId && request.conversationId) {
       fileDownloadURL = `https://chatgpt.com/backend-api/files/download/${asset.fileId}?conversation_id=${request.conversationId}&download_intent=false&inline=true`;
+    }
+    if (request.allowFileDownload === true && asset.sandboxPath && asset.messageId && request.conversationId) {
+      const entry = new URL(`https://chatgpt.com/backend-api/conversation/${request.conversationId}/interpreter/download`);
+      entry.searchParams.set('download_intent', 'true');
+      entry.searchParams.set('message_id', asset.messageId);
+      entry.searchParams.set('sandbox_path', asset.sandboxPath);
+      interpreterDownloadURL = entry.href;
     }
     // The transient URL comes from the captured attachment, never from a guessed endpoint.
     if (asset.retrievalURL) safeURL(asset.retrievalURL, { blob: true });
     const before = await session();
-    if (before.accountKey !== request.expectedAccountKey) fail('ACCOUNT_CHANGED', '当前账号与图片来源账号不一致。');
+    if (before.accountKey !== request.expectedAccountKey) fail('ACCOUNT_CHANGED', '当前账号与附件来源账号不一致。');
     let binary, lastError;
     if (asset.retrievalURL) {
       try { binary = await download(asset.retrievalURL, before.token, 'captured-resource'); }
@@ -391,6 +474,10 @@ export async function probeChatGPTAsset(request) {
     }
     if (!binary && request.allowLibraryDownload === true && asset.libraryFileId) {
       try { binary = await download(`https://chatgpt.com/api/library/files/${asset.libraryFileId}/download`, before.token, 'library-download'); }
+      catch (error) { lastError = error; }
+    }
+    if (!binary && interpreterDownloadURL) {
+      try { binary = await download(interpreterDownloadURL, before.token, 'interpreter-download'); }
       catch (error) { lastError = error; }
     }
     if (!binary && fileDownloadURL) {
@@ -404,16 +491,16 @@ export async function probeChatGPTAsset(request) {
       }
     }
     const after = await session();
-    if (after.accountKey !== before.accountKey) fail('ACCOUNT_CHANGED', '读取图片期间账号发生变化，结果已丢弃。');
+    if (after.accountKey !== before.accountKey) fail('ACCOUNT_CHANGED', '读取附件期间账号发生变化，结果已丢弃。');
     if (!binary) {
       if (lastError) throw lastError;
-      fail('ASSET_PENDING', '未找到可确认归属的原图。请打开对应图片后补采，或等待资源接口适配。');
+      fail('ASSET_PENDING', '未找到可确认归属的附件下载来源。请重新采集原对话，补齐来源消息、文件路径或平台文件标识后重试。');
     }
     return { ok: true, accountKey: before.accountKey, binary };
   } catch (error) {
     const known = /^[A-Z][A-Z0-9_]{0,60}$/.test(error?.code || '');
     return { ok: false, error: { code: known ? error.code : error?.name === 'AbortError' ? 'ASSET_TIMEOUT' : 'ASSET_NETWORK',
       state: error?.state === 'unavailable' ? 'unavailable' : 'pending',
-      message: known ? error.message : '图片读取未完成，请检查当前登录状态、站点权限或网络后重试。' } };
+      message: known ? error.message : '附件读取未完成，请检查当前登录状态、站点权限或网络后重试。' } };
   }
 }

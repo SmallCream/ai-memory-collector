@@ -1,4 +1,4 @@
-import { decodeHTMLEntities, extractRichReferences, safePublicURL } from './rich-content.js';
+import { decodeHTMLEntities, extractRichReferences, referenceFileName, safePublicURL } from './rich-content.js';
 
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const SECRET_QUERY = /(?:token|signature|credential|authorization|api[_-]?key|^auth$|^sig$|^key$|key-pair-id|^expires$|^expiry$|^x-amz-|^x-goog-)/i;
@@ -76,7 +76,9 @@ export async function extractAssets(conversation) {
   const fileContentReferences = new WeakSet();
   const add = (ref, info) => { if (typeof ref === 'string' && ref.trim()) candidates.push({ ref, ...info }); };
   function text(value, info) {
-    for (const reference of extractRichReferences(value)) add(reference.ref, { ...info, kind: reference.kind, syntax: reference.syntax, attribute: reference.attribute });
+    for (const reference of extractRichReferences(value)) add(reference.ref, { ...info, kind: reference.kind,
+      ...(reference.kind === 'attachment' ? { fileName: referenceFileName(reference.ref) } : {}),
+      syntax: reference.syntax, attribute: reference.attribute });
   }
   function walk(value, info, depth = 0) {
     if (depth > 100 || value == null) return;
@@ -144,7 +146,10 @@ export async function extractAssets(conversation) {
   for (const candidate of candidates) {
     const classified = classifyAssetReference(candidate.ref, candidate);
     if (classified.sourceType === 'embedded') classified.sourceRef = `embedded:sha256:${await sha256(classified.original)}`;
-    const stable = classified.fileId ? `platform:file:${classified.fileId}` : classified.libraryFileId ? `platform:library:${classified.libraryFileId}` : `${classified.sourceType}:${classified.sourceRef}`;
+    // Interpreter paths are scoped to the generating message. Reusing a path
+    // in a later response may mean a different version of the file.
+    const stable = classified.fileId ? `platform:file:${classified.fileId}` : classified.libraryFileId ? `platform:library:${classified.libraryFileId}` :
+      /^sandbox:/i.test(classified.sourceRef) ? JSON.stringify(['sandbox', candidate.messageId, classified.sourceRef]) : `${classified.sourceType}:${classified.sourceRef}`;
     const id = await sha256(stable), occurrence = { messageId: candidate.messageId, path: candidate.path, kind: candidate.kind || 'attachment',
       ...(candidate.syntax ? { syntax: candidate.syntax } : {}), ...(candidate.attribute ? { attribute: candidate.attribute } : {}) };
     // Only this known viewer's attachment results are internal. Filename,
@@ -234,17 +239,27 @@ export function sanitizeAssetRecords(records) {
 export function createAssetResolver(records, markdownPath) {
   const assets = sanitizeAssetRecords(records), byReference = new Map();
   const prefix = String(markdownPath || '').split('/').slice(0, 4).join('/') + '/';
+  const addReference = (reference, asset) => {
+    const matches = byReference.get(reference) || [];
+    if (!matches.some(item => item.id === asset.id)) matches.push(asset);
+    byReference.set(reference, matches);
+  };
   for (const asset of assets) {
-    byReference.set(asset.sourceRef, asset);
-    for (const reference of asset.references || []) byReference.set(reference, asset);
-    if (asset.fileId) for (const scheme of ['file-service', 'sediment']) byReference.set(`${scheme}://${asset.fileId}`, asset);
-    if (asset.libraryFileId) byReference.set(`library:${asset.libraryFileId}`, asset);
+    addReference(asset.sourceRef, asset);
+    for (const reference of asset.references || []) addReference(reference, asset);
+    if (asset.fileId) for (const scheme of ['file-service', 'sediment']) addReference(`${scheme}://${asset.fileId}`, asset);
+    if (asset.libraryFileId) addReference(`library:${asset.libraryFileId}`, asset);
     const ephemeral = records.find(item => item?.id === asset.id)?.retrieval?.sourceRef;
-    if (typeof ephemeral === 'string') byReference.set(ephemeral, asset);
+    if (typeof ephemeral === 'string') addReference(ephemeral, asset);
   }
-  return ref => {
+  return (ref, { messageId } = {}) => {
     const classified = classifyAssetReference(ref);
-    const asset = byReference.get(ref) || byReference.get(classified.sourceRef);
+    let matches = byReference.get(ref) || byReference.get(classified.sourceRef) || [];
+    if (typeof messageId === 'string' && (/^sandbox:/i.test(classified.sourceRef) || matches.length > 1)) {
+      matches = matches.filter(asset => asset.messageId === messageId || asset.occurrences?.some(item => item.messageId === messageId));
+    }
+    // An unscoped repeated sandbox path has no single correct local version.
+    const asset = matches.length === 1 ? matches[0] : null;
     if (!asset) return null;
     if (READY.has(asset.status) && safePath(asset.localPath) && asset.localPath.startsWith(prefix)) {
       const from = markdownPath.split('/').slice(0, -1), to = asset.localPath.split('/');

@@ -300,7 +300,7 @@ test('asset summary distinguishes pending images from successful uploads', async
   const state = initialState(); state.assetStatus = { local: 5, uploaded: 3, pendingUpload: 2, pendingCapture: 1, failed: 1 };
   const app = await setup({ state });
   assert.equal(app.elements.get('asset-summary').hidden, false);
-  assert.match(app.elements.get('asset-summary-text').textContent, /本地图片 5.*已上传 3.*待采集 1（其中失败 1）.*待上传 2/);
+  assert.match(app.elements.get('asset-summary-text').textContent, /本地附件 5.*已上传 3.*待采集 1（其中失败 1）.*待上传 2/);
 });
 
 test('image failures are a subset of pending tasks and use queue diagnostics over stale counts', async () => {
@@ -315,7 +315,7 @@ test('image failures are a subset of pending tasks and use queue diagnostics ove
   const item = app.elements.get('asset-failure-list').children[0];
   assert.equal(item.children[0].textContent, '旅行计划');
   assert.equal(item.children[1].textContent, '地图.png');
-  assert.match(item.children[2].textContent, /尚未取得可确认归属的原图/);
+  assert.match(item.children[2].textContent, /尚未取得可确认归属的原始附件/);
   assert.equal(item.children[3].textContent, 'ASSET_PENDING · 已尝试 2 次');
 });
 
@@ -343,7 +343,7 @@ test('image retry works while conversation scan is paused without sending a capt
   assert.deepEqual(app.messages.filter(message => message.type === 'collector:retry-images'), [{ type: 'collector:retry-images', tabId: 22 }]);
   assert(!app.messages.some(message => ['collector:start', 'collector:resume'].includes(message.type)));
   assert.equal(app.permissionRequests.length, 0);
-  assert.match(html, /逐张重试失败图片，不会重新扫描对话列表。对话采集暂停时，每项只尝试一次。/);
+  assert.match(html, /逐项重试失败附件，不会重新扫描对话列表。对话采集暂停时，每项只尝试一次。/);
 });
 
 test('image retry cannot run without a matching enabled account, writable directory and source tab', async () => {
@@ -385,7 +385,7 @@ test('source refresh failures explain missing images and incomplete details safe
   ] };
   const app = await setup({ state });
   const items = app.elements.get('asset-failure-list').children;
-  assert.match(items[0].children[2].textContent, /最新对话中未找到这张图片/);
+  assert.match(items[0].children[2].textContent, /最新对话中未找到此附件/);
   assert.match(items[1].children[2].textContent, /对话详情不完整，未覆盖已保存数据/);
   assert(!items.map(item => item.children[2].textContent).join('').includes('private'));
   assert.equal(app.elements.get('asset-failures-limit').hidden, true);
@@ -409,7 +409,7 @@ test('internal viewer attachments remain visibly undownloaded outside ordinary f
     { conversationTitle: '看图对话', fileName: 'internal-image.png', messageId: 'tool-message', fileId: 'file_demo', code: 'HTTP_404', attempt: 6, retryAt: Date.now() },
   ] };
   const app = await setup({ state });
-  assert.equal(app.elements.get('asset-summary-text').textContent, '本地图片 12 · 已上传 4 · 待上传 8 · 内部附件未下载 1');
+  assert.equal(app.elements.get('asset-summary-text').textContent, '本地附件 12 · 已上传 4 · 待上传 8 · 内部附件未下载 1');
   assert.equal(app.elements.get('asset-failures').hidden, true);
   assert.equal(app.elements.get('retry-images').hidden, true);
   assert.equal(app.elements.get('asset-internal').hidden, false);
@@ -585,7 +585,7 @@ test('transfer details distinguish file upload from conversation commit and expo
   state.activity = { upload: { current: logItem({ status: 'success', stage: 'upload-image', fileName: '结果.png', finishedAt: Date.now(), completed: 1, total: 1 }), recent: [] } };
   state.restoreStatus = { total: 5, processed: 3, pending: 2, failed: 0 };
   const app = await setup({ state });
-  assert.match(visibleText(app.elements.get('transfer-current')), /图片上传 · 本步骤完成/);
+  assert.match(visibleText(app.elements.get('transfer-current')), /附件上传 · 本步骤完成/);
   assert.match(visibleText(app.elements.get('upload-queue')), /结果.png · 已上传/);
   assert.match(visibleText(app.elements.get('download-queue')), /HTTP_403/);
   assert.match(visibleText(app.elements.get('outbox-queue')), /待提交对话 · 等待提交/);

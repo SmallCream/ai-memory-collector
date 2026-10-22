@@ -423,6 +423,66 @@ async function pictureBundle({ assets = [IMAGE], time = 100, text = 'Screenshot'
   return { accountKey: ACCOUNT, files: built.files, manifest: built.manifest, entry: built.manifest.conversations.picture };
 }
 
+async function downloadableBundle(extension = 'zip', downloaded = true) {
+  const initial = bundle('downloadable'), native = JSON.parse(initial.files[0].content);
+  const fileName = `report.${extension}`;
+  native.mapping.a.message.content.parts.push({ content_type: 'file', file_id: 'file-synthetic-download', name: fileName });
+  const [source] = await extractAssets(native);
+  const oid = digest(`synthetic-download-${extension}`);
+  const asset = downloaded ? { ...source, status: 'downloaded', oid, size: 32,
+    localPath: `${PREFIX}/assets/${oid}.${extension}` } : source;
+  const built = await buildArchive({ conversation: native, identity: { accountKey: ACCOUNT, displayName: 'Demo' },
+    capturedAt: '2026-10-21T00:00:00Z', existingManifest: initial.manifest, productionPrefix: PREFIX, assets: [asset] });
+  return { accountKey: ACCOUNT, files: built.files, manifest: built.manifest, entry: built.manifest.conversations.downloadable, asset };
+}
+
+test('downloadable ZIP, PDF, Office and text assets commit references and LFS pointers together', async () => {
+  for (const extension of ['zip', 'pdf', 'docx', 'xlsx', 'pptx', 'txt', 'md', 'csv', 'json', 'py']) {
+    const b = await downloadableBundle(extension), server = gitServer();
+    const result = await syncArchives({ config: CONFIG, bundles: [b], assetPointers: [pointer(b.asset)], fetchImpl: server.fetchImpl });
+    assert.equal(result.status, 'synced');
+    assert.equal(server.files()[b.asset.localPath], formatLfsPointer(b.asset));
+    assert.equal(server.files()[b.entry.jsonPath], b.files[0].content);
+    assert.ok(server.files()[b.entry.markdownPath].includes(`[report\\.${extension}](../../../assets/${b.asset.oid}.${extension})`));
+    assert.equal(JSON.parse(server.files()[MANIFEST]).conversations.downloadable.assets[0].status, 'downloaded');
+    assert.equal(server.files()[ATTRIBUTES], RULE);
+    assert.equal(server.calls.filter(call => call.method === 'PATCH').length, 1);
+  }
+});
+
+test('same native downloadable attachment merges preserve ready remote files and upgrade pending remote files', async () => {
+  const ready = await downloadableBundle(), pending = await downloadableBundle('zip', false);
+  assert.equal(ready.files[0].content, pending.files[0].content);
+  for (const localReady of [true, false]) {
+    const local = localReady ? ready : pending, remote = localReady ? pending : ready;
+    const server = gitServer({ initial: { ...fileMap(remote), ...(!localReady ? {
+      [ready.asset.localPath]: formatLfsPointer(ready.asset), [ATTRIBUTES]: RULE,
+    } : {}) } });
+    const result = await syncArchives({ config: CONFIG, bundles: [local],
+      ...(localReady ? { assetPointers: [pointer(ready.asset)] } : {}), fetchImpl: server.fetchImpl });
+    assert.equal(result.status, localReady ? 'synced' : 'unchanged');
+    const merged = JSON.parse(server.files()[MANIFEST]).conversations.downloadable.assets[0];
+    assert.equal(merged.status, 'downloaded');
+    assert.equal(merged.localPath, ready.asset.localPath);
+    assert.equal(server.files()[ready.entry.markdownPath], ready.files[1].content);
+    assert.equal(server.files()[ready.entry.jsonPath], ready.files[0].content);
+  }
+});
+
+test('generic attachment paths still reject unsupported suffixes, wrong hashes and cross-account ownership', async () => {
+  for (const invalid of ['unsupported', 'hash', 'account']) {
+    const b = await downloadableBundle(), server = gitServer();
+    const value = b.manifest.conversations.downloadable.assets[0];
+    value.localPath = invalid === 'unsupported' ? value.localPath.replace(/zip$/, 'exe') :
+      invalid === 'hash' ? value.localPath.replace(value.oid, 'f'.repeat(64)) :
+        value.localPath.replace(PREFIX, 'data/web/chatgpt/other');
+    b.files.find(file => file.path === MANIFEST).content = json(b.manifest);
+    await assert.rejects(syncArchives({ config: CONFIG, bundles: [b], fetchImpl: server.fetchImpl }),
+      { code: invalid === 'account' ? 'ACCOUNT_OWNERSHIP' : 'ARCHIVE_ASSET' });
+    assert.equal(server.calls.length, 0);
+  }
+});
+
 async function citedPictureBundles({ ambiguous = false, readyAlias = false } = {}) {
   const initial = bundle('cited-picture'), native = JSON.parse(initial.files[0].content);
   const libraryFileId = 'libfile_synthetic_citation';
