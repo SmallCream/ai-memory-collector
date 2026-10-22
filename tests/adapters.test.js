@@ -4,13 +4,13 @@ import { createChatGPTAdapter, isChatGPTUrl } from '../extension/adapters/chatgp
 import { adapterForUrl, getAdapter, supportedPlatforms } from '../extension/adapters/index.js';
 
 const identity = { platform: 'chatgpt', accountKey: `acct-${'a'.repeat(24)}`, displayName: 'Synthetic', workspace: 'unverified' };
-function fixture(result, tabs = [{ url: 'https://chatgpt.com/c/demo' }, { url: 'https://chatgpt.com/c/demo' }]) {
+function fixture(result, tabs = [{ url: 'https://chatgpt.com/c/demo' }, { url: 'https://chatgpt.com/c/demo' }], { raw = false } = {}) {
   const calls = [];
   const browser = {
     tabs: { get: async () => {
       const value = tabs.shift(); if (value instanceof Error) throw value; return value;
     } },
-    scripting: { executeScript: async options => { calls.push(options); return [{ frameId: 0, result }]; } },
+    scripting: { executeScript: async options => { calls.push(options); return raw ? result : [{ frameId: 0, result }]; } },
   };
   return { adapter: createChatGPTAdapter(browser), calls };
 }
@@ -70,6 +70,79 @@ test('detail failures keep only known reason codes without exposing extra probe 
       assert.equal(error.code, 'INCOMPLETE_DETAIL');
       assert.equal(error.reason, reason === 'TREE_MISSING_CHILD' ? reason : undefined);
       assert.doesNotMatch(JSON.stringify(error), /private|token|secret|__proto__/);
+      return true;
+    });
+  }
+});
+
+test('script result transport rejects malformed containers, absent main frames and duplicate main frames', async () => {
+  for (const [result, reason] of [
+    [undefined, 'SCRIPT_RESULTS_INVALID'], [null, 'SCRIPT_RESULTS_INVALID'], [{}, 'SCRIPT_RESULTS_INVALID'],
+    [[null], 'SCRIPT_RESULTS_INVALID'], [[[]], 'SCRIPT_RESULTS_INVALID'],
+    [[{ frameId: 0, result: { ok: true, identity } }, 'invalid'], 'SCRIPT_RESULTS_INVALID'],
+    [[], 'SCRIPT_MAIN_FRAME_MISSING'], [[{ frameId: 3, result: { ok: true, identity } }], 'SCRIPT_MAIN_FRAME_MISSING'],
+    [[{ frameId: 0 }, { frameId: 0, result: { ok: true, identity } }], 'SCRIPT_RESULTS_INVALID'],
+  ]) {
+    const { adapter, calls } = fixture(result, undefined, { raw: true });
+    await assert.rejects(adapter.detail(1, { accountKey: identity.accountKey, conversationId: 'demo' }), { code: 'INVALID_RESPONSE', reason });
+    assert.equal(calls.length, 1, 'transport failures must not trigger a different source endpoint');
+  }
+});
+
+test('missing script results and frame errors remain distinct and never expose browser error data', async () => {
+  for (const [frame, reason] of [
+    [{ frameId: 0 }, 'SCRIPT_RESULT_MISSING'],
+    [{ frameId: 0, result: undefined }, 'SCRIPT_RESULT_MISSING'],
+    [{ frameId: 0, result: null }, 'SCRIPT_RESULT_MISSING'],
+    [{ frameId: 0, error: 'https://example.test/private?token=secret' }, 'SCRIPT_EXECUTION_FAILED'],
+    [{ frameId: 0, error: { message: 'private response', code: 'HTTP_401', reason: 'MESSAGE_IN_PROGRESS' } }, 'SCRIPT_EXECUTION_FAILED'],
+    [{ frameId: 0, error: false, result: { ok: true, identity } }, 'SCRIPT_EXECUTION_FAILED'],
+    [{ frameId: 0, error: '', result: { ok: true, identity } }, 'SCRIPT_EXECUTION_FAILED'],
+  ]) {
+    const { adapter } = fixture([frame], undefined, { raw: true });
+    await assert.rejects(adapter.identify(1), error => {
+      assert.equal(error.code, 'INVALID_RESPONSE'); assert.equal(error.reason, reason);
+      assert.doesNotMatch(error.message + JSON.stringify(error), /example\.test|private|token=|secret|MESSAGE_IN_PROGRESS|HTTP_401/);
+      return true;
+    });
+  }
+  for (const error of [null, undefined]) {
+    const { adapter } = fixture([{ frameId: 0, error, result: { ok: true, identity } }], undefined, { raw: true });
+    assert.deepEqual(await adapter.identify(1), identity);
+  }
+});
+
+test('probe envelopes require a boolean ok and a valid explicit failure code', async () => {
+  for (const result of [
+    '', 1, [], {}, { ok: 'yes', identity }, { ok: 1, identity }, { ok: null, identity },
+    { ok: false }, { ok: false, error: null }, { ok: false, error: [] },
+    { ok: false, error: { code: 401, message: 'private error' } },
+    { ok: false, error: { code: 'https://example.test/private', message: 'Bearer secret', reason: 'MESSAGE_IN_PROGRESS' } },
+    { ok: false, error: { message: 'private error', reason: 'MESSAGE_IN_PROGRESS' } },
+  ]) {
+    const { adapter } = fixture(result);
+    await assert.rejects(adapter.identify(1), error => {
+      assert.equal(error.code, 'INVALID_RESPONSE'); assert.equal(error.reason, 'SCRIPT_ENVELOPE_INVALID');
+      assert.doesNotMatch(error.message + JSON.stringify(error), /private|example\.test|Bearer|secret|MESSAGE_IN_PROGRESS/);
+      return true;
+    });
+  }
+  const tabs = [{ url: 'https://chatgpt.com/c/demo' }];
+  const { adapter, calls } = fixture({ ok: false, error: { code: 'INCOMPLETE_DETAIL', message: '详情未完整', reason: 'TREE_MISSING_CHILD' } }, tabs);
+  await assert.rejects(adapter.identify(1), { code: 'INCOMPLETE_DETAIL', reason: 'TREE_MISSING_CHILD' });
+  assert.equal(calls.length, 1); assert.equal(tabs.length, 0, 'explicit probe failures preserve their existing path');
+});
+
+test('an invalid script result rechecks whether the source tab closed or left ChatGPT', async () => {
+  for (const [after, code] of [
+    [new Error('private tab exception'), 'TAB_CLOSED'],
+    [{ url: 'https://example.test/private' }, 'TAB_CHANGED'],
+    [{ url: 'https://chatgpt.com/c/demo', pendingUrl: 'https://example.test/private' }, 'TAB_CHANGED'],
+  ]) {
+    const { adapter } = fixture([{ frameId: 0, error: 'private browser error' }], [{ url: 'https://chatgpt.com/c/demo' }, after], { raw: true });
+    await assert.rejects(adapter.identify(1), error => {
+      assert.equal(error.code, code); assert.equal(error.reason, undefined);
+      assert.doesNotMatch(error.message + JSON.stringify(error), /private|example\.test/);
       return true;
     });
   }

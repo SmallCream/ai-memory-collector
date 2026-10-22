@@ -560,6 +560,21 @@ test('retry waiting and paused jobs never infer stalled work from an old complet
   assert.doesNotMatch(visibleText(app.elements.get('collection-current')), /暂未收到新进展/);
 });
 
+test('invalid script replies show a fixed reason while old collection and GitHub failures stay distinct', async () => {
+  const state = initialState();
+  state.job = { status: 'partial', diagnostics: { total: 1, items: [{ title: '对话', conversationId: 'synthetic',
+    code: 'INVALID_RESPONSE', reason: 'SCRIPT_RESULT_MISSING', status: 'retry', attempt: 1 }] } };
+  state.activity = { github: { current: logItem({ status: 'failed', code: 'INVALID_RESPONSE', stage: 'commit' }), recent: [] } };
+  const app = await setup({ state });
+  assert.match(visibleText(app.elements.get('collection-queue')), /采集脚本没有返回结果/);
+  assert.match(visibleText(app.elements.get('collection-queue')), /SCRIPT_RESULT_MISSING/);
+  assert.doesNotMatch(visibleText(app.elements.get('transfer-current')), /采集脚本/);
+  state.job.diagnostics.items[0].reason = 'https://secret.invalid/?token=private';
+  app.setState(state); await app.poll();
+  assert.match(visibleText(app.elements.get('collection-queue')), /此记录没有具体原因/);
+  assert.doesNotMatch(visibleText(app.elements.get('collection-queue')), /secret.invalid|token=private/);
+});
+
 test('transfer details distinguish file upload from conversation commit and expose downloads and restore scope', async () => {
   const state = initialState(); state.config.github.enabled = true;
   state.githubStatus = { status: 'pending', pending: 1 };

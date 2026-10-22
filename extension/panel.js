@@ -167,7 +167,7 @@ function appendText(parent, tag, value, className) {
   if (className) element.classList.add(className);
   parent.append(element); return element;
 }
-function appendDetailFailure(parent, item) {
+function appendDetailFailure(parent, item, collection = false) {
   if (item.code && item.title && item.conversationId) {
     appendText(parent, 'p', `对话 ID：${assetLabel(item.conversationId, '')}`, 'muted');
   }
@@ -176,6 +176,8 @@ function appendDetailFailure(parent, item) {
   if (message) appendText(parent, 'p', `原因：${message}（${reason}）`, 'warning-text');
   else if (item.code === 'INCOMPLETE_DETAIL') {
     appendText(parent, 'p', '详情完整性未确认；此记录没有具体原因，请继续采集后查看新记录。', 'warning-text');
+  } else if (collection && item.code === 'INVALID_RESPONSE') {
+    appendText(parent, 'p', '采集脚本未返回可识别的结果；此记录没有具体原因，请继续采集后查看新记录。', 'warning-text');
   }
 }
 function renderActivityCards(id, channels) {
@@ -198,7 +200,7 @@ function renderActivityCards(id, channels) {
     if (fileSize(item.size)) parts.push(`文件大小 ${fileSize(item.size)}`);
     if (item.code) parts.push(assetFailureCode(item.code));
     appendText(card, 'p', parts.join(' · '), 'muted');
-    appendDetailFailure(card, item);
+    appendDetailFailure(card, item, id.startsWith('collection-'));
     if (item.status === 'running' && Number.isFinite(item.updatedAt || item.startedAt) &&
         Date.now() - (item.updatedAt || item.startedAt) >= 90_000) {
       appendText(card, 'p', '暂未收到新进展，可能仍在等待响应；这不代表程序已停止。', 'warning-text');
@@ -232,7 +234,7 @@ function renderTaskList(id, noteId, items, total, emptyText, mode = 'queue') {
     if (mode === 'recent' && clock(item.finishedAt || item.updatedAt)) parts.push(clock(item.finishedAt || item.updatedAt));
     if (mode === 'outbox' && clock(item.createdAt)) parts.push(`入队 ${clock(item.createdAt)}`);
     if (parts.length) appendText(row, 'p', parts.join(' · '), 'muted');
-    appendDetailFailure(row, item);
+    appendDetailFailure(row, item, id.startsWith('collection-'));
     list.append(row);
   }
   if (Number.isFinite(previousScroll)) list.scrollTop = previousScroll;

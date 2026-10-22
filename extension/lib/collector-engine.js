@@ -40,6 +40,7 @@ const ERROR_MESSAGES = {
   LOCAL_WRITE: '本地文件写入未完成，已保留恢复记录。',
   LOCAL_VERIFY: '本地文件核对未完成，已保留恢复记录。',
   FORMAT: '网站返回结构发生变化，本次未推进进度。',
+  INVALID_RESPONSE: '未取得有效的采集返回结果，已有归档和进度已保留。',
   PAGINATION_STALLED: '列表分页没有继续前进，未标记全量完成。',
   PAGINATION_CHANGED: '扫描时列表发生变化，未标记全量完成，请重新检查。',
   PAGINATION_LIMIT: '列表超过当前支持的扫描范围，未标记全量完成。',
@@ -62,7 +63,7 @@ function safeError(error) {
 }
 
 function transient(code) {
-  return ['NETWORK', 'TIMEOUT', 'HTTP_429', 'PARTIAL_DETAIL', 'INCOMPLETE_DETAIL', 'STALE_DETAIL', 'DETAIL_CHANGED', 'DETAIL_PAGINATION', 'STORAGE'].includes(code) || /^HTTP_5\d\d$/.test(code);
+  return ['NETWORK', 'TIMEOUT', 'HTTP_429', 'INVALID_RESPONSE', 'PARTIAL_DETAIL', 'INCOMPLETE_DETAIL', 'STALE_DETAIL', 'DETAIL_CHANGED', 'DETAIL_PAGINATION', 'STORAGE'].includes(code) || /^HTTP_5\d\d$/.test(code);
 }
 
 function blocked(code) {

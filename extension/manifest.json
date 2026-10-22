@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI Memory Collector",
-  "version": "0.3.10",
+  "version": "0.3.11",
   "description": "按账号采集 ChatGPT 对话与图片，保存 JSON、Markdown，同步到私有 GitHub 并恢复本地备份。",
   "minimum_chrome_version": "120",
   "permissions": ["scripting", "sidePanel", "alarms", "activeTab"],

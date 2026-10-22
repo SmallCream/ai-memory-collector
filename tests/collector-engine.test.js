@@ -123,6 +123,56 @@ test('unknown detail reasons are removed from retry state and recent activity', 
   assert.doesNotMatch(JSON.stringify([...f.store]), /example.test|token=|private secret/);
 });
 
+test('invalid bridge response retries after restart and only saves when a later result succeeds', async () => {
+  const f = setup({ list: async () => ({ items: [source('a')], nextOffset: null, total: 1 }) });
+  const original = f.dependencies.adapter.detail;
+  let attempts = 0;
+  f.dependencies.adapter.detail = async (...args) => {
+    if (++attempts === 1) throw Object.assign(issue('INVALID_RESPONSE'), { reason: 'SCRIPT_RESULT_MISSING' });
+    return original(...args);
+  };
+  await f.engine.start({ account, tabId: 1 });
+  await f.engine.tick({ account, tabId: 1 });
+  const failed = await f.engine.tick({ account, tabId: 1 });
+  assert.equal(failed.diagnostics.items[0].status, 'retry');
+  assert.equal(failed.diagnostics.items[0].reason, 'SCRIPT_RESULT_MISSING');
+  assert.equal(failed.diagnostics.items[0].attempt, 1);
+  assert.equal(failed.nextRetryAt - failed.updatedAt, 60000);
+  assert.equal(f.calls.saves.length, 0);
+  assert.deepEqual(await f.engine.getOutbox(account.accountKey), []);
+  assert.equal(f.store.get(key('Index')), undefined);
+  const resumed = createCollectorEngine(f.dependencies);
+  await resumed.tick({ account, tabId: 1 }); assert.equal(attempts, 1);
+  f.advance(60000);
+  const finished = await complete(resumed);
+  assert.equal(finished.status, 'completed'); assert.equal(attempts, 2);
+  assert.deepEqual(f.calls.saves, ['a']); assert.deepEqual(f.calls.pages, [0]);
+  assert.equal((await resumed.getOutbox(account.accountKey)).length, 1);
+});
+
+test('persistent invalid responses stop after three attempts and manual resume retains the unfinished item', async () => {
+  const f = setup({ list: async () => ({ items: [source('a')], nextOffset: null, total: 1 }), detailError: 'INVALID_RESPONSE' });
+  await f.engine.start({ account, tabId: 1 });
+  await f.engine.tick({ account, tabId: 1 });
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const state = await f.engine.tick({ account, tabId: 1 });
+    assert.equal(state.diagnostics.items[0].attempt, attempt);
+    assert.equal(state.diagnostics.items[0].status, attempt < 3 ? 'retry' : 'failed');
+    if (attempt < 3) {
+      assert.equal(state.nextRetryAt - state.updatedAt, 60000 * 2 ** (attempt - 1));
+      f.advance(60000 * 2 ** (attempt - 1));
+    }
+  }
+  assert.equal((await f.engine.tick({ account, tabId: 1 })).status, 'partial');
+  f.advance(600000); await f.engine.tick({ account, tabId: 1 });
+  assert.equal(f.calls.details.length, 3); assert.equal(f.calls.saves.length, 0);
+  assert.deepEqual(await f.engine.getOutbox(account.accountKey), []);
+  f.setDetailError(null);
+  await f.engine.resume({ account, tabId: 1 });
+  assert.equal((await complete(f.engine)).status, 'completed');
+  assert.deepEqual(f.calls.saves, ['a']); assert.deepEqual(f.calls.pages, [0]);
+});
+
 test('initialization walks all pages, persists every conversation and completes only afterwards', async () => {
   const f = setup({ list: async offset => offset === 0 ? { items: [source('a')], nextOffset: 1, total: 2 } : { items: [source('b')], nextOffset: null, total: 2 } });
   const start = await f.engine.start({ account, tabId: 1, mode: 'incremental' });

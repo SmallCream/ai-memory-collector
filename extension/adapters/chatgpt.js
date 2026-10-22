@@ -19,6 +19,8 @@ function validIdentity(value) {
     typeof value.displayName === 'string';
 }
 
+const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
 /** Injectable Chrome dependency supports tests without a live logged-in account. */
 export function createChatGPTAdapter(browser, { now = Date.now } = {}) {
   async function run(tabId, request) {
@@ -38,9 +40,35 @@ export function createChatGPTAdapter(browser, { now = Date.now } = {}) {
       // Browser exceptions may contain page URLs; do not pass them into logs/UI.
       throw new AdapterError('TAB_UNAVAILABLE', '暂时无法读取 ChatGPT 页面，请检查网站权限、登录状态或重新载入页面。');
     }
-    const result = results?.find(item => item.frameId === 0)?.result;
-    if (!result?.ok) {
-      const code = /^[A-Z][A-Z0-9_]{0,60}$/.test(result?.error?.code || '') ? result.error.code : 'INVALID_RESPONSE';
+    async function checkSourceAfterRead() {
+      let after;
+      try { after = await api.tabs.get(tabId); }
+      catch { throw new AdapterError('TAB_CLOSED', 'ChatGPT 标签页已关闭，结果未归档。'); }
+      if (!isChatGPTUrl(after.url) || (after.pendingUrl && !isChatGPTUrl(after.pendingUrl))) {
+        throw new AdapterError('TAB_CHANGED', '采集标签页已离开 ChatGPT，结果未归档。');
+      }
+    }
+    async function invalidResponse(reason) {
+      // An interrupted document can also lose its injection result. Prefer the
+      // observed tab state to guessing why the browser returned no usable data.
+      await checkSourceAfterRead();
+      throw new AdapterError('INVALID_RESPONSE', '未取得有效的采集结果，已保留进度，稍后重试。', reason);
+    }
+    if (!Array.isArray(results) || results.some(item => !record(item))) return invalidResponse('SCRIPT_RESULTS_INVALID');
+    const mainFrames = results.filter(item => item.frameId === 0);
+    if (mainFrames.length > 1) return invalidResponse('SCRIPT_RESULTS_INVALID');
+    if (!mainFrames.length) return invalidResponse('SCRIPT_MAIN_FRAME_MISSING');
+    const frame = mainFrames[0];
+    // Error details may contain page data or URLs. Never pass them into logs.
+    if (frame.error !== null && frame.error !== undefined) return invalidResponse('SCRIPT_EXECUTION_FAILED');
+    const result = frame.result;
+    if (result === null || result === undefined) return invalidResponse('SCRIPT_RESULT_MISSING');
+    if (!record(result) || typeof result.ok !== 'boolean') return invalidResponse('SCRIPT_ENVELOPE_INVALID');
+    if (result.ok === false) {
+      if (!record(result.error) || typeof result.error.code !== 'string' || !/^[A-Z][A-Z0-9_]{0,60}$/.test(result.error.code)) {
+        return invalidResponse('SCRIPT_ENVELOPE_INVALID');
+      }
+      const code = result.error.code;
       const message = typeof result?.error?.message === 'string' ? result.error.message : '未取得有效的采集结果，请稍后重试。';
       throw new AdapterError(code, message, result?.error?.reason);
     }
@@ -50,12 +78,7 @@ export function createChatGPTAdapter(browser, { now = Date.now } = {}) {
     }
     // Navigation during the injected read invalidates its result, even when the
     // old document finished a request after the tab navigated elsewhere.
-    let after;
-    try { after = await api.tabs.get(tabId); }
-    catch { throw new AdapterError('TAB_CLOSED', 'ChatGPT 标签页已关闭，结果未归档。'); }
-    if (!isChatGPTUrl(after.url) || (after.pendingUrl && !isChatGPTUrl(after.pendingUrl))) {
-      throw new AdapterError('TAB_CHANGED', '采集标签页已离开 ChatGPT，结果未归档。');
-    }
+    await checkSourceAfterRead();
     return result;
   }
   return Object.freeze({

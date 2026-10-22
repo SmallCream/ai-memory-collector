@@ -19,11 +19,17 @@ const messages = Object.freeze({
   PAGE_CURSOR_STALLED: '历史分页游标没有继续前进，无法确认历史已完整读取。',
   PAGE_OVERLAP_CONFLICT: '相邻消息页的重叠内容不一致，无法安全合并。',
   DETAIL_COMPLETENESS_UNKNOWN: '详情接口未返回适配器已确认的完整性结果。',
+  SCRIPT_RESULTS_INVALID: '浏览器返回的脚本执行结果格式异常，或包含重复的主页面结果。',
+  SCRIPT_MAIN_FRAME_MISSING: '浏览器没有返回主页面的采集结果。',
+  SCRIPT_EXECUTION_FAILED: '浏览器报告页面采集脚本执行失败，未取得可归档的结果。',
+  SCRIPT_RESULT_MISSING: '页面采集脚本没有返回结果，或结果未能传回扩展。',
+  SCRIPT_ENVELOPE_INVALID: '采集脚本返回的成功或失败标记不符合约定，无法确认结果。',
 });
 const codes = new Set(['INCOMPLETE_DETAIL', 'DETAIL_PAGINATION', 'DETAIL_CHANGED', 'FORMAT']);
 export function sanitizeDetailFailure(error) {
-  return codes.has(error?.code) && typeof error.reason === 'string' && Object.hasOwn(messages, error.reason)
-    ? { reason: error.reason } : {};
+  if (typeof error?.reason !== 'string' || !Object.hasOwn(messages, error.reason)) return {};
+  const transport = error.reason.startsWith('SCRIPT_');
+  return (transport ? error.code === 'INVALID_RESPONSE' : codes.has(error.code)) ? { reason: error.reason } : {};
 }
 export function detailFailureMessage(error) {
   const { reason } = sanitizeDetailFailure(error);
