@@ -30,7 +30,7 @@ const ERROR_MESSAGES = {
   TAB_CLOSED: 'ChatGPT 标签页已关闭，重新打开后可继续采集。',
   TAB_CHANGED: '采集标签页已离开 ChatGPT，重新打开后可继续采集。',
   TAB_UNAVAILABLE: '暂时无法读取 ChatGPT，请检查网站权限和登录状态后继续。',
-  PARTIAL_DETAIL: '详情尚未完整取得或仍在生成，已有归档保持不变。',
+  PARTIAL_DETAIL: '详情尚未完整取得或有消息尚不能确认已结束，已有归档保持不变。',
   INCOMPLETE_DETAIL: '详情尚未完整取得，已有归档保持不变。',
   STALE_DETAIL: '线上返回的版本较旧，未覆盖已有归档。',
   DETAIL_CHANGED: '读取消息分页时对话发生变化，保留原归档，稍后重新读取。',

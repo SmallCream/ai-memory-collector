@@ -7,6 +7,76 @@ export async function probeChatGPT(request) {
   const fail = (code, message, reason) => { const e = new Error(message); e.code = code; if (reason) reasons.set(e, reason); throw e; };
   const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
   const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
+  // Keep this serialized copy identical to message-generation.js; parity is tested.
+  function inspectMessageGeneration(native) {
+    const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+    const unfinished = message => record(message) && ['pending', 'in_progress', 'streaming'].includes(message.status);
+    const terminal = message => record(message) && message.author?.role === 'assistant' &&
+      message.status === 'finished_successfully' && message.end_turn === true &&
+      [undefined, null, '', 'all'].includes(message.recipient) &&
+      [undefined, null, '', 'final'].includes(message.channel);
+    const result = (unfinishedCount, historicalUnfinishedCount = 0) => ({
+      unfinishedCount,
+      historicalUnfinishedCount,
+      unresolvedUnfinishedCount: unfinishedCount - historicalUnfinishedCount,
+    });
+
+    const mapping = record(native?.mapping) ? native.mapping : null;
+    const nodes = new Map(mapping ? Object.entries(mapping) : []);
+    if (!nodes.size) {
+      const messages = Array.isArray(native?.messages) ? native.messages : [];
+      // A flat response or a single page does not supply verified branch ancestry.
+      return result(messages.filter(item => unfinished(item?.message ?? item)).length);
+    }
+
+    const unfinishedIds = [], terminalIds = [];
+    for (const [id, node] of nodes) {
+      if (unfinished(node?.message)) unfinishedIds.push(id);
+      if (terminal(node?.message)) terminalIds.push(id);
+    }
+    if (!unfinishedIds.length) return result(0);
+
+    const current = native?.current_node;
+    if (typeof current !== 'string' || !nodes.has(current)) return result(unfinishedIds.length);
+
+    // Walk from the selected tip toward its root. A selected-chain message needs
+    // a later ending on that same chain; a completed sibling cannot close it.
+    const currentChain = new Set(), currentClosedAncestors = new Set();
+    let cursor = current, laterTerminal = false;
+    while (cursor !== null && cursor !== undefined) {
+      if (currentChain.has(cursor) || !nodes.has(cursor) || !record(nodes.get(cursor))) {
+        return result(unfinishedIds.length);
+      }
+      const node = nodes.get(cursor);
+      currentChain.add(cursor);
+      if (laterTerminal) currentClosedAncestors.add(cursor);
+      if (terminal(node.message)) laterTerminal = true;
+      cursor = node.parent;
+    }
+
+    // Union the strict ancestors of all explicit endings. Once an ancestor was
+    // visited, its own ancestry was visited too: each node is traversed at most
+    // once across all terminal messages, avoiding repeated long-chain walks.
+    const closedAncestors = new Set();
+    for (const id of terminalIds) {
+      cursor = nodes.get(id)?.parent;
+      while (cursor !== null && cursor !== undefined && !closedAncestors.has(cursor)) {
+        const node = nodes.get(cursor);
+        if (!record(node)) break;
+        closedAncestors.add(cursor);
+        cursor = node.parent;
+      }
+    }
+
+    let historicalUnfinishedCount = 0;
+    for (const id of unfinishedIds) {
+      if (id === current) continue;
+      if (currentChain.has(id) ? currentClosedAncestors.has(id) : closedAncestors.has(id)) {
+        historicalUnfinishedCount++;
+      }
+    }
+    return result(unfinishedIds.length, historicalUnfinishedCount);
+  }
   try {
     if (location.origin !== 'https://chatgpt.com') fail('ORIGIN', '请在 chatgpt.com 的已登录标签页中操作。');
     if (!request || !['identity', 'list', 'detail'].includes(request.kind)) fail('REQUEST', '不支持的采集操作。');
@@ -85,7 +155,7 @@ export async function probeChatGPT(request) {
       }
     }
     function completeDetail(payload, format) {
-      const partial = reason => fail('INCOMPLETE_DETAIL', '详情尚不完整或仍在生成，已保留原归档，等待后续补采。', reason);
+      const partial = reason => fail('INCOMPLETE_DETAIL', '详情完整性或消息结束状态尚未确认，已保留原归档，等待后续补采。', reason);
       const page = payload.page_info;
       if (payload.is_incomplete === true || payload.has_more === true || payload.has_more_messages === true ||
           payload.has_next_page === true || payload.has_previous_page === true ||
@@ -113,7 +183,6 @@ export async function probeChatGPT(request) {
         for (const key of keys) {
           const node = mapping[key];
           if (!record(node) || (node.message != null && !record(node.message))) partial('TREE_NODE_SHAPE');
-          if (inProgress(node.message)) partial('MESSAGE_IN_PROGRESS');
           if (node.parent !== null && node.parent !== undefined &&
               (typeof node.parent !== 'string' || !own(mapping, node.parent))) partial('TREE_MISSING_PARENT');
           if (node.children !== undefined && (!Array.isArray(node.children) ||
@@ -132,6 +201,7 @@ export async function probeChatGPT(request) {
           }
           for (const id of chain) verified.add(id);
         }
+        if (inspectMessageGeneration(payload).unresolvedUnfinishedCount > 0) partial('MESSAGE_IN_PROGRESS');
       }
       return 'complete';
     }

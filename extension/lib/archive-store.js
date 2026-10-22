@@ -2,6 +2,7 @@ import { buildArchive } from './archive.js';
 import { extractAssets, reconcileAssetCapturePolicy } from './assets.js';
 import { getSetting, setSetting } from './storage.js';
 import { sanitizeMessageSync, selectMessageSync } from './message-sync-receipt.js';
+import { inspectMessageGeneration } from './message-generation.js';
 
 const MAX_FILE_BYTES = 24 * 1024 * 1024;
 const MAX_BATCH_BYTES = 48 * 1024 * 1024;
@@ -52,14 +53,13 @@ const hasTree = native => record(native?.mapping) && Object.keys(native.mapping)
 
 function assertNativeNotPartial(native) {
   if (!record(native)) return; // The archive builder reports malformed outer data.
-  const partial = () => fail('PARTIAL_DETAIL', '原始详情仍有未读取或生成中的内容，已有归档保持不变。');
+  const partial = () => fail('PARTIAL_DETAIL', '原始详情仍有未读取内容或尚不能确认已结束的消息，已有归档保持不变。');
   if (['is_incomplete', 'has_more', 'has_more_messages', 'has_next_page', 'has_previous_page'].some(key => native[key] === true) ||
       ['has_more', 'has_next_page', 'has_previous_page'].some(key => native.page_info?.[key] === true)) partial();
-  const pending = message => ['in_progress', 'streaming', 'pending'].includes(message?.status);
   if (record(native.mapping) && Object.keys(native.mapping).length) {
     const mapping = native.mapping;
     for (const node of Object.values(mapping)) {
-      if (!record(node) || (node.message != null && !record(node.message)) || pending(node.message)) partial();
+      if (!record(node) || (node.message != null && !record(node.message))) partial();
       if (node.parent != null && (typeof node.parent !== 'string' || !own(mapping, node.parent))) partial();
       if (node.children !== undefined && (!Array.isArray(node.children) ||
           node.children.some(id => typeof id !== 'string' || !own(mapping, id)))) partial();
@@ -74,7 +74,10 @@ function assertNativeNotPartial(native) {
       }
       for (const id of chain) verified.add(id);
     }
-  } else if (Array.isArray(native.messages) && native.messages.some(item => pending(item?.message ?? item))) partial();
+  }
+  // Recompute from native nodes after validating the graph. Caller or remote
+  // generation metadata cannot turn an unresolved message into a stable one.
+  if (inspectMessageGeneration(native).unresolvedUnfinishedCount > 0) partial();
 }
 async function ensurePermission(directory) {
   if (directory?.kind !== 'directory' || typeof directory.queryPermission !== 'function') {
@@ -307,7 +310,7 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
       existingManifest: builderManifest, productionPrefix: prefix, assets: assets ?? prior?.assets ?? preferredEntry?.assets });
     const entry = built.manifest.conversations[id];
     if (detail.completeness === 'partial' || built.summary.coverage.messages === 'partial') {
-      fail('PARTIAL_DETAIL', '这条对话尚未完整读取或仍在生成，已保留原归档，稍后重试。');
+      fail('PARTIAL_DETAIL', '这条对话尚未完整读取或有消息尚不能确认已结束，已保留原归档，稍后重试。');
     }
     const updatedAt = sourceTime(native.update_time);
     const oldTime = sourceTime(prior?.sourceUpdatedAt);

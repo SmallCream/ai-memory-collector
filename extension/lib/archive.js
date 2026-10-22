@@ -1,6 +1,7 @@
 /** Native web-detail JSON is authoritative; Markdown is derived from the same snapshot. */
 import { renderRichText } from './rich-content.js';
 import { createAssetResolver, sanitizeAssetRecords, extractAssets } from './assets.js';
+import { inspectMessageGeneration } from './message-generation.js';
 export const RENDERER_VERSION = 'rich-1';
 const PLATFORM = 'chatgpt';
 const SECRET_KEYS = new Set(['accesstoken', 'access_token', 'refreshtoken', 'refresh_token',
@@ -250,8 +251,14 @@ export async function buildArchive({ conversation, identity, capturedAt, existin
   const sourcePartial = native.is_incomplete === true || native.page_info?.has_next_page === true || native.page_info?.has_previous_page === true;
   if (sourcePartial) warnings.push('来源提示还有未取得内容，当前档案为部分覆盖。');
   const allNodes = hasMapping ? Object.values(native.mapping) : native.messages.map(item => own(item, 'message') ? item : { message: item });
-  if (allNodes.some(node => ['in_progress', 'streaming'].includes(node.message?.status))) {
-    warnings.push('存在生成中的消息；该采集不能视为完整稳定版本。');
+  const generation = inspectMessageGeneration(native);
+  const generationState = generation.unfinishedCount > 0 ? {
+    policy: 'closed-descendant-v1', historicalUnfinishedCount: generation.historicalUnfinishedCount,
+    unresolvedUnfinishedCount: generation.unresolvedUnfinishedCount,
+  } : null;
+  if (generation.unresolvedUnfinishedCount > 0) warnings.push('存在尚不能确认已结束的消息；该采集不能视为完整稳定版本。');
+  if (generation.historicalUnfinishedCount > 0) {
+    warnings.push(`已原样保留 ${generation.historicalUnfinishedCount} 条历史未完成状态消息，同一分支存在后续结束记录。`);
   }
   if (redactions.length) warnings.push(`已脱敏 ${redactions.length} 个结构化认证字段或 URL，详情见清单。`);
   const title = typeof native.title === 'string' ? native.title : '未命名对话';
@@ -270,7 +277,7 @@ export async function buildArchive({ conversation, identity, capturedAt, existin
     }
   }
   const coverage = {
-    messages: branch.partial || sourcePartial || warnings.some(warning => warning.includes('生成中')) ? 'partial' : 'unknown',
+    messages: branch.partial || sourcePartial || generation.unresolvedUnfinishedCount > 0 ? 'partial' : 'unknown',
     branches: sourcePartial ? 'partial' : 'unknown',
     attachments: 'references-only',
   };
@@ -303,6 +310,7 @@ export async function buildArchive({ conversation, identity, capturedAt, existin
     // Repeated identical capture is byte-stable, including the derived manifest.
     lastChangedAt: previous?.contentHash === contentHash ? previous.lastChangedAt : captureTime,
     coverage, renderMode: branch.mode, redactions, warnings,
+    ...(generationState ? { generationState } : {}),
     ...(assets !== undefined ? { assets: resourceRecords } : {}),
   };
   Object.defineProperty(manifest.conversations, id, { value: entry, enumerable: true, writable: true, configurable: true });
@@ -319,6 +327,7 @@ export async function buildArchive({ conversation, identity, capturedAt, existin
       nodeCount: allNodes.length, messageCount,
       currentBranchMessageCount: branch.mode === 'current-branch' ? selectedMessages.length : null,
       displayedMessageCount: displayed.length, renderMode: branch.mode,
-      coverage, warnings, redactionCount: redactions.length, jsonPath, markdownPath },
+      coverage, warnings, redactionCount: redactions.length, jsonPath, markdownPath,
+      ...(generationState ? { generationState } : {}) },
   };
 }

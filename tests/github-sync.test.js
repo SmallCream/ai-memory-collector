@@ -224,6 +224,58 @@ test('same native sync selects the latest full-history receipt with and without 
   }
 });
 
+async function generationBundle(unfinished = true) {
+  const initial = bundle('generation-state'), native = JSON.parse(initial.files[0].content);
+  native.mapping.old = { parent: 'a', message: { id: 'old', author: { role: 'assistant' },
+    status: unfinished ? 'in_progress' : 'finished_successfully', content: { parts: ['Historical answer'] } } };
+  native.mapping.done = { parent: 'old', message: { id: 'done', author: { role: 'assistant' },
+    status: 'finished_successfully', end_turn: true, content: { parts: ['Later completed answer'] } } };
+  native.current_node = 'done';
+  const built = await buildArchive({ conversation: native, identity: { accountKey: ACCOUNT, displayName: 'Demo' },
+    capturedAt: '2026-10-21T00:00:00Z', existingManifest: initial.manifest, productionPrefix: PREFIX, assets: [] });
+  const entry = built.manifest.conversations['generation-state'];
+  entry.sourceCompleteness = 'complete';
+  built.files.find(file => file.path === MANIFEST).content = json(built.manifest);
+  return { accountKey: ACCOUNT, files: built.files, manifest: built.manifest, entry };
+}
+
+test('same native asset merge recomputes historical generation metadata and retains known complete structure', async () => {
+  const local = await generationBundle(), remote = structuredClone(local);
+  remote.entry = remote.manifest.conversations['generation-state'];
+  remote.entry.generationState = { policy: 'old-policy', historicalUnfinishedCount: 999, unresolvedUnfinishedCount: 999 };
+  remote.entry.warnings = ['Stale generation warning'];
+  remote.entry.coverage.messages = 'partial';
+  remote.entry.sourceCompleteness = 'partial';
+  remote.files.find(file => file.path === MANIFEST).content = json(remote.manifest);
+  const server = gitServer({ initial: fileMap(remote) });
+  const result = await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+  assert.equal(result.conflicts.length, 0);
+  const merged = JSON.parse(server.files()[MANIFEST]).conversations['generation-state'];
+  assert.deepEqual(merged.generationState, local.entry.generationState);
+  assert.deepEqual(merged.warnings, local.entry.warnings);
+  assert.deepEqual(merged.coverage, local.entry.coverage);
+  assert.equal(merged.sourceCompleteness, 'complete');
+  assert.deepEqual(result.remoteWinners[0].entry, merged);
+  assert.equal(server.files()[remote.entry.jsonPath], remote.files[0].content);
+  assert.equal(JSON.parse(server.files()[remote.entry.jsonPath]).mapping.old.message.status, 'in_progress');
+  assert.equal((await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl })).status, 'unchanged');
+});
+
+test('same native asset merge removes unsupported generation counts when the source has no unfinished messages', async () => {
+  const local = await generationBundle(false), remote = structuredClone(local);
+  remote.entry = remote.manifest.conversations['generation-state'];
+  remote.entry.generationState = { policy: 'closed-descendant-v1', historicalUnfinishedCount: 8, unresolvedUnfinishedCount: 0 };
+  remote.entry.warnings = ['Unsupported historical count'];
+  remote.files.find(file => file.path === MANIFEST).content = json(remote.manifest);
+  const server = gitServer({ initial: fileMap(remote) });
+  const result = await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+  const merged = JSON.parse(server.files()[MANIFEST]).conversations['generation-state'];
+  assert.equal(Object.hasOwn(merged, 'generationState'), false);
+  assert.equal(Object.hasOwn(result.remoteWinners[0].entry, 'generationState'), false);
+  assert.deepEqual(merged.warnings, local.entry.warnings);
+  assert.equal(server.files()[remote.entry.jsonPath], remote.files[0].content);
+});
+
 test('same full-history time chooses the later valid receipt and discards incompatible formats', async () => {
   const local = setReceipt(flatBundle(), receipt(100, 200), []);
   const remote = setReceipt(flatBundle(), receipt(100, 300), []);

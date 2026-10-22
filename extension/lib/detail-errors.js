@@ -4,7 +4,7 @@ const messages = Object.freeze({
   SOURCE_PARTIAL: '接口明确标记本次返回的详情尚不完整或仍有未返回的内容。',
   TREE_CURRENT_NODE: '消息树为空、缺少当前节点标识，或当前节点不在返回结果中。',
   TREE_NODE_SHAPE: '消息树中存在无法识别的节点或消息结构。',
-  MESSAGE_IN_PROGRESS: '返回数据中有消息仍标记为生成中或等待中，也可能是保留了旧的中断状态。',
+  MESSAGE_IN_PROGRESS: '存在尚不能确认已结束的消息，可能仍在生成或保留了未确认的中断状态；本次不覆盖归档，可稍后重试。',
   TREE_MISSING_PARENT: '消息树的父节点引用无效，或指向本次未返回的节点。',
   TREE_MISSING_CHILD: '消息树的子节点引用无效，或指向本次未返回的节点。',
   TREE_PARENT_CYCLE: '消息树的父节点关系形成循环，无法确认完整的消息顺序。',

@@ -177,3 +177,64 @@ test('an existing tree archive is not replaced by a selected-branch page when th
   assert.equal(f.fs.text(entry.jsonPath), original);
   assert.deepEqual(await f.engine.getOutbox(accountKey), []);
 });
+
+function historicalTree(messages) {
+  const mapping = { root: { id: 'root', parent: null, children: ['m1'], message: null } };
+  for (const [index, item] of messages.entries()) mapping[item.id] = {
+    id: item.id, message: structuredClone(item), parent: index ? messages[index - 1].id : 'root',
+    children: index < messages.length - 1 ? [messages[index + 1].id] : [],
+  };
+  mapping.m2.message.status = 'in_progress';
+  mapping.m8.message.end_turn = true;
+  return { conversation_id: conversationId, title: 'Pipeline conversation',
+    create_time: sourceTime - 1000, update_time: sourceTime, current_node: 'm8', mapping };
+}
+
+test('historical unfinished tree messages survive the serialized collector, archive, baseline and upload handoff', async () => {
+  const f = setup(), tree = historicalTree(f.messages);
+  f.setTree(tree);
+  const state = await run(f);
+  assert.equal(state.status, 'completed');
+  const entry = (await f.manifest()).conversations[conversationId];
+  assert.equal(entry.sourceCompleteness, 'complete');
+  assert.notEqual(entry.coverage.messages, 'partial');
+  assert.deepEqual(entry.generationState, { policy: 'closed-descendant-v1',
+    historicalUnfinishedCount: 1, unresolvedUnfinishedCount: 0 });
+  const native = JSON.parse(f.fs.text(entry.jsonPath));
+  assert.equal(native.mapping.m2.message.status, 'in_progress');
+  assert.deepEqual(Object.keys(native.mapping).sort(), Object.keys(tree.mapping).sort());
+  assert.deepEqual(native.mapping.m2, tree.mapping.m2);
+  const markdown = f.fs.text(entry.markdownPath);
+  assert.match(markdown, /Message 2\b/);
+  assert.match(markdown, /Message 8\b/);
+  assert.doesNotMatch(markdown, /generationState|历史未完成|closed-descendant/);
+  const baseline = await readConversationBaseline(f.fs.directory, account, conversationId, { get: f.fs.getSetting });
+  assert.deepEqual(baseline.payload, native);
+  assert.deepEqual((await f.engine.getOutbox(accountKey)).map(item => item.conversationId), [conversationId]);
+  assert.deepEqual(f.flatRequests(), []);
+});
+
+test('an unresolved current message preserves the earlier historical-status archive and never queues a replacement', async () => {
+  const f = setup(), tree = historicalTree(f.messages);
+  f.setTree(tree);
+  assert.equal((await run(f)).status, 'completed');
+  const entry = (await f.manifest()).conversations[conversationId];
+  const original = f.fs.text(entry.jsonPath), markdown = f.fs.text(entry.markdownPath);
+  const manifest = JSON.stringify(await f.manifest());
+  await f.engine.acknowledgeOutbox(accountKey, (await f.engine.getOutbox(accountKey)).map(item => item.id));
+  const unfinished = structuredClone(tree);
+  unfinished.update_time += 60;
+  unfinished.mapping.m8.message.status = 'streaming';
+  // Caller-supplied metadata cannot turn an unresolved current message into
+  // a complete archive, even when it claims there are no unfinished messages.
+  unfinished.generationState = { policy: 'closed-descendant-v1', unresolvedUnfinishedCount: 0 };
+  f.append(); f.setTree(unfinished);
+  const state = await run(f);
+  assert.equal(state.status, 'running');
+  assert.equal(state.error.code, 'INCOMPLETE_DETAIL');
+  assert.equal(state.error.reason, 'MESSAGE_IN_PROGRESS');
+  assert.equal(f.fs.text(entry.jsonPath), original);
+  assert.equal(f.fs.text(entry.markdownPath), markdown);
+  assert.equal(JSON.stringify(await f.manifest()), manifest);
+  assert.deepEqual(await f.engine.getOutbox(accountKey), []);
+});

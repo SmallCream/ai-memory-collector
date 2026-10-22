@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { webcrypto } from 'node:crypto';
 import vm from 'node:vm';
 import { probeChatGPT } from '../extension/lib/chatgpt.js';
+import { inspectMessageGeneration } from '../extension/lib/message-generation.js';
 
 const session = (id = 'synthetic-user') => ({ user: { id, name: 'Demo User' }, accessToken: 'synthetic-bearer-secret' });
 const expectedKey = 'acct-' + Buffer.from(await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode('chatgpt:synthetic-user'))).toString('hex').slice(0, 24);
@@ -423,4 +424,130 @@ test('network errors cannot inject diagnostic reasons, including names used by i
     assert.equal(Object.hasOwn(result.error, 'reason'), false);
     assert.doesNotMatch(JSON.stringify(result), /private|MESSAGE_IN_PROGRESS/);
   }
+});
+
+function historicalTree(status = 'in_progress') {
+  const value = completeTree();
+  value.mapping.a.message.status = status;
+  value.mapping.a.message.end_turn = false;
+  value.mapping.a.children = ['u2'];
+  value.mapping.u2 = { id: 'u2', parent: 'a', children: ['a2'], message: {
+    id: 'u2', author: { role: 'user' }, content: { parts: ['Continue this conversation'] }, status: 'finished_successfully',
+  } };
+  value.mapping.a2 = { id: 'a2', parent: 'u2', children: [], message: {
+    id: 'a2', author: { role: 'assistant' }, content: { parts: ['A later completed answer'] },
+    status: 'finished_successfully', end_turn: true,
+  } };
+  value.current_node = 'a2';
+  return value;
+}
+
+test('serialized tree probe preserves historical unfinished messages with later closure on the selected branch', async () => {
+  for (const status of ['pending', 'streaming', 'in_progress']) {
+    const payload = historicalTree(status);
+    const before = structuredClone(payload);
+    const { run, calls } = setup([session(), payload, session()]);
+    const result = await run({ ...autoRequest, format: 'tree', requireComplete: true });
+    assert.equal(result.ok, true);
+    assert.equal(result.completeness, 'complete');
+    assert.deepEqual(JSON.parse(JSON.stringify(result.payload)), before, 'no node, status or content is rewritten');
+    assert.equal(calls.length, 3, 'identity must still be checked after the detail read');
+    assert.deepEqual(inspectMessageGeneration(payload), {
+      unfinishedCount: 1, historicalUnfinishedCount: 1, unresolvedUnfinishedCount: 0,
+    });
+  }
+});
+
+test('tree probe and shared classification agree on same-branch closure and ambiguous states', async t => {
+  const cases = {
+    'selected branch ended': { accepted: true, mutate: () => {} },
+    'current node remains pending': { mutate: value => { value.mapping.a2.message.status = 'pending'; } },
+    'current pending ancestor has only sibling closure': { mutate: value => {
+      value.mapping.a2.message.end_turn = false;
+      value.mapping.a.children.push('side');
+      value.mapping.side = { id: 'side', parent: 'a', children: [], message: {
+        ...structuredClone(value.mapping.a2.message), id: 'side', end_turn: true,
+      } };
+    } },
+    'unfinished alternate branch has its own closure': { accepted: true, mutate: value => {
+      value.mapping.u.children.push('side');
+      value.mapping.side = { id: 'side', parent: 'u', children: ['sideFinal'], message: {
+        ...structuredClone(value.mapping.a.message), id: 'side',
+      } };
+      value.mapping.sideFinal = { id: 'sideFinal', parent: 'side', children: [], message: {
+        ...structuredClone(value.mapping.a2.message), id: 'sideFinal',
+      } };
+    } },
+    'unfinished alternate leaf has no closure': { mutate: value => {
+      value.mapping.u.children.push('side');
+      value.mapping.side = { id: 'side', parent: 'u', children: [], message: {
+        ...structuredClone(value.mapping.a.message), id: 'side',
+      } };
+    } },
+    'end_turn missing': { mutate: value => { delete value.mapping.a2.message.end_turn; } },
+    'end_turn false': { mutate: value => { value.mapping.a2.message.end_turn = false; } },
+    'user message ended': { mutate: value => { value.mapping.a2.message.author.role = 'user'; } },
+    'tool message ended': { mutate: value => { value.mapping.a2.message.author.role = 'tool'; } },
+    'tool recipient': { mutate: value => { value.mapping.a2.message.recipient = 'python'; } },
+    'analysis channel': { mutate: value => { value.mapping.a2.message.channel = 'analysis'; } },
+    'commentary channel': { mutate: value => { value.mapping.a2.message.channel = 'commentary'; } },
+    'failed end status': { mutate: value => { value.mapping.a2.message.status = 'failed'; } },
+    'explicit final channel and all recipient': { accepted: true, mutate: value => {
+      value.mapping.a2.message.channel = 'final'; value.mapping.a2.message.recipient = 'all';
+    } },
+  };
+  for (const [name, { accepted = false, mutate }] of Object.entries(cases)) await t.test(name, async () => {
+    const payload = historicalTree(); mutate(payload);
+    const classification = inspectMessageGeneration(payload);
+    assert.equal(classification.unresolvedUnfinishedCount === 0, accepted);
+    const { run, calls } = setup([session(), payload, session()]);
+    const result = await run({ ...autoRequest, format: 'tree', requireComplete: true });
+    assert.equal(result.ok, accepted);
+    if (accepted) assert.deepEqual(JSON.parse(JSON.stringify(result.payload)), payload);
+    else {
+      assert.equal(result.error.code, 'INCOMPLETE_DETAIL');
+      assert.equal(result.error.reason, 'MESSAGE_IN_PROGRESS');
+      assert.equal(result.payload, undefined);
+      assert.equal(calls.length, 2, 'an uncertain tree must not fall back to a narrower endpoint');
+    }
+  });
+});
+
+test('historical closure does not override incomplete flags, malformed links or cycles', async () => {
+  for (const [reason, mutate] of [
+    ['SOURCE_PARTIAL', value => { value.has_more = true; }],
+    ['TREE_CURRENT_NODE', value => { value.current_node = 'missing'; }],
+    ['TREE_MISSING_PARENT', value => { value.mapping.u.parent = 'missing'; }],
+    ['TREE_MISSING_CHILD', value => { value.mapping.u.children.push('missing'); }],
+    ['TREE_PARENT_CYCLE', value => { value.mapping.root.parent = 'a2'; }],
+  ]) {
+    const payload = historicalTree(); mutate(payload);
+    const { run, calls } = setup([session(), payload]);
+    const result = await run({ ...autoRequest, format: 'tree', requireComplete: true });
+    assert.equal(result.error.code, 'INCOMPLETE_DETAIL');
+    assert.equal(result.error.reason, reason);
+    assert.equal(result.payload, undefined);
+    assert.equal(calls.length, 2);
+  }
+});
+
+test('flat and page reads still reject unfinished history even with a later ended message', async () => {
+  for (const format of ['flat', 'page']) {
+    const payload = messagePage(['m1', 'm2'], { has_previous_page: false, has_next_page: false });
+    payload.messages[0].status = 'pending';
+    payload.messages[1].author.role = 'assistant';
+    payload.messages[1].end_turn = true;
+    assert.equal(inspectMessageGeneration(payload).unresolvedUnfinishedCount, 1);
+    const { run } = setup([session(), payload]);
+    const result = await run({ ...autoRequest, format, requireComplete: true });
+    assert.equal(result.error.reason, 'MESSAGE_IN_PROGRESS');
+    assert.equal(result.payload, undefined);
+  }
+});
+
+test('serialized generation classifier stays identical to the archive classifier', () => {
+  // Chrome serializes only probeChatGPT, so the small classifier must be nested.
+  // Assert source parity as well as the behavior above to prevent future drift.
+  const nested = inspectMessageGeneration.toString().split('\n').map(line => line ? `  ${line}` : '').join('\n');
+  assert.ok(probeChatGPT.toString().includes(nested));
 });

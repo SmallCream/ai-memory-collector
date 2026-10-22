@@ -17,6 +17,20 @@ function detail(id = 'one', text = 'first', update = 1792569600, extra = {}) {
     }, ...extra,
   } };
 }
+function historicalDetail(status = 'pending') {
+  const result = detail();
+  const mapping = result.payload.mapping;
+  mapping.reply.message.status = status;
+  mapping.nextQuestion = { parent: 'reply', message: {
+    id: 'q2', author: { role: 'user' }, content: { parts: ['A later question'] }, status: 'finished_successfully',
+  } };
+  mapping.finalReply = { parent: 'nextQuestion', message: {
+    id: 'r2', author: { role: 'assistant' }, content: { parts: ['A later completed answer'] },
+    status: 'finished_successfully', end_turn: true,
+  } };
+  result.payload.current_node = 'finalReply';
+  return result;
+}
 function setup() {
   const files = new Map(), directories = new Set(['']), journals = new Map(), writes = [];
   let permission = 'granted', failPath = null, failJournalClear = false, corruptPath = null;
@@ -98,6 +112,65 @@ test('incremental presence checks require both nonempty archive files without re
     fs.files.set(path, content);
   }
   assert.equal(fs.writes.length, writes);
+});
+
+test('historical unfinished tree nodes survive save, baseline read and new-machine restoration without rewriting status', async () => {
+  for (const status of ['pending', 'streaming', 'in_progress']) {
+    const source = historicalDetail(status), origin = setup(), target = setup();
+    const saved = await origin.save(source);
+    const expected = { policy: 'closed-descendant-v1', historicalUnfinishedCount: 1, unresolvedUnfinishedCount: 0 };
+    assert.equal(saved.entry.sourceCompleteness, 'complete');
+    assert.deepEqual(saved.entry.generationState, expected);
+    assert.deepEqual(JSON.parse(origin.files.get(saved.entry.jsonPath)), source.payload);
+    const baseline = await origin.store.readConversationBaseline(origin.directory, account, 'one');
+    assert.deepEqual(baseline.payload, source.payload);
+    assert.deepEqual(baseline.entry.generationState, expected);
+    // Imported metadata is a hint only; rebuilding must derive the true count.
+    const remoteFiles = structuredClone(saved.files);
+    const manifestFile = remoteFiles.find(file => file.path.endsWith('/archive/manifest.json'));
+    const manifest = JSON.parse(manifestFile.content);
+    manifest.conversations.one.generationState.historicalUnfinishedCount = 999;
+    manifestFile.content = JSON.stringify(manifest);
+    const restored = await target.store.applyRemoteFiles({ directory: target.directory, account, files: remoteFiles });
+    assert.deepEqual(restored.entry.generationState, expected);
+    assert.equal(target.files.get(restored.entry.jsonPath), origin.files.get(saved.entry.jsonPath));
+    assert.equal(target.files.get(restored.entry.markdownPath), origin.files.get(saved.entry.markdownPath));
+    assert.deepEqual((await target.store.readConversationBaseline(target.directory, account, 'one')).payload, source.payload);
+  }
+});
+
+test('ended historical nodes do not bypass native partial flags or invalid graph references', async () => {
+  const fs = setup();
+  await fs.save(detail());
+  const before = new Map(fs.files);
+  for (const mutate of [
+    native => { native.has_more = true; },
+    native => { native.mapping.hidden = { parent: 'missing', message: null }; },
+    native => { native.mapping.hidden = { parent: 'hidden', message: null }; },
+    native => { native.mapping.reply.children = ['missing']; },
+  ]) {
+    const source = historicalDetail(); mutate(source.payload);
+    await assert.rejects(fs.save(source), { code: 'PARTIAL_DETAIL' });
+    assert.deepEqual(fs.files, before);
+  }
+});
+
+test('current unfinished nodes and unproven siblings cannot replace a saved historical tree', async () => {
+  const fs = setup();
+  await fs.save(historicalDetail());
+  const before = new Map(fs.files);
+  for (const mutate of [
+    native => { native.mapping.finalReply.message.status = 'pending'; },
+    native => { native.mapping.other = { parent: 'question', message: {
+      id: 'other', author: { role: 'assistant' }, status: 'pending', content: { parts: ['Unfinished alternate answer'] },
+    } }; },
+    native => { native.current_node = 'nextQuestion'; },
+  ]) {
+    const source = historicalDetail(); mutate(source.payload);
+    source.generationState = { policy: 'closed-descendant-v1', historicalUnfinishedCount: 1, unresolvedUnfinishedCount: 0 };
+    await assert.rejects(fs.save(source), { code: 'PARTIAL_DETAIL' });
+    assert.deepEqual(fs.files, before);
+  }
 });
 
 test('incremental presence checks reject foreign or unsafe paths and propagate permission/read errors', async () => {
@@ -424,6 +497,9 @@ test('remote complete labels cannot override pagination, pending messages, or br
     const manifestFile = files.find(file => file.path.endsWith('/archive/manifest.json'));
     const manifest = JSON.parse(manifestFile.content);
     manifest.conversations.one.contentHash = Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(nativeFile.content))).toString('hex');
+    manifest.conversations.one.generationState = {
+      policy: 'closed-descendant-v1', historicalUnfinishedCount: 1, unresolvedUnfinishedCount: 0,
+    };
     manifestFile.content = JSON.stringify(manifest);
     await assert.rejects(local.store.applyRemoteFiles({ directory: local.directory, account, files }), { code: 'PARTIAL_DETAIL' });
     assert.deepEqual(local.files, before);

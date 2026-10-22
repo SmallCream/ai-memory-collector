@@ -328,13 +328,22 @@ async function plan(api, remote, bundles, assetPlan) {
           productionPrefix: prefix, assets: mergedAssets });
         const rebuiltMD = rebuilt.files.find(file => file.path === markdownPath)?.content;
         if (typeof rebuiltMD !== 'string') fail('REMOTE_DERIVATIVE_MISSING', '图片阅读文件无法重新生成，待同步任务已保留。');
+        const rebuiltEntry = rebuilt.manifest.conversations[id];
         // Receipts belong to exact native bytes. A derivative-only merge must
         // retain the strongest full-history check rather than favoring a device.
         const mergedEntry = applyMessageSync({ ...localEntry, ...previous, assets: mergedAssets, jsonPath, markdownPath,
           contentHash: remoteContentHash, markdownHash: await hash(rebuiltMD),
-          rendererVersion: rebuilt.manifest.conversations[id].rendererVersion }, native,
+          rendererVersion: rebuiltEntry.rendererVersion, coverage: rebuiltEntry.coverage, warnings: rebuiltEntry.warnings }, native,
         remoteContentHash === localEntry.contentHash ? localEntry.messageSync : null,
         remoteContentHash === previous?.contentHash ? previous.messageSync : null);
+        // These are derived from the chosen native tree, not evidence supplied
+        // by another device's older manifest. Clear stale generation metadata
+        // when no unfinished messages exist in the actual source.
+        if (rebuiltEntry.generationState) mergedEntry.generationState = rebuiltEntry.generationState;
+        else delete mergedEntry.generationState;
+        if (localEntry.sourceCompleteness === 'complete' || previous?.sourceCompleteness === 'complete') {
+          mergedEntry.sourceCompleteness = 'complete';
+        }
         Object.defineProperty(manifest.conversations, id, { value: mergedEntry, enumerable: true, writable: true, configurable: true });
         await put(markdownPath, rebuiltMD);
         // Preserve the native JSON bytes and return the richer version for guarded local import.
