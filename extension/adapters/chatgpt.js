@@ -1,8 +1,12 @@
 import { probeChatGPT } from '../lib/chatgpt.js';
 import { collectMessagePages, fullMessageSync } from '../lib/message-sync.js';
+import { sanitizeDetailFailure } from '../lib/detail-errors.js';
 
 export class AdapterError extends Error {
-  constructor(code, message) { super(message); this.name = 'AdapterError'; this.code = code; }
+  constructor(code, message, reason) {
+    super(message); this.name = 'AdapterError'; this.code = code;
+    Object.assign(this, sanitizeDetailFailure({ code, reason }));
+  }
 }
 
 export function isChatGPTUrl(value) {
@@ -38,7 +42,7 @@ export function createChatGPTAdapter(browser, { now = Date.now } = {}) {
     if (!result?.ok) {
       const code = /^[A-Z][A-Z0-9_]{0,60}$/.test(result?.error?.code || '') ? result.error.code : 'INVALID_RESPONSE';
       const message = typeof result?.error?.message === 'string' ? result.error.message : '未取得有效的采集结果，请稍后重试。';
-      throw new AdapterError(code, message);
+      throw new AdapterError(code, message, result?.error?.reason);
     }
     if (!validIdentity(result.identity) ||
         (request.expectedAccountKey && result.identity.accountKey !== request.expectedAccountKey)) {
@@ -77,7 +81,7 @@ export function createChatGPTAdapter(browser, { now = Date.now } = {}) {
       const flatBaseline = !treeBaseline && Array.isArray(baseline?.payload?.messages);
       const tree = async () => {
         const result = await readDetail({ format: 'tree', requireComplete: true });
-        if (result.completeness !== 'complete') throw new AdapterError('INCOMPLETE_DETAIL', '详情完整度未确认，原归档保持不变。');
+        if (result.completeness !== 'complete') throw new AdapterError('INCOMPLETE_DETAIL', '详情完整度未确认，原归档保持不变。', 'DETAIL_COMPLETENESS_UNKNOWN');
         if (!result.payload?.mapping || !Object.keys(result.payload.mapping).length) throw new AdapterError('FORMAT', '消息树结构无法确认，原归档保持不变。');
         const messageSync = fullMessageSync(result.payload, baseline, now());
         try { await onProgress?.({ pagesRead: 1, fetchedMessages: messageSync.fetchedMessages, reusedMessages: 0, mode: 'full' }); }
@@ -90,7 +94,7 @@ export function createChatGPTAdapter(browser, { now = Date.now } = {}) {
         const captured = await collectMessagePages({ conversationId, baseline, forceFull, now: now(), onProgress,
           readPage: async before => {
             const result = await readDetail({ format: 'page', ...(before ? { before } : {}) });
-            if (result.completeness !== 'page') throw new AdapterError('INCOMPLETE_DETAIL', '分页结构完整度未确认，原归档保持不变。');
+            if (result.completeness !== 'page') throw new AdapterError('INCOMPLETE_DETAIL', '分页结构完整度未确认，原归档保持不变。', 'DETAIL_COMPLETENESS_UNKNOWN');
             if (!before) latest = result;
             return result.payload;
           } });

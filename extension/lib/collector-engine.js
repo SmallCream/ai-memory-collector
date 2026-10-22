@@ -5,6 +5,7 @@
  */
 import { createActivityLog, activityLabel } from './activity-log.js';
 import { needsMessageFullCheck } from './message-sync.js';
+import { sanitizeDetailFailure, detailFailureMessage } from './detail-errors.js';
 const MODES = new Set(['initial', 'incremental', 'full']);
 const LIVE = new Set(['running', 'paused', 'blocked']);
 const MAX_ITEMS = 100_000;
@@ -57,7 +58,7 @@ function fail(code, message = ERROR_MESSAGES[code] || '采集未完成，进度�
 
 function safeError(error) {
   const code = /^[A-Z][A-Z0-9_]{0,60}$/.test(error?.code || '') ? error.code : 'COLLECTION_FAILED';
-  return { code, message: ERROR_MESSAGES[code] || (code.startsWith('HTTP_5') ? '网站暂时不可用，已保留进度。' : '采集未完成，已有归档和进度已保留。') };
+  return { code, ...sanitizeDetailFailure({ ...error, code }), message: detailFailureMessage({ ...error, code }) || ERROR_MESSAGES[code] || (code.startsWith('HTTP_5') ? '网站暂时不可用，已保留进度。' : '采集未完成，已有归档和进度已保留。') };
 }
 
 function transient(code) {
@@ -132,6 +133,7 @@ function queueDiagnostics(queue = []) {
       status: own(rank, item.status) ? item.status : 'pending',
       attempt: Number.isSafeInteger(item.attempts) && item.attempts >= 0 ? item.attempts : 0,
       nextRetryAt: diagnosticTime(item.nextRetryAt), code: item.error ? safeError(item.error).code : null,
+      ...sanitizeDetailFailure(item.error),
     })) };
 }
 

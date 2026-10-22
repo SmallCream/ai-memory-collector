@@ -13,11 +13,11 @@ const idOf = item => (record(item?.message) ? item.message.id : item?.id) ?? ite
 const nativeMessage = item => own(item, 'message') ? item.message : item;
 const hasTree = payload => record(payload?.mapping) && Object.keys(payload.mapping).length > 0;
 
-function fail(code = 'DETAIL_PAGINATION') {
+function fail(code = 'DETAIL_PAGINATION', reason) {
   throw Object.assign(new Error(code === 'DETAIL_CHANGED'
     ? '读取期间对话版本发生变化，原归档保持不变，请稍后重试。'
     : code === 'SIZE' ? '对话分页超过本次处理上限，原归档保持不变。'
-      : '消息分页或历史衔接无法确认，原归档保持不变。'), { code });
+      : '消息分页或历史衔接无法确认，原归档保持不变。'), { code, ...(reason ? { reason } : {}) });
 }
 
 function canonical(value) {
@@ -45,29 +45,36 @@ function version(payload) {
     title: payload.title ?? null });
 }
 
-function validRows(rows) {
-  if (!Array.isArray(rows) || rows.length > MAX_MESSAGES) return false;
+function rowsIssue(rows) {
+  if (!Array.isArray(rows)) return 'MESSAGE_SHAPE';
+  if (rows.length > MAX_MESSAGES) return 'PAGE_MESSAGE_LIMIT';
   const ids = new Set();
   for (const row of rows) {
     const message = record(row) ? nativeMessage(row) : null;
     const id = idOf(row);
-    if (!record(message) || !validId(id) || ids.has(id) || ['in_progress', 'streaming', 'pending'].includes(message.status)) return false;
+    if (!record(message)) return 'MESSAGE_SHAPE';
+    if (!validId(id) || ids.has(id)) return 'MESSAGE_ID';
+    if (['in_progress', 'streaming', 'pending'].includes(message.status)) return 'MESSAGE_IN_PROGRESS';
     ids.add(id);
   }
-  return true;
+  return null;
 }
 
+function validRows(rows) { return rowsIssue(rows) === null; }
+
 function validatePage(payload, conversationId, before) {
-  if (!record(payload) || (payload.conversation_id ?? payload.id) !== conversationId || hasTree(payload) ||
-      !validRows(payload.messages) || payload.messages.length > 2000) fail('FORMAT');
-  if (['is_incomplete', 'has_more', 'has_more_messages', 'has_next_page', 'has_previous_page'].some(key => payload[key] === true)) fail('INCOMPLETE_DETAIL');
+  if (!record(payload) || (payload.conversation_id ?? payload.id) !== conversationId || hasTree(payload)) fail('FORMAT');
+  const issue = rowsIssue(payload.messages);
+  if (issue) fail('FORMAT', issue);
+  if (payload.messages.length > 2000) fail('FORMAT', 'PAGE_MESSAGE_LIMIT');
+  if (['is_incomplete', 'has_more', 'has_more_messages', 'has_next_page', 'has_previous_page'].some(key => payload[key] === true)) fail('INCOMPLETE_DETAIL', 'SOURCE_PARTIAL');
   const page = payload.page_info;
-  if (!record(page) || typeof page.has_previous_page !== 'boolean' || typeof page.has_next_page !== 'boolean' || page.has_more === true) fail('INCOMPLETE_DETAIL');
-  if (!before && page.has_next_page) fail('INCOMPLETE_DETAIL');
+  if (!record(page) || typeof page.has_previous_page !== 'boolean' || typeof page.has_next_page !== 'boolean' || page.has_more === true) fail('INCOMPLETE_DETAIL', 'PAGE_FLAGS');
+  if (!before && page.has_next_page) fail('INCOMPLETE_DETAIL', 'PAGE_DIRECTION');
   if (!payload.messages.length) {
-    if (before || page.has_previous_page || page.has_next_page) fail();
+    if (before || page.has_previous_page || page.has_next_page) fail('DETAIL_PAGINATION', 'PAGE_CURSOR_STALLED');
   } else if (!validId(page.start_cursor) || !validId(page.end_cursor) ||
-      page.start_cursor !== idOf(payload.messages[0]) || page.end_cursor !== idOf(payload.messages.at(-1))) fail();
+      page.start_cursor !== idOf(payload.messages[0]) || page.end_cursor !== idOf(payload.messages.at(-1))) fail('DETAIL_PAGINATION', 'PAGE_CURSOR_MISMATCH');
 }
 
 function flatRows(payload) {
@@ -134,9 +141,10 @@ function prependPage(older, newer) {
   const overlapStart = older.findIndex(row => positions.has(idOf(row)));
   if (overlapStart === -1) return [...older, ...newer];
   const overlap = older.length - overlapStart;
-  if (overlapStart === 0 || overlap > newer.length) fail();
+  if (overlapStart === 0) fail('DETAIL_PAGINATION', 'PAGE_CURSOR_STALLED');
+  if (overlap > newer.length) fail('DETAIL_PAGINATION', 'PAGE_OVERLAP_CONFLICT');
   for (let index = 0; index < overlap; index++) {
-    if (idOf(older[overlapStart + index]) !== idOf(newer[index]) || canonical(older[overlapStart + index]) !== canonical(newer[index])) fail('DETAIL_CHANGED');
+    if (idOf(older[overlapStart + index]) !== idOf(newer[index]) || canonical(older[overlapStart + index]) !== canonical(newer[index])) fail('DETAIL_CHANGED', 'PAGE_OVERLAP_CONFLICT');
   }
   return [...older.slice(0, overlapStart), ...newer];
 }
@@ -162,7 +170,7 @@ export async function collectMessagePages({ readPage, conversationId, baseline =
   const head = await read(null), snapshotVersion = version(head), firstFingerprint = canonical(head);
   // Joining server pages or reusing a local prefix needs a comparable source
   // version and branch tip. A single complete response has no join boundary.
-  if (head.page_info.has_previous_page && (millis(head.update_time) === null || !validId(head.current_node))) fail('INCOMPLETE_DETAIL');
+  if (head.page_info.has_previous_page && (millis(head.update_time) === null || !validId(head.current_node))) fail('INCOMPLETE_DETAIL', 'PAGE_VERSION_MISSING');
   let page = head, rows = head.messages, merged = null;
   const cursors = new Set();
   const allowTail = usableBaseline(baseline, now, forceFull, conversationId);
@@ -172,10 +180,10 @@ export async function collectMessagePages({ readPage, conversationId, baseline =
       if (merged) break;
     }
     const cursor = page.page_info.start_cursor;
-    if (cursors.has(cursor)) fail();
+    if (cursors.has(cursor)) fail('DETAIL_PAGINATION', 'PAGE_CURSOR_STALLED');
     cursors.add(cursor);
     const older = await read(cursor);
-    if (version(older) !== snapshotVersion) fail('DETAIL_CHANGED');
+    if (version(older) !== snapshotVersion) fail('DETAIL_CHANGED', 'PAGE_VERSION_CHANGED');
     rows = prependPage(older.messages, rows);
     if (rows.length > MAX_MESSAGES) fail('SIZE');
     page = older;
@@ -183,7 +191,7 @@ export async function collectMessagePages({ readPage, conversationId, baseline =
   // A second request after walking backward detects a moving head/version.
   if (pagesRead > 1) {
     const check = await read(null);
-    if (canonical(check) !== firstFingerprint) fail('DETAIL_CHANGED');
+    if (canonical(check) !== firstFingerprint) fail('DETAIL_CHANGED', 'PAGE_VERSION_CHANGED');
   }
   if (merged) rows = merged.rows;
   const payload = { ...head, messages: rows, page_info: { ...head.page_info,

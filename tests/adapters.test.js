@@ -61,3 +61,16 @@ test('probe failures retain safe retry codes', async () => {
   const { adapter } = fixture({ ok: false, error: { code: 'HTTP_429', message: '限流' } });
   await assert.rejects(adapter.identify(1), { code: 'HTTP_429', message: '限流' });
 });
+
+test('detail failures keep only known reason codes without exposing extra probe data', async () => {
+  for (const reason of ['TREE_MISSING_CHILD', 'private-response-https://example.test/?token=secret', '__proto__']) {
+    const { adapter } = fixture({ ok: false, error: { code: 'INCOMPLETE_DETAIL', message: '详情未确认', reason,
+      response: 'private conversation', token: 'secret' } });
+    await assert.rejects(adapter.detail(1, { accountKey: identity.accountKey, conversationId: 'demo' }), error => {
+      assert.equal(error.code, 'INCOMPLETE_DETAIL');
+      assert.equal(error.reason, reason === 'TREE_MISSING_CHILD' ? reason : undefined);
+      assert.doesNotMatch(JSON.stringify(error), /private|token|secret|__proto__/);
+      return true;
+    });
+  }
+});

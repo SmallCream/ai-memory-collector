@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
+import { detailFailureMessage, sanitizeDetailFailure } from '../extension/lib/detail-errors.js';
 
 const html = await readFile(new URL('../extension/panel.html', import.meta.url), 'utf8');
 const script = await readFile(new URL('../extension/panel.js', import.meta.url), 'utf8');
@@ -53,6 +54,7 @@ async function setup(options = {}) {
     setInterval: callback => { intervalCallbacks.push(callback); return 1; }, clearInterval() {},
     setTimeout: options.setTimeout || setTimeout, clearTimeout: options.clearTimeout || clearTimeout,
     getSetting: async key => settings.get(key), setSetting: async (key, value) => { events.push(`setting:${key}`); settings.set(key, value); },
+    detailFailureMessage, sanitizeDetailFailure,
     chrome: {
       runtime: { sendMessage: async message => {
         messages.push(structuredClone(message)); events.push(message.type);
@@ -78,7 +80,7 @@ async function setup(options = {}) {
       tabs: { create: async () => ({ id: 11 }) },
     },
   });
-  const run = script.replace(/^import .*;\n/m, '');
+  const run = script.replace(/^import .*;\n/gm, '');
   await vm.runInContext(`(async()=>{${run}\n})()`, context);
   return { elements, messages, events, permissionRequests, state: () => state, setState: value => { state = value; }, context,
     click: id => elements.get(id).click(), poll: () => intervalCallbacks[0]() };
@@ -506,6 +508,40 @@ test('message progress distinguishes downloaded pages from locally reused histor
   assert.match(app.elements.get('collection-message-progress').textContent, /接收 5 条消息 · 复用 100 条历史消息/);
   state.job.messageProgress = null; app.setState(state); await app.poll();
   assert.equal(app.elements.get('collection-message-progress').hidden, true);
+});
+
+test('collection failures show a whitelisted reason and conversation ID across queue, current and recent steps', async () => {
+  const state = initialState();
+  const failure = { title: '同名对话', conversationId: 'synthetic-failed-id', status: 'failed',
+    code: 'INCOMPLETE_DETAIL', reason: 'TREE_MISSING_CHILD' };
+  state.job = { status: 'partial', diagnostics: { total: 1, items: [failure] } };
+  state.activity = { collection: { current: logItem(failure), recent: [logItem(failure)] } };
+  const app = await setup({ state });
+  for (const id of ['collection-queue', 'collection-current', 'collection-recent']) {
+    const text = visibleText(app.elements.get(id));
+    assert.ok(text.includes(`原因：${detailFailureMessage(failure)}（TREE_MISSING_CHILD）`));
+    assert.match(text, /对话 ID：synthetic-failed-id/);
+  }
+});
+
+test('unknown diagnostic reasons are not rendered and older incomplete records ask for a new observation', async () => {
+  for (const reason of [undefined, 'Bearer sensitive-token https://example.test/private?sig=secret']) {
+    const state = initialState();
+    const failure = { title: '旧采集记录', status: 'retry', code: 'INCOMPLETE_DETAIL', reason };
+    state.job = { status: 'partial', diagnostics: { total: 1, items: [failure] } };
+    state.activity = { collection: { current: logItem(failure), recent: [logItem(failure)] } };
+    const app = await setup({ state });
+    for (const id of ['collection-queue', 'collection-current', 'collection-recent']) {
+      const text = visibleText(app.elements.get(id));
+      assert.match(text, /详情完整性未确认；此记录没有具体原因，请继续采集后查看新记录。/);
+      assert.doesNotMatch(text, /sensitive-token|example\.test|sig=secret|Bearer/);
+    }
+  }
+  const state = initialState();
+  state.job = { status: 'partial', diagnostics: { total: 1, items: [{ title: '网络失败', status: 'retry',
+    code: 'HTTP_429', reason: 'TREE_MISSING_CHILD' }] } };
+  const app = await setup({ state });
+  assert.doesNotMatch(visibleText(app.elements.get('collection-queue')), /原因：|TREE_MISSING_CHILD/);
 });
 
 test('retry waiting and paused jobs never infer stalled work from an old completed step', async () => {

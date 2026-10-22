@@ -85,6 +85,44 @@ async function complete(engine, target = account) {
   throw new Error('Task did not finish');
 }
 
+test('detail reason survives a retry checkpoint and restart without saving an incomplete archive', async () => {
+  const f = setup();
+  f.dependencies.adapter.detail = async () => {
+    throw Object.assign(new Error('private response and bearer secret'), {
+      code: 'INCOMPLETE_DETAIL', reason: 'TREE_MISSING_CHILD', payload: 'private-body', nodeId: 'private-id',
+    });
+  };
+  await f.engine.start({ account, tabId: 1 });
+  await f.engine.tick({ account, tabId: 1 });
+  const result = await f.engine.tick({ account, tabId: 1 });
+  assert.equal(result.error.reason, 'TREE_MISSING_CHILD');
+  assert.match(result.error.message, /子节点/);
+  assert.equal(result.diagnostics.items[0].reason, 'TREE_MISSING_CHILD');
+  assert.equal(result.diagnostics.items[0].status, 'retry');
+  assert.equal(result.diagnostics.items[0].attempt, 1);
+  assert.equal(f.calls.saves.length, 0);
+  assert.deepEqual(await f.engine.getOutbox(account.accountKey), []);
+  const restored = createCollectorEngine(f.dependencies);
+  assert.equal((await restored.getState(account.accountKey)).error.reason, 'TREE_MISSING_CHILD');
+  const log = await createActivityLog(f.dependencies).read(account.accountKey, 'collection');
+  assert.equal(log.current.reason, 'TREE_MISSING_CHILD');
+  assert.equal(log.recent[0].reason, 'TREE_MISSING_CHILD');
+  assert.doesNotMatch(JSON.stringify([...f.store]), /private-response|private-body|private-id|bearer secret/);
+});
+
+test('unknown detail reasons are removed from retry state and recent activity', async () => {
+  const f = setup();
+  f.dependencies.adapter.detail = async () => {
+    throw Object.assign(new Error('private secret'), { code: 'INCOMPLETE_DETAIL', reason: 'https://example.test/private?token=secret' });
+  };
+  await f.engine.start({ account, tabId: 1 });
+  await f.engine.tick({ account, tabId: 1 });
+  const result = await f.engine.tick({ account, tabId: 1 });
+  assert.equal(result.error.reason, undefined);
+  assert.equal(result.diagnostics.items[0].reason, undefined);
+  assert.doesNotMatch(JSON.stringify([...f.store]), /example.test|token=|private secret/);
+});
+
 test('initialization walks all pages, persists every conversation and completes only afterwards', async () => {
   const f = setup({ list: async offset => offset === 0 ? { items: [source('a')], nextOffset: 1, total: 2 } : { items: [source('b')], nextOffset: null, total: 2 } });
   const start = await f.engine.start({ account, tabId: 1, mode: 'incremental' });

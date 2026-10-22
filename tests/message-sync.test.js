@@ -101,10 +101,12 @@ test('full capture de-duplicates a contiguous identical page boundary without so
 
 test('pagination rejects conflicting, noncontiguous and nonprogressing overlaps', async t => {
   const head = page(['c', 'd'], { previous: true });
-  for (const older of [page(['a', row('c', 'conflict')], { next: true }),
-    page(['a', 'd'], { next: true }), page(['c', 'd'], { previous: true, next: true })]) {
+  for (const [older, reason] of [[page(['a', row('c', 'conflict')], { next: true }), 'PAGE_OVERLAP_CONFLICT'],
+    [page(['a', 'd'], { next: true }), 'PAGE_OVERLAP_CONFLICT'],
+    [page(['c', 'd'], { previous: true, next: true }), 'PAGE_CURSOR_STALLED']]) {
     await t.test(older.messages.map(item => item.id).join(','), async () => {
-      await assert.rejects(run([head, older]).result, error => ['DETAIL_CHANGED', 'DETAIL_PAGINATION'].includes(error.code));
+      await assert.rejects(run([head, older]).result, error =>
+        ['DETAIL_CHANGED', 'DETAIL_PAGINATION'].includes(error.code) && error.reason === reason);
     });
   }
 });
@@ -114,11 +116,12 @@ test('a changed version, branch tip or latest page aborts the assembled snapshot
   for (const older of [page(['a', 'b'], { next: true, update_time: NOW / 1000 + 1 }),
     page(['a', 'b'], { next: true, current_node: 'other' })]) {
     await t.test(JSON.stringify(older.current_node) + older.update_time, async () => {
-      await assert.rejects(run([head, older]).result, { code: 'DETAIL_CHANGED' });
+      await assert.rejects(run([head, older]).result, { code: 'DETAIL_CHANGED', reason: 'PAGE_VERSION_CHANGED' });
     });
   }
   const changedHead = page(['c', row('d', 'changed while reading')], { previous: true });
-  await assert.rejects(run([head, page(['a', 'b'], { next: true }), changedHead]).result, { code: 'DETAIL_CHANGED' });
+  await assert.rejects(run([head, page(['a', 'b'], { next: true }), changedHead]).result,
+    { code: 'DETAIL_CHANGED', reason: 'PAGE_VERSION_CHANGED' });
 });
 
 test('unknown pagination, cursor mismatch, duplicate IDs and unfinished messages cannot become complete', async t => {
@@ -127,8 +130,29 @@ test('unknown pagination, cursor mismatch, duplicate IDs and unfinished messages
   delete invalid[2].page_info.has_next_page;
   invalid[3].messages[0].status = 'in_progress';
   invalid[4].page_info.has_next_page = true;
+  const reasons = ['MESSAGE_ID', 'PAGE_CURSOR_MISMATCH', 'PAGE_FLAGS', 'MESSAGE_IN_PROGRESS', 'PAGE_DIRECTION'];
   for (let index = 0; index < invalid.length; index++) await t.test(String(index), async () => {
-    await assert.rejects(run([invalid[index]]).result, error => ['FORMAT', 'DETAIL_PAGINATION', 'INCOMPLETE_DETAIL'].includes(error.code));
+    await assert.rejects(run([invalid[index]]).result, error =>
+      ['FORMAT', 'DETAIL_PAGINATION', 'INCOMPLETE_DETAIL'].includes(error.code) && error.reason === reasons[index]);
+  });
+});
+
+test('structural diagnostic reasons are fixed labels and never include server content', async t => {
+  const confidential = 'private-message-and-token';
+  const examples = [
+    [page(['a'], { is_incomplete: true }), 'INCOMPLETE_DETAIL', 'SOURCE_PARTIAL'],
+    [page(['a'], { messages: [null] }), 'FORMAT', 'MESSAGE_SHAPE'],
+    [page(Array.from({ length: 2001 }, (_, index) => `m${index}`)), 'FORMAT', 'PAGE_MESSAGE_LIMIT'],
+    [page([], { previous: true }), 'DETAIL_PAGINATION', 'PAGE_CURSOR_STALLED'],
+  ];
+  for (const [payload, code, reason] of examples) await t.test(reason, async () => {
+    payload.title = confidential; payload.reason = confidential;
+    await assert.rejects(run([payload]).result, error => {
+      assert.equal(error.code, code); assert.equal(error.reason, reason);
+      assert.ok(!JSON.stringify(error).includes(confidential));
+      assert.ok(!error.message.includes(confidential));
+      return true;
+    });
   });
 });
 
@@ -182,7 +206,7 @@ test('a paginated or tail-merge head needs a usable version and branch tip befor
     await t.test(JSON.stringify({ updated: head.update_time, current: head.current_node }), async () => {
       for (const local of [null, baseline()]) {
         const f = run([head], { baseline: local });
-        await assert.rejects(f.result, { code: 'INCOMPLETE_DETAIL' });
+        await assert.rejects(f.result, { code: 'INCOMPLETE_DETAIL', reason: 'PAGE_VERSION_MISSING' });
         assert.deepEqual(f.calls, [null]);
       }
     });

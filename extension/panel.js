@@ -1,4 +1,5 @@
 import { getSetting, setSetting } from './lib/storage.js';
+import { detailFailureMessage, sanitizeDetailFailure } from './lib/detail-errors.js';
 
 const $ = id => document.getElementById(id);
 const setupPage = new URL(location.href).searchParams.get('setup') === '1';
@@ -166,6 +167,17 @@ function appendText(parent, tag, value, className) {
   if (className) element.classList.add(className);
   parent.append(element); return element;
 }
+function appendDetailFailure(parent, item) {
+  if (item.code && item.title && item.conversationId) {
+    appendText(parent, 'p', `对话 ID：${assetLabel(item.conversationId, '')}`, 'muted');
+  }
+  const { reason } = sanitizeDetailFailure(item);
+  const message = reason ? detailFailureMessage({ code: item.code, reason }) : '';
+  if (message) appendText(parent, 'p', `原因：${message}（${reason}）`, 'warning-text');
+  else if (item.code === 'INCOMPLETE_DETAIL') {
+    appendText(parent, 'p', '详情完整性未确认；此记录没有具体原因，请继续采集后查看新记录。', 'warning-text');
+  }
+}
 function renderActivityCards(id, channels) {
   const parent = $(id); parent.replaceChildren();
   for (const [label, log] of channels) {
@@ -186,6 +198,7 @@ function renderActivityCards(id, channels) {
     if (fileSize(item.size)) parts.push(`文件大小 ${fileSize(item.size)}`);
     if (item.code) parts.push(assetFailureCode(item.code));
     appendText(card, 'p', parts.join(' · '), 'muted');
+    appendDetailFailure(card, item);
     if (item.status === 'running' && Number.isFinite(item.updatedAt || item.startedAt) &&
         Date.now() - (item.updatedAt || item.startedAt) >= 90_000) {
       appendText(card, 'p', '暂未收到新进展，可能仍在等待响应；这不代表程序已停止。', 'warning-text');
@@ -219,6 +232,7 @@ function renderTaskList(id, noteId, items, total, emptyText, mode = 'queue') {
     if (mode === 'recent' && clock(item.finishedAt || item.updatedAt)) parts.push(clock(item.finishedAt || item.updatedAt));
     if (mode === 'outbox' && clock(item.createdAt)) parts.push(`入队 ${clock(item.createdAt)}`);
     if (parts.length) appendText(row, 'p', parts.join(' · '), 'muted');
+    appendDetailFailure(row, item);
     list.append(row);
   }
   if (Number.isFinite(previousScroll)) list.scrollTop = previousScroll;

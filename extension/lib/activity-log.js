@@ -1,4 +1,5 @@
 /** Local, bounded observation of real operations. Never drives task scheduling. */
+import { sanitizeDetailFailure } from './detail-errors.js';
 const WORKER_ID = crypto.randomUUID();
 const serial = new Map();
 const statuses = new Set(['running', 'success', 'failed', 'interrupted']);
@@ -16,6 +17,7 @@ function clean(value) {
   }
   if (statuses.has(value.status)) out.status = value.status;
   if (/^[A-Z][A-Z0-9_]{0,60}$/.test(value.code || '')) out.code = value.code;
+  Object.assign(out, sanitizeDetailFailure(value));
   return out;
 }
 export function createActivityLog({ getSetting, setSetting, now = Date.now, workerId = WORKER_ID }) {
@@ -48,7 +50,8 @@ export function createActivityLog({ getSetting, setSetting, now = Date.now, work
     try { result = await operation(); }
     catch (error) { failed = true; failure = error; }
     const finished = { ...current, status: failed ? 'failed' : 'success', finishedAt: now(), updatedAt: now(),
-      ...(failed ? { code: /^[A-Z][A-Z0-9_]{0,60}$/.test(failure?.code || '') ? failure.code : 'OPERATION_FAILED' } : {}) };
+      ...(failed ? { code: /^[A-Z][A-Z0-9_]{0,60}$/.test(failure?.code || '') ? failure.code : 'OPERATION_FAILED',
+        ...sanitizeDetailFailure(failure) } : {}) };
     await mutate(key, old => ({ ...old,
       ...(old.operationId === operationId ? { current: finished, updatedAt: finished.updatedAt } : {}),
       recent: [finished, ...(Array.isArray(old.recent) ? old.recent : []).map(clean).filter(Boolean)].slice(0, 20) }));

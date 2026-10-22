@@ -1,7 +1,10 @@
 // Serialized by chrome.scripting.executeScript: keep this function self-contained.
 // Experimental, read-only website endpoints. Session credentials never leave it.
 export async function probeChatGPT(request) {
-  const fail = (code, message) => { const e = new Error(message); e.code = code; throw e; };
+  // Only failures created here may expose a reason; fetch errors and response
+  // content cannot inject diagnostics even when they use a known reason name.
+  const reasons = new WeakMap();
+  const fail = (code, message, reason) => { const e = new Error(message); e.code = code; if (reason) reasons.set(e, reason); throw e; };
   const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
   const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
   try {
@@ -82,37 +85,39 @@ export async function probeChatGPT(request) {
       }
     }
     function completeDetail(payload, format) {
-      const partial = () => fail('INCOMPLETE_DETAIL', '详情尚不完整或仍在生成，已保留原归档，等待后续补采。');
+      const partial = reason => fail('INCOMPLETE_DETAIL', '详情尚不完整或仍在生成，已保留原归档，等待后续补采。', reason);
       const page = payload.page_info;
       if (payload.is_incomplete === true || payload.has_more === true || payload.has_more_messages === true ||
           payload.has_next_page === true || payload.has_previous_page === true ||
-          page?.has_next_page === true || page?.has_previous_page === true || page?.has_more === true) partial();
+          page?.has_next_page === true || page?.has_previous_page === true || page?.has_more === true) partial('SOURCE_PARTIAL');
       const inProgress = message => message && ['in_progress', 'streaming', 'pending'].includes(message.status);
       if (format === 'flat') {
         // A limited messages response without explicit end markers is not proof
         // of complete history. Do not invent undocumented cursor parameters.
-        if (!record(page) || page.has_previous_page !== false || page.has_next_page !== false) partial();
+        if (!record(page) || page.has_previous_page !== false || page.has_next_page !== false) partial('PAGE_FLAGS');
         const seen = new Set();
         for (const item of payload.messages) {
-          if (!record(item)) partial();
+          if (!record(item)) partial('MESSAGE_SHAPE');
           const message = own(item, 'message') ? item.message : item;
           if (message === null) continue;
-          if (!record(message) || inProgress(message)) partial();
+          if (!record(message)) partial('MESSAGE_SHAPE');
+          if (inProgress(message)) partial('MESSAGE_IN_PROGRESS');
           const id = message.id ?? item.id;
-          if (typeof id !== 'string' || !id || seen.has(id)) partial();
+          if (typeof id !== 'string' || !id || seen.has(id)) partial('MESSAGE_ID');
           seen.add(id);
         }
       } else {
         const mapping = payload.mapping;
         const keys = Object.keys(mapping);
-        if (!keys.length || typeof payload.current_node !== 'string' || !own(mapping, payload.current_node)) partial();
+        if (!keys.length || typeof payload.current_node !== 'string' || !own(mapping, payload.current_node)) partial('TREE_CURRENT_NODE');
         for (const key of keys) {
           const node = mapping[key];
-          if (!record(node) || (node.message != null && !record(node.message)) || inProgress(node.message)) partial();
+          if (!record(node) || (node.message != null && !record(node.message))) partial('TREE_NODE_SHAPE');
+          if (inProgress(node.message)) partial('MESSAGE_IN_PROGRESS');
           if (node.parent !== null && node.parent !== undefined &&
-              (typeof node.parent !== 'string' || !own(mapping, node.parent))) partial();
+              (typeof node.parent !== 'string' || !own(mapping, node.parent))) partial('TREE_MISSING_PARENT');
           if (node.children !== undefined && (!Array.isArray(node.children) ||
-              node.children.some(child => typeof child !== 'string' || !own(mapping, child)))) partial();
+              node.children.some(child => typeof child !== 'string' || !own(mapping, child)))) partial('TREE_MISSING_CHILD');
         }
         // Check every component, including non-selected branches, in linear time.
         const verified = new Set();
@@ -120,7 +125,8 @@ export async function probeChatGPT(request) {
           const chain = new Set();
           let cursor = key;
           while (cursor !== null && cursor !== undefined && !verified.has(cursor)) {
-            if (chain.has(cursor) || !own(mapping, cursor)) partial();
+            if (chain.has(cursor)) partial('TREE_PARENT_CYCLE');
+            if (!own(mapping, cursor)) partial('TREE_MISSING_PARENT');
             chain.add(cursor);
             cursor = mapping[cursor].parent;
           }
@@ -130,26 +136,28 @@ export async function probeChatGPT(request) {
       return 'complete';
     }
     function completePage(payload) {
-      const partial = () => fail('INCOMPLETE_DETAIL', '消息页边界或内容尚未确认，原归档保持不变。');
+      const partial = reason => fail('INCOMPLETE_DETAIL', '消息页边界或内容尚未确认，原归档保持不变。', reason);
       const page = payload.page_info;
       if (!record(page) || typeof page.has_previous_page !== 'boolean' || typeof page.has_next_page !== 'boolean' ||
-          (!request.before && page.has_next_page !== false) || page.has_more === true ||
-          ['is_incomplete', 'has_more', 'has_more_messages', 'has_next_page', 'has_previous_page'].some(key => payload[key] === true) ||
-          payload.messages.length > 2000) partial();
+          page.has_more === true) partial('PAGE_FLAGS');
+      if (!request.before && page.has_next_page !== false) partial('PAGE_DIRECTION');
+      if (['is_incomplete', 'has_more', 'has_more_messages', 'has_next_page', 'has_previous_page'].some(key => payload[key] === true)) partial('SOURCE_PARTIAL');
+      if (payload.messages.length > 2000) partial('PAGE_MESSAGE_LIMIT');
       const ids = [];
       const seen = new Set();
       for (const item of payload.messages) {
-        if (!record(item)) partial();
+        if (!record(item)) partial('MESSAGE_SHAPE');
         const message = own(item, 'message') ? item.message : item;
-        if (!record(message) || ['in_progress', 'streaming', 'pending'].includes(message.status)) partial();
+        if (!record(message)) partial('MESSAGE_SHAPE');
+        if (['in_progress', 'streaming', 'pending'].includes(message.status)) partial('MESSAGE_IN_PROGRESS');
         const id = message.id ?? item.id;
-        if (typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,160}$/.test(id) || seen.has(id)) partial();
+        if (typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,160}$/.test(id) || seen.has(id)) partial('MESSAGE_ID');
         ids.push(id); seen.add(id);
       }
       if (!ids.length) {
-        if (page.has_previous_page || page.has_next_page ||
-            [page.start_cursor, page.end_cursor].some(cursor => cursor !== undefined && cursor !== null && cursor !== '')) partial();
-      } else if (page.start_cursor !== ids[0] || page.end_cursor !== ids[ids.length - 1]) partial();
+        if (page.has_previous_page || page.has_next_page) partial('PAGE_DIRECTION');
+        if ([page.start_cursor, page.end_cursor].some(cursor => cursor !== undefined && cursor !== null && cursor !== '')) partial('PAGE_CURSOR_MISMATCH');
+      } else if (page.start_cursor !== ids[0] || page.end_cursor !== ids[ids.length - 1]) partial('PAGE_CURSOR_MISMATCH');
       // This verifies only one page. The adapter must join cursor pages or a
       // verified local prefix before describing the conversation as complete.
       return 'page';
@@ -210,6 +218,7 @@ export async function probeChatGPT(request) {
       coverage: request.kind === 'detail' ? '已检查返回结构；全部历史和平台全部分支完整度仍未验证，附件仅保留引用' : payload.coverage };
   } catch (error) {
     return { ok: false, error: { code: error.code || (error.name === 'AbortError' ? 'TIMEOUT' : 'NETWORK'),
-      message: error.code ? error.message : error.name === 'AbortError' ? '请求超时，请稍后重试。' : '请求未完成，请检查网站登录状态和网络。' } };
+      message: error.code ? error.message : error.name === 'AbortError' ? '请求超时，请稍后重试。' : '请求未完成，请检查网站登录状态和网络。',
+      ...(reasons.has(error) ? { reason: reasons.get(error) } : {}) } };
   }
 }

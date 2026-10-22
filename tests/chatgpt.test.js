@@ -339,3 +339,88 @@ test('explicit complete tree mode validates the whole tree without flat fallback
   const diagnostic = setup([session(), partial, session()]);
   assert.equal((await diagnostic.run({ ...request, requireComplete: false })).completeness, 'unknown');
 });
+
+test('tree rejection exposes a fixed structural reason without source details', async () => {
+  const cases = [
+    ['SOURCE_PARTIAL', value => { value.has_more = true; }],
+    ['TREE_CURRENT_NODE', value => { value.current_node = 'private-missing-id'; }],
+    ['TREE_NODE_SHAPE', value => { value.mapping.a.message = 'private malformed content'; }],
+    ['MESSAGE_IN_PROGRESS', value => { value.mapping.a.message.status = 'pending'; }],
+    ['TREE_MISSING_PARENT', value => { value.mapping.a.parent = 'private-missing-id'; }],
+    ['TREE_MISSING_CHILD', value => { value.mapping.a.children = ['private-missing-id']; }],
+    ['TREE_PARENT_CYCLE', value => { value.mapping.u.parent = 'a'; }],
+  ];
+  for (const [reason, mutate] of cases) {
+    const payload = completeTree();
+    payload.mapping.u.message.content.parts = ['private conversation text'];
+    payload.reason = 'Authorization: private-reason-token';
+    mutate(payload);
+    const { run } = setup([session(), payload]);
+    const result = await run({ ...autoRequest, format: 'tree', requireComplete: true });
+    assert.equal(result.error.code, 'INCOMPLETE_DETAIL');
+    assert.equal(result.error.reason, reason);
+    assert.deepEqual(Object.keys(result.error).sort(), ['code', 'message', 'reason']);
+    assert.equal(result.payload, undefined);
+    assert.doesNotMatch(JSON.stringify(result), /private|synthetic-bearer-secret/);
+  }
+});
+
+test('legacy flat rejection distinguishes pagination, message shape, generation and IDs', async () => {
+  const cases = [
+    ['SOURCE_PARTIAL', value => { value.page_info.has_previous_page = true; }],
+    ['PAGE_FLAGS', value => { delete value.page_info; }],
+    ['MESSAGE_SHAPE', value => { value.messages[0] = 'private malformed content'; }],
+    ['MESSAGE_SHAPE', value => { value.messages[0] = { message: 'private malformed content' }; }],
+    ['MESSAGE_IN_PROGRESS', value => { value.messages[0].status = 'streaming'; }],
+    ['MESSAGE_ID', value => { delete value.messages[0].id; }],
+  ];
+  for (const [reason, mutate] of cases) {
+    const payload = messagePage(['m1'], { has_previous_page: false, has_next_page: false });
+    payload.messages[0].content.parts = ['private conversation text'];
+    mutate(payload);
+    const { run } = setup([session(), payload]);
+    const result = await run({ ...autoRequest, format: 'flat', requireComplete: true });
+    assert.equal(result.error.code, 'INCOMPLETE_DETAIL');
+    assert.equal(result.error.reason, reason);
+    assert.equal(result.payload, undefined);
+    assert.doesNotMatch(JSON.stringify(result), /private|synthetic-bearer-secret/);
+  }
+});
+
+test('page rejection distinguishes unsafe boundaries from unfinished messages without exposing source fields', async () => {
+  const cases = [
+    ['SOURCE_PARTIAL', value => { value.has_more_messages = true; }],
+    ['PAGE_FLAGS', value => { value.page_info.has_previous_page = 'private malformed flag'; }],
+    ['PAGE_DIRECTION', value => { value.page_info.has_next_page = true; }],
+    ['PAGE_MESSAGE_LIMIT', value => { value.messages = Array.from({ length: 2001 }, () => value.messages[0]); }],
+    ['MESSAGE_SHAPE', value => { value.messages[0] = { id: 'private-node-id', message: null }; }],
+    ['MESSAGE_IN_PROGRESS', value => { value.messages[0].status = 'in_progress'; }],
+    ['MESSAGE_ID', value => { value.messages[0].id = '../private-id'; }],
+    ['PAGE_CURSOR_MISMATCH', value => { value.page_info.start_cursor = 'private-missing-id'; }],
+    ['PAGE_DIRECTION', value => { value.messages = []; }],
+    ['PAGE_CURSOR_MISMATCH', value => { value.messages = []; value.page_info.has_previous_page = false; }],
+  ];
+  for (const [reason, mutate] of cases) {
+    const payload = messagePage();
+    payload.messages[0].content.parts = ['private conversation text'];
+    payload.reason = 'Authorization: private-reason-token';
+    mutate(payload);
+    const { run } = setup([session(), payload]);
+    const result = await run(pageRequest);
+    assert.equal(result.error.code, 'INCOMPLETE_DETAIL');
+    assert.equal(result.error.reason, reason);
+    assert.equal(result.payload, undefined);
+    assert.doesNotMatch(JSON.stringify(result), /private|synthetic-bearer-secret/);
+  }
+});
+
+test('network errors cannot inject diagnostic reasons, including names used by internal validation', async () => {
+  for (const reason of ['MESSAGE_IN_PROGRESS', 'Authorization: private-reason-token']) {
+    const error = Object.assign(new Error('Synthetic transport failure'), { reason });
+    const { run } = setup([error]);
+    const result = await run({ kind: 'identity' });
+    assert.equal(result.error.code, 'NETWORK');
+    assert.equal(Object.hasOwn(result.error, 'reason'), false);
+    assert.doesNotMatch(JSON.stringify(result), /private|MESSAGE_IN_PROGRESS/);
+  }
+});
