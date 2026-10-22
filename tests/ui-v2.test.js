@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
 import { detailFailureMessage, sanitizeDetailFailure } from '../extension/lib/detail-errors.js';
+import { assetFailureDiagnosticMessage } from '../extension/lib/asset-failure.js';
 
 const html = await readFile(new URL('../extension/panel.html', import.meta.url), 'utf8');
 const script = await readFile(new URL('../extension/panel.js', import.meta.url), 'utf8');
@@ -54,7 +55,7 @@ async function setup(options = {}) {
     setInterval: callback => { intervalCallbacks.push(callback); return 1; }, clearInterval() {},
     setTimeout: options.setTimeout || setTimeout, clearTimeout: options.clearTimeout || clearTimeout,
     getSetting: async key => settings.get(key), setSetting: async (key, value) => { events.push(`setting:${key}`); settings.set(key, value); },
-    detailFailureMessage, sanitizeDetailFailure,
+    detailFailureMessage, sanitizeDetailFailure, assetFailureDiagnosticMessage,
     chrome: {
       runtime: { sendMessage: async message => {
         messages.push(structuredClone(message)); events.push(message.type);
@@ -198,6 +199,27 @@ test('GitHub idle is not success and conflict copies are visible with pending re
   assert.match(app.elements.get('github-detail').textContent, /原文没有丢弃/);
 });
 
+test('top GitHub detail exposes persisted failure code instead of stale LFS progress and clears on retry', async () => {
+  const state = initialState(); state.config.github.enabled = true;
+  state.githubStatus = { status: 'pending', pending: 1, message: '附件正在分批上传，完成后自动提交对话。',
+    error: { code: 'GITHUB_NETWORK', message: '请求失败 https://example.com/private?signature=secret ghp_hidden123 Bearer hidden456 <b>plain text</b>' } };
+  const app = await setup({ state }), detail = app.elements.get('github-detail');
+  assert.equal(detail.hidden, false); assert.equal(detail.classList.contains('warning-text'), true);
+  assert.match(detail.textContent, /同步未完成（GITHUB_NETWORK）/);
+  assert.doesNotMatch(detail.textContent, /分批上传|example\.com|signature=secret|ghp_hidden123|hidden456/);
+  assert.match(detail.textContent, /<b>plain text<\/b>/);
+  assert.equal(app.elements.get('retry-github').hidden, false);
+
+  state.githubStatus = { status: 'syncing', pending: 1, error: null, message: '' };
+  app.setState(state); app.poll(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.elements.get('github-state').textContent, '同步中');
+  assert.equal(detail.hidden, true); assert.equal(detail.classList.contains('warning-text'), false);
+
+  state.githubStatus = { status: 'pending', pending: 1, error: { code: 'Bearer unsafe', message: '' } };
+  app.setState(state); app.poll(); await new Promise(resolve => setImmediate(resolve));
+  assert.match(detail.textContent, /GITHUB_ERROR/); assert.doesNotMatch(detail.textContent, /unsafe/);
+});
+
 test('login error remains visible inside settings and a missing site grant can be recovered', async () => {
   const state = initialState(); state.identity = null; state.account = null;
   state.error = { code: 'HTTP_401', message: '登录已失效，请在网站重新登录。' };
@@ -331,6 +353,24 @@ test('image diagnostics do not render raw server messages, signed URLs, credenti
   assert.equal(parts[1], '[链接已隐藏] [已隐藏]');
   assert.match(parts[2], /根据错误代码继续排查/);
   assert(!parts.join(' ').match(/private|sensitive|https:\/\//));
+});
+
+test('attachment failures show recognized format reasons without exposing arbitrary or mismatched diagnostic text', async () => {
+  const state = initialState();
+  state.assetDiagnostics = { total: 4, pending: 4, failed: 4, failures: [
+    { code: 'ASSET_FORMAT', reason: 'format_html_response', message: 'unsafe response body https://example.com/?secret=1' },
+    { code: 'ASSET_FORMAT', reason: 'format_unknown', message: 'unsafe arbitrary explanation' },
+    { code: 'ASSET_INPUT', reason: 'format_html_response', message: 'unsafe mismatched explanation' },
+    { code: 'ASSET_FORMAT', message: 'unsafe old response body' },
+  ] };
+  const app = await setup({ state });
+  const explanations = app.elements.get('asset-failure-list').children.map(item => item.children[2].textContent);
+  assert.equal(explanations[0], assetFailureDiagnosticMessage({ code: 'ASSET_FORMAT', reason: 'format_html_response' }));
+  assert.ok(explanations[0]);
+  assert.match(explanations[1], /未取得受支持的完整附件/);
+  assert.match(explanations[2], /根据错误代码继续排查/);
+  assert.equal(explanations[3], explanations[1]);
+  assert.doesNotMatch(explanations.join(' '), /unsafe|https:\/\/|secret=1/);
 });
 
 test('image retry works while conversation scan is paused without sending a capture or resume command', async () => {

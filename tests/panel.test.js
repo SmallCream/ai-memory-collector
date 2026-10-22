@@ -205,6 +205,58 @@ test('pending LFS work retains text outbox and only commits after upload prepara
   assert.equal(acknowledged, 1); assert.equal((await f.service.engine.getOutbox(accountKey)).length, 0);
 });
 
+test('GitHub retry replaces stale LFS progress with its failure and preserves backoff and delivery checkpoints', async () => {
+  const options = { config: { autoEnabled: false }, syncError: 'GITHUB_NETWORK',
+    github: { repository: 'owner/data', token: 'secret', enabled: true } };
+  const f = fixture(options), key = `githubStatus:${accountKey}`, running = [];
+  let prepared = false, acknowledged = 0;
+  f.dependencies.assetService = {
+    tick: async () => ({ runnable: false }),
+    prepareUploads: async () => {
+      running.push(structuredClone(f.store.get(key)));
+      if (!prepared) throw issue('LFS_UPLOAD_PENDING');
+      return [];
+    },
+    acknowledgeUploads: async () => { acknowledged++; },
+  };
+  f.service = createCollectorService(f.dependencies);
+  await f.service.engine.enqueueArchive({ account, archive: f.saved(f.root, 'one') });
+  f.store.set(key, { status: 'pending', pending: 1, message: 'old upload progress',
+    error: { code: 'GITHUB_PERMISSION', message: 'old failure' }, attempt: 4,
+    nextRetryAt: f.now() + 30 * 60000, lastSyncedAt: 1000, commitSha: 'old-commit' });
+
+  await f.service.pump();
+  assert.equal(running.length, 0);
+  assert.equal(f.store.get(key).error.code, 'GITHUB_PERMISSION');
+  await f.service.command({ type: 'collector:retry-github' }, 1);
+  const uploading = f.store.get(key);
+  assert.equal(uploading.status, 'pending'); assert.equal(uploading.error, null);
+  assert.match(uploading.message, /分批上传/); assert.equal(uploading.nextRetryAt, 0);
+  assert.equal(uploading.attempt, 4); assert.equal(uploading.commitSha, 'old-commit');
+  assert.equal(acknowledged, 0); assert.equal((await f.service.engine.getOutbox(accountKey)).length, 1);
+
+  prepared = true;
+  await assert.rejects(f.service.command({ type: 'collector:retry-github' }, 1), error => error.code === 'GITHUB_NETWORK');
+  const failed = structuredClone(f.store.get(key));
+  assert.equal(failed.status, 'pending'); assert.equal(failed.message, '');
+  assert.equal(failed.error.code, 'GITHUB_NETWORK'); assert.equal(failed.attempt, 5);
+  assert.equal(failed.nextRetryAt, f.now() + 32 * 60000);
+  assert.equal(failed.lastSyncedAt, 1000); assert.equal(failed.commitSha, 'old-commit');
+  assert.equal(acknowledged, 0); assert.equal((await f.service.engine.getOutbox(accountKey)).length, 1);
+  await f.service.pump();
+  assert.deepEqual(f.store.get(key), failed); assert.equal(running.length, 2);
+
+  options.syncError = null;
+  await f.service.command({ type: 'collector:retry-github' }, 1);
+  for (const state of running) {
+    assert.equal(state.status, 'syncing'); assert.equal(state.error, null);
+    assert.equal(state.message, ''); assert.equal(state.nextRetryAt, 0);
+  }
+  assert.equal(acknowledged, 1); assert.equal((await f.service.engine.getOutbox(accountKey)).length, 0);
+  assert.equal(f.store.get(key).status, 'synced'); assert.equal(f.store.get(key).error, undefined);
+  assert.equal(f.calls.lists, 0); assert.equal(f.calls.details, 0);
+});
+
 test('image-only retry remains account scoped and works while conversation collection stays paused', async () => {
   const f = fixture({ config: { autoEnabled: false } }), retries = [], ticks = [];
   const diagnostics = { total: 1, pending: 1, failed: 1, failures: [{ code: 'HTTP_404' }] };

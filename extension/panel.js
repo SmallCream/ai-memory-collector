@@ -1,5 +1,6 @@
 import { getSetting, setSetting } from './lib/storage.js';
 import { detailFailureMessage, sanitizeDetailFailure } from './lib/detail-errors.js';
+import { assetFailureDiagnosticMessage } from './lib/asset-failure.js';
 
 const $ = id => document.getElementById(id);
 const setupPage = new URL(location.href).searchParams.get('setup') === '1';
@@ -95,7 +96,8 @@ function renderAssetFailures(diagnostics) {
     const filename = document.createElement('p');
     filename.textContent = assetLabel(failure.fileName, '未命名附件');
     const code = assetFailureCode(failure.code);
-    const explanation = document.createElement('p'); explanation.textContent = assetFailureMessage(code);
+    const explanation = document.createElement('p');
+    explanation.textContent = assetFailureDiagnosticMessage({ code, reason: failure.reason }) || assetFailureMessage(code);
     const metadata = document.createElement('p'); metadata.classList.add('muted');
     metadata.textContent = `${code} · 已尝试 ${count(failure.attempt)} 次${time(failure.retryAt) ? ` · 重试等待至 ${time(failure.retryAt)}` : ''}`;
     item.append(title, filename, explanation, metadata); list.append(item);
@@ -402,10 +404,16 @@ function render() {
   const githubDescription = describeGithub(current.githubStatus, config.github?.enabled);
   text('github-state', githubDescription);
   show('retry-github', Boolean(config.github?.enabled) && (githubDescription.includes('待同步') || Number(current.githubStatus?.pending) > 0));
-  const githubDetail = config.github?.enabled ? current.githubStatus?.message || current.githubStatus?.error?.message || '' : '';
+  const githubError = current.githubStatus?.error;
+  const githubErrorCode = typeof githubError?.code === 'string' && /^[A-Z][A-Z0-9_]{0,60}$/.test(githubError.code) ? githubError.code : 'GITHUB_ERROR';
+  // Older persisted states can contain both a failed request and the preceding
+  // LFS progress message. Always expose the failure without expanding a card.
+  const githubDetail = config.github?.enabled ? githubError ?
+    `同步未完成（${githubErrorCode}）：${safeMessage(githubError.message || '请检查权限或网络后重试。')
+      .replace(/(?:https?:\/\/|blob:|data:)[^\s<>"']+/gi, '[链接已隐藏]')}` : current.githubStatus?.message || '' : '';
   text('github-detail', safeMessage(githubDetail));
   show('github-detail', Boolean(githubDetail));
-  $('github-detail').classList.toggle('warning-text', current.githubStatus?.status === 'conflicts');
+  $('github-detail').classList.toggle('warning-text', Boolean(githubError) || current.githubStatus?.status === 'conflicts');
   const assets = current.assetStatus || {};
   const diagnostics = current.assetDiagnostics;
   const pendingImages = Number(diagnostics?.pending ?? assets.pendingCapture) || 0;

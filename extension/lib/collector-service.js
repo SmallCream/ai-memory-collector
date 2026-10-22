@@ -225,7 +225,11 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
         outbox.push(bundle); bytes += size;
       }
       if (!outbox.length) return;
-      await setSetting(key, { ...previous, status: 'syncing', pending: pending.length });
+      // A new attempt supersedes the last attempt's display state. Keep its
+      // attempt count/backfill checkpoint, but do not show an old error or
+      // upload message while this request is running.
+      await setSetting(key, { ...previous, status: 'syncing', pending: pending.length,
+        message: '', error: null, nextRetryAt: 0 });
       try {
         const assetPointers = assetService ? await assetService.prepareUploads({ directory: await getSetting('directory'), account, config: github, bundles: outbox }) : [];
         const result = await activity.run(account.accountKey, 'github', { stage: 'commit', total: outbox.length },
@@ -255,12 +259,12 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
         if (remaining) continueSoon();
       } catch (error) {
         if (error.code === 'LFS_UPLOAD_PENDING') {
-          await setSetting(key, { ...previous, status: 'pending', pending: pending.length,
+          await setSetting(key, { ...previous, status: 'pending', pending: pending.length, error: null,
             message: '附件正在分批上传，完成后自动提交对话。', nextRetryAt: 0 });
           continueSoon(); return;
         }
         const attempt = (previous?.attempt || 0) + 1;
-        await setSetting(key, { ...previous, status: 'pending', pending: pending.length, error: safeError(error), attempt,
+        await setSetting(key, { ...previous, status: 'pending', pending: pending.length, message: '', error: safeError(error), attempt,
           nextRetryAt: now() + Math.min(60, 2 ** Math.min(attempt, 6)) * 60000 });
         if (force) throw error;
       }

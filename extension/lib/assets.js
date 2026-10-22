@@ -72,6 +72,11 @@ function messages(conversation) {
  * `retrieval` is deliberately non-enumerable: use it immediately in memory, never persist it.
  */
 export async function extractAssets(conversation) {
+  return (await analyzeAssets(conversation)).assets;
+}
+
+/** Also identify legacy descriptors proven to be interface icons by native context. */
+export async function analyzeAssets(conversation) {
   const candidates = [];
   const fileContentReferences = new WeakSet();
   const add = (ref, info) => { if (typeof ref === 'string' && ref.trim()) candidates.push({ ref, ...info }); };
@@ -82,6 +87,9 @@ export async function extractAssets(conversation) {
   }
   function walk(value, info, depth = 0) {
     if (depth > 100 || value == null) return;
+    const appPath = info.interfaceAppRoot && info.path.slice(info.interfaceAppRoot.length);
+    if (info.path.startsWith(info.interfaceAppRoot) &&
+        (appPath === '/icon' || /^\/items\/\d+\/icon$/.test(appPath))) info = { ...info, interfaceIcon: true };
     if (Array.isArray(value)) { value.forEach((child, index) => walk(child, { ...info, path: `${info.path}/${index}` }, depth + 1)); return; }
     if (typeof value === 'string') { if (info.prose) text(value, info); return; }
     if (!record(value)) return;
@@ -140,17 +148,22 @@ export async function extractAssets(conversation) {
     const internalViewer = item.message.author?.role === 'tool' && item.message.author?.name === 'container.open_image' &&
       item.message.content?.content_type === 'execution_output';
     walk(item.message, { messageId, path: `messages/${messageId}`, kind: 'attachment', prose: false, attachment: false,
+      interfaceAppRoot: `messages/${messageId}/metadata/dil_v2_reasoning/appData`,
       internalAttachmentRoot: internalViewer ? `messages/${messageId}/metadata/attachments/` : null });
   }
-  const result = new Map(), internalOnly = new Map();
-  for (const candidate of candidates) {
+  const result = new Map(), internalOnly = new Map(), interfaceIconIds = new Set();
+  // Visible content wins even if the same reference also decorates a tool card.
+  // Do not let icon metadata supply names, IDs or retrieval URLs to real media.
+  for (const candidate of candidates.sort((a, b) => Number(Boolean(a.interfaceIcon)) - Number(Boolean(b.interfaceIcon)))) {
     const classified = classifyAssetReference(candidate.ref, candidate);
     if (classified.sourceType === 'embedded') classified.sourceRef = `embedded:sha256:${await sha256(classified.original)}`;
     // Interpreter paths are scoped to the generating message. Reusing a path
     // in a later response may mean a different version of the file.
     const stable = classified.fileId ? `platform:file:${classified.fileId}` : classified.libraryFileId ? `platform:library:${classified.libraryFileId}` :
       /^sandbox:/i.test(classified.sourceRef) ? JSON.stringify(['sandbox', candidate.messageId, classified.sourceRef]) : `${classified.sourceType}:${classified.sourceRef}`;
-    const id = await sha256(stable), occurrence = { messageId: candidate.messageId, path: candidate.path, kind: candidate.kind || 'attachment',
+    const id = await sha256(stable);
+    if (candidate.interfaceIcon) { if (!result.has(id)) interfaceIconIds.add(id); continue; }
+    const occurrence = { messageId: candidate.messageId, path: candidate.path, kind: candidate.kind || 'attachment',
       ...(candidate.syntax ? { syntax: candidate.syntax } : {}), ...(candidate.attribute ? { attribute: candidate.attribute } : {}) };
     // Only this known viewer's attachment results are internal. Filename,
     // directory, HTTP status and other tool messages are not classification
@@ -187,7 +200,7 @@ export async function extractAssets(conversation) {
     if (!asset.occurrences.some(item => item.messageId === occurrence.messageId && item.path === occurrence.path && item.kind === occurrence.kind)) asset.occurrences.push(occurrence);
   }
   for (const asset of result.values()) if (internalOnly.get(asset.id)) asset.capturePolicy = 'internal-viewer';
-  return [...result.values()];
+  return { assets: [...result.values()], interfaceIconIds: [...interfaceIconIds] };
 }
 
 /** Re-derive policy from freshly extracted native data, never persisted labels. */

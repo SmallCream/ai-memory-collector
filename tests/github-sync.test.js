@@ -526,6 +526,30 @@ async function internalViewerBundles({ visible = false } = {}) {
   return { asset, build };
 }
 
+test('same-native merge does not resurrect legacy interface icons or erase actual attachments', async () => {
+  const initial = bundle('interface-icons'), native = JSON.parse(initial.files[0].content);
+  const sourceRef = '/images/ecosystem/apps/example/icon.png';
+  native.mapping.a.message.metadata = { dil_v2_reasoning: { appData: { icon: { type: 'image', src: sourceRef } } } };
+  native.mapping.a.message.content.parts.push({ content_type: 'image_asset_pointer', asset_pointer: 'file-service://file-one' });
+  const [picture] = await extractAssets(native);
+  const icon = { id: digest(`unknown:${sourceRef}`), sourceRef, sourceType: 'unknown', kind: 'image', status: 'pending' };
+  const build = async assets => {
+    const built = await buildArchive({ conversation: native, identity: { accountKey: ACCOUNT, displayName: 'Demo' },
+      capturedAt: '2026-10-21T00:00:00Z', existingManifest: initial.manifest, productionPrefix: PREFIX, assets });
+    return { accountKey: ACCOUNT, files: built.files, manifest: built.manifest, entry: built.manifest.conversations['interface-icons'] };
+  };
+  const corrected = await build([picture]), legacy = await build([picture, icon]);
+  for (const [local, remote] of [[corrected, legacy], [legacy, corrected]]) {
+    const server = gitServer({ initial: fileMap(remote) });
+    await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+    const assets = JSON.parse(server.files()[MANIFEST]).conversations['interface-icons'].assets;
+    assert.equal(assets.length, 1); assert.equal(assets[0].id, picture.id);
+    assert.equal(server.files()[remote.entry.jsonPath], remote.files[0].content);
+    const again = await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+    assert.equal(again.status, 'unchanged');
+  }
+});
+
 test('same native merge preserves a suspended internal 404 from either device and stays stable on replay', async () => {
   const { asset, build } = await internalViewerBundles();
   const stale = await build([asset]), suspended = await build([{ ...asset, status: 'unavailable',

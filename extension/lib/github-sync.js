@@ -3,7 +3,7 @@ import { buildArchive } from './archive.js';
 import { createGitHubClient, inspectGitHubRepository, commitProbe, GitHubProbeError } from './github.js';
 import { formatLfsPointer } from './lfs.js';
 import { ASSET_EXTENSIONS } from './asset-store.js';
-import { extractAssets, reconcileAssetCapturePolicy } from './assets.js';
+import { analyzeAssets, reconcileAssetCapturePolicy } from './assets.js';
 import { reconcileFileCitation } from './asset-reconciliation.js';
 import { selectMessageSync } from './message-sync-receipt.js';
 
@@ -104,7 +104,8 @@ async function mergeSameNativeAssets(localEntry, remoteEntry, prefix, native) {
   }
   // The caller has verified account ownership, the local hash and identical
   // native content. Retire only aliases proven by that same conversation.
-  const extracted = await extractAssets(native);
+  const { assets: extracted, interfaceIconIds } = await analyzeAssets(native);
+  for (const id of interfaceIconIds) result.delete(id);
   for (const asset of [...result.values()]) {
     if (!result.has(asset.id)) continue;
     const reconciled = await reconcileFileCitation(asset, [...result.values()], extracted);

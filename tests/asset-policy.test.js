@@ -1,11 +1,59 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { extractAssets, sanitizeAssetRecords, reconcileAssetCapturePolicy } from '../extension/lib/assets.js';
+import { analyzeAssets, extractAssets, sanitizeAssetRecords, reconcileAssetCapturePolicy, sha256 } from '../extension/lib/assets.js';
 
 const attachment = () => ({ id: 'file_synthetic_viewer', name: 'user-synthetic/run/mnt/data/image.png',
   mime_type: 'image/png', size: 100 });
 const viewer = () => ({ id: 'synthetic-viewer', author: { role: 'tool', name: 'container.open_image' },
   content: { content_type: 'execution_output', text: '<<ImageDisplayed>>' }, metadata: { attachments: [attachment()] } });
+
+const appIcons = () => ({ id: 'synthetic-app', author: { role: 'assistant' },
+  content: { content_type: 'text', parts: ['Tools used.'] }, metadata: { dil_v2_reasoning: { appData: {
+    icon: { type: 'image', src: '/images/ecosystem/apps/example/icon.png' },
+    items: [{ icon: { type: 'image', src: 'connectors://synthetic/logo?theme=light' } }],
+  } } } });
+
+test('tool-card interface icons are excluded using native scope without changing the original conversation', async () => {
+  const message = appIcons(), source = { messages: [message] }, original = structuredClone(source);
+  const inventory = await analyzeAssets(source);
+  assert.deepEqual(inventory.assets, []);
+  assert.deepEqual(new Set(inventory.interfaceIconIds), new Set(await Promise.all([
+    sha256('unknown:/images/ecosystem/apps/example/icon.png'), sha256('unknown:connectors://synthetic/logo?theme=light'),
+  ])));
+  assert.deepEqual(await extractAssets(source), []);
+  assert.deepEqual(source, original);
+});
+
+test('visible media sharing a tool icon reference is still captured, with only visible source metadata', async () => {
+  for (const first of [true, false]) {
+    const tool = appIcons(), visible = { id: 'visible', author: { role: 'user' }, content: { content_type: 'text',
+      parts: ['![diagram](/images/ecosystem/apps/example/icon.png)'] } };
+    tool.metadata.dil_v2_reasoning.appData.icon.name = 'interface-name.png';
+    const result = await analyzeAssets({ messages: first ? [tool, visible] : [visible, tool] });
+    assert.equal(result.assets.length, 1);
+    assert.equal(result.assets[0].messageId, 'visible');
+    assert.equal(result.assets[0].fileName, undefined);
+    assert.equal(result.assets[0].occurrences.length, 1);
+    assert.ok(!result.interfaceIconIds.includes(result.assets[0].id));
+  }
+});
+
+test('other metadata images and uploaded icons are not excluded by icon names, URL schemes or similar paths', async () => {
+  const icon = appIcons().metadata.dil_v2_reasoning.appData.icon;
+  for (const metadata of [
+    { attachments: [icon] }, { appData: { icon } }, { dil_v2_reasoning: { icon } },
+    { dil_v2_reasoning: { appData: { preview: { icon } } } },
+    { dil_v2_reasoning: { appData: { items: [{ result: { icon } }] } } },
+  ]) {
+    const result = await analyzeAssets({ messages: [{ id: 'example', metadata }] });
+    assert.equal(result.assets.length, 1);
+    assert.deepEqual(result.interfaceIconIds, []);
+  }
+  const message = appIcons();
+  message.metadata.dil_v2_reasoning.appData.image = { type: 'image', src: 'sediment://file_real' };
+  const result = await analyzeAssets({ mapping: { example: { message } } });
+  assert.equal(result.assets.length, 1); assert.equal(result.assets[0].fileId, 'file_real');
+});
 
 test('only known internal viewer attachment results receive the internal capture policy without changing native JSON', async () => {
   const source = { mapping: { viewer: { message: viewer() } } }, original = structuredClone(source);

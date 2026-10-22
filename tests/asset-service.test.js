@@ -1046,3 +1046,143 @@ test('a fetched source rejected for ownership is a failed refresh activity rathe
   assert.equal(activity.current.code, 'ACCOUNT_CHANGED'); assert.equal(env.captures.length, 1);
   assert.equal((await env.service.diagnostics({ account })).captureItems[0].code, 'ACCOUNT_CHANGED');
 });
+
+
+async function legacyInterfaceIcons({ visible = false } = {}) {
+  const env = setup(), source = detail();
+  const iconRefs = ['/images/ecosystem/apps/example/icon.png', 'connectors://connector_example/logo?theme=light'];
+  const message = source.payload.mapping.reply.message;
+  message.metadata = { dil_v2_reasoning: { appData: {
+    icon: { type: 'image', src: iconRefs[0] }, items: [{ icon: { type: 'image', src: iconRefs[1] } }],
+  } } };
+  if (visible) message.content.parts.push({ content_type: 'image', src: iconRefs[0] });
+  const current = await extractAssets(source.payload);
+  const icons = await Promise.all(iconRefs.map(async sourceRef => ({
+    id: await hashBytes(new TextEncoder().encode(`unknown:${sourceRef}`)), sourceRef,
+    sourceType: 'unknown', status: 'pending', kind: 'image', messageId: message.id,
+    // Deliberately untrusted/incomplete paths: retirement must use the native JSON.
+    occurrences: [], references: [sourceRef],
+  })));
+  const real = current.find(asset => asset.fileId === 'file_image');
+  const oid = await hashBytes(PNG);
+  Object.assign(real, { status: 'downloaded', oid, size: PNG.length, localPath: assetPath(account, oid, 'png') });
+  env.fs.put(real.localPath, PNG);
+  const saved = await env.store.saveConversation({ directory: env.fs.directory, account, detail: source, assets: [real, ...icons] });
+  const jobKey = `assetJobs:${account.accountKey}`;
+  await env.fs.setSetting(jobKey, { tasks: icons.map(asset => ({ conversationId: 'conversation-one', assetId: asset.id,
+    attempt: 9, retryAt: 9_000_000, error: { code: 'ASSET_INPUT', message: 'synthetic old descriptor' } })) });
+  env.dependencies.refreshConversation = async () => { throw new Error('UI cleanup must not request online details'); };
+  env.dependencies.resolveAsset = async () => { throw new Error('UI cleanup must not download'); };
+  env.restart();
+  return { env, source, saved, real, icons, jobKey };
+}
+
+test('old UI-only icon jobs retire before retry time without fetching and preserve real assets and upload receipts', async () => {
+  const { env, saved, real, jobKey } = await legacyInterfaceIcons();
+  const receiptKey = `assetReceipts:${account.accountKey}`;
+  const receipt = { repository: config.repository, branch: 'main', directory: env.fs.directory,
+    uploaded: [`${real.localPath}:${real.oid}:${real.size}`] };
+  await env.fs.setSetting(receiptKey, receipt);
+  const nativeBefore = env.fs.text(saved.entry.jsonPath);
+  const result = await env.tick();
+  assert.equal(result.pending, 0);
+  const entry = (await env.manifest()).conversations['conversation-one'];
+  assert.equal(entry.assets.length, 1); assert.equal(entry.assets[0].id, real.id);
+  assert.deepEqual(env.fs.files.get(real.localPath), PNG);
+  assert.equal(env.fs.text(saved.entry.jsonPath), nativeBefore);
+  assert.equal(entry.contentHash, saved.entry.contentHash);
+  assert.equal((await env.fs.getSetting(jobKey)).tasks.length, 0);
+  assert.deepEqual(await env.fs.getSetting(receiptKey), receipt);
+  assert.equal(env.enqueued.length, 1); assert.equal(env.enqueued[0].archive.entry.assets.length, 1);
+  assert.equal(env.captures.length, 0); assert.equal(env.requests.length, 0);
+});
+
+test('same URL in actual message content is not retired as a UI-only icon and keeps ASSET_INPUT backoff', async () => {
+  const { env, icons, jobKey } = await legacyInterfaceIcons({ visible: true });
+  await env.tick();
+  const state = await env.fs.getSetting(jobKey);
+  assert.equal(state.tasks.length, 2); assert.equal(state.tasks[0].error.code, 'ASSET_INPUT');
+  assert.equal(state.tasks[0].retryAt, 9_000_000);
+  assert.ok(state.tasks[0].interfacePolicyCheckedHash);
+  // The second icon can be cleaned independently, without changing the first.
+  await env.tick();
+  assert.deepEqual((await env.fs.getSetting(jobKey)).tasks.map(task => task.assetId), [icons[0].id]);
+  assert.ok((await env.manifest()).conversations['conversation-one'].assets.some(asset => asset.id === icons[0].id));
+});
+
+test('icon retirement checks source bytes before altering descriptors or tasks', async () => {
+  const { env, saved, jobKey } = await legacyInterfaceIcons();
+  const manifestBefore = JSON.stringify(await env.manifest());
+  env.fs.put(saved.entry.jsonPath, env.fs.text(saved.entry.jsonPath) + ' ');
+  await env.tick();
+  assert.equal(JSON.stringify(await env.manifest()), manifestBefore);
+  const state = await env.fs.getSetting(jobKey);
+  assert.equal(state.tasks.length, 2); assert.equal(state.tasks[0].error.code, 'LOCAL_CONFLICT');
+  assert.equal(env.enqueued.length, 0);
+});
+
+test('icon retirement drains all older durable receipts before its corrected archive', async () => {
+  const { env, saved, jobKey } = await legacyInterfaceIcons();
+  const state = await env.fs.getSetting(jobKey);
+  const older = { ...saved, entry: { ...saved.entry, title: 'older first' } };
+  const other = { ...saved, entry: { ...saved.entry, title: 'older second' } };
+  state.tasks[0].pendingArchives = [older]; state.tasks[1].priorArchives = [other];
+  await env.fs.setSetting(jobKey, state);
+  env.enqueueFailure(true); await env.tick();
+  let waiting = await env.fs.getSetting(jobKey);
+  assert.equal(waiting.tasks.length, 1); assert.equal(waiting.tasks[0].pendingArchives.length, 3);
+  assert.equal(waiting.tasks[0].interfaceRetirement, 'deliver');
+  env.enqueueFailure(false); env.time(20_000_000); env.restart(); await env.tick();
+  assert.deepEqual(env.enqueued.map(item => item.archive.entry.title), ['older first', 'older second', saved.entry.title]);
+  assert.equal(env.enqueued.at(-1).archive.entry.assets.length, 1);
+  assert.equal((await env.fs.getSetting(jobKey)).tasks.length, 0);
+});
+
+test('worker stop between icon descriptor removal and delivery checkpoint recovers correction from native evidence', async () => {
+  const { env, saved, jobKey } = await legacyInterfaceIcons();
+  let interrupt = true;
+  env.dependencies.setSetting = async (key, value) => {
+    if (interrupt && key === jobKey && value?.tasks.some(task => task.interfaceRetirement === 'deliver')) {
+      throw new Error('synthetic worker stop');
+    }
+    return env.fs.setSetting(key, value);
+  };
+  env.restart(); await assert.rejects(env.tick(), /synthetic worker stop/);
+  assert.equal((await env.manifest()).conversations['conversation-one'].assets.length, 1);
+  assert.equal((await env.fs.getSetting(jobKey)).tasks[0].interfaceRetirement, 'prepare');
+  assert.equal(env.enqueued.length, 0);
+  interrupt = false; env.time(20_000_000); env.restart(); await env.tick();
+  assert.equal(env.enqueued.length, 1); assert.equal(env.enqueued[0].archive.entry.assets.length, 1);
+  assert.equal(env.enqueued[0].archive.entry.contentHash, saved.entry.contentHash);
+  assert.equal((await env.fs.getSetting(jobKey)).tasks.length, 0);
+});
+
+
+test('attachment diagnostics expose only recognized fixed failure reasons and never copy arbitrary error text', async () => {
+  const env = setup();
+  const jobKey = `assetJobs:${account.accountKey}`;
+  await env.fs.setSetting(jobKey, { tasks: [
+    { conversationId: 'one', assetId: 'one', error: { code: 'ASSET_FORMAT', message: '附件请求返回了网页，未保存。' } },
+    { conversationId: 'two', assetId: 'two', error: { code: 'ASSET_FORMAT', message: 'https://example.invalid/?sig=private' } },
+  ] });
+  const report = await env.service.diagnostics({ account });
+  assert.equal(report.failures[0].reason, 'format_html_response');
+  assert.match(report.failures[0].message, /网页/);
+  assert.equal(report.failures[1].reason, undefined);
+  assert.doesNotMatch(JSON.stringify(report), /private|https:\/\//);
+});
+
+test('explicit retry while collection is paused retires UI icons and preserves older delivery receipts without network', async () => {
+  const { env, saved, jobKey } = await legacyInterfaceIcons();
+  const state = await env.fs.getSetting(jobKey);
+  state.tasks[0].pendingArchives = [saved];
+  await env.fs.setSetting(jobKey, state);
+  await env.service.retryFailed({ account });
+  const result = await env.service.tick({ directory: env.fs.directory, account, tabId: 7, manualOnly: true });
+  assert.equal(result.pending, 0);
+  assert.equal((await env.fs.getSetting(jobKey)).tasks.length, 0);
+  assert.equal((await env.manifest()).conversations['conversation-one'].assets.length, 1);
+  assert.equal(env.enqueued.length, 2);
+  assert.equal(env.enqueued.at(-1).archive.entry.assets.length, 1);
+  assert.equal(env.captures.length, 0); assert.equal(env.requests.length, 0);
+});
