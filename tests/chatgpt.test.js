@@ -551,3 +551,189 @@ test('serialized generation classifier stays identical to the archive classifier
   const nested = inspectMessageGeneration.toString().split('\n').map(line => line ? `  ${line}` : '').join('\n');
   assert.ok(probeChatGPT.toString().includes(nested));
 });
+
+function timedProbe(handler) {
+  let time = 0, nextTimer = 0;
+  const timers = new Map(), scheduled = [], cleared = [], calls = [];
+  const clock = {
+    advance(milliseconds) {
+      time += milliseconds;
+      for (const [id, timer] of [...timers].sort((a, b) => a[1].due - b[1].due)) {
+        if (timer.due <= time && timers.delete(id)) timer.callback();
+      }
+    },
+  };
+  const context = vm.createContext({
+    location: { origin: 'https://chatgpt.com' }, crypto: webcrypto, TextEncoder, TextDecoder, AbortController, URL,
+    fetch: async (path, options) => { calls.push({ path, options }); return handler(path, options, clock); },
+    setTimeout: (callback, delay) => {
+      const id = ++nextTimer;
+      scheduled.push(delay); timers.set(id, { callback, due: time + delay }); return id;
+    },
+    clearTimeout: id => { cleared.push(id); timers.delete(id); },
+  });
+  return { run: vm.runInContext(`(${probeChatGPT.toString()})`, context), calls, scheduled, cleared, timers };
+}
+const jsonResponse = value => new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } });
+const timeoutReply = result => {
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, 'TIMEOUT');
+  assert.equal(typeof result.error.code, 'string');
+  assert.equal(result.error.message, '请求超时，请稍后重试。');
+  assert.equal(result.payload, undefined);
+  assert.equal(result.error.reason, undefined);
+};
+
+test('real AbortController numeric code 20 becomes a safe TIMEOUT for identity and detail requests', async () => {
+  for (const kind of ['identity', 'detail']) {
+    const f = timedProbe((path, options, clock) => {
+      if (kind === 'detail' && path === '/api/auth/session') return jsonResponse(session());
+      clock.advance(kind === 'detail' ? 60_000 : 20_000);
+      assert.equal(options.signal.aborted, true);
+      assert.equal(options.signal.reason.name, 'AbortError');
+      assert.equal(options.signal.reason.code, 20, 'use the native exception, not a plain Error mock');
+      throw options.signal.reason;
+    });
+    timeoutReply(await f.run(kind === 'identity' ? { kind } : autoRequest));
+    assert.equal(f.calls.length, kind === 'identity' ? 1 : 2, 'timeout must not trigger another endpoint');
+    assert.deepEqual(f.scheduled, kind === 'identity' ? [20_000] : [20_000, 60_000]);
+    assert.equal(f.cleared.length, f.scheduled.length);
+    assert.equal(f.timers.size, 0);
+  }
+});
+
+test('a stream reader abort cannot expose a numeric code or partial conversation', async () => {
+  const f = timedProbe((path, options, clock) => {
+    if (path === '/api/auth/session') return jsonResponse(session());
+    let reads = 0;
+    return { ok: true, headers: new Headers({ 'content-type': 'application/json' }), body: { getReader: () => ({
+      read: async () => {
+        if (++reads === 1) return { done: false, value: new TextEncoder().encode('{"conversation_id":"private-partial') };
+        clock.advance(60_000);
+        throw options.signal.reason;
+      },
+    }) } };
+  });
+  const result = await f.run(autoRequest);
+  timeoutReply(result);
+  assert.doesNotMatch(JSON.stringify(result), /private-partial|operation was aborted/);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.cleared.length, 2);
+});
+
+test('external error codes and primitive exceptions cannot spoof a safe error or trigger fallback', async () => {
+  const secret = 'private https://example.test/?token=secret';
+  for (const error of [
+    null, undefined, 20, secret,
+    { code: 20, message: secret },
+    { code: 'HTTP_404', message: secret, reason: 'TREE_MISSING_CHILD' },
+    { code: 'FORMAT', message: secret },
+    Object.assign(new Error(secret), { code: 'INCOMPLETE_DETAIL', reason: 'MESSAGE_IN_PROGRESS' }),
+  ]) {
+    const f = timedProbe(path => {
+      if (path === '/api/auth/session') return jsonResponse(session());
+      throw error;
+    });
+    const result = await f.run(autoRequest);
+    assert.equal(result.ok, false);
+    assert.equal(result.error.code, 'NETWORK');
+    assert.equal(result.error.message, '请求未完成，请检查网站登录状态和网络。');
+    assert.equal(result.error.reason, undefined);
+    assert.doesNotMatch(JSON.stringify(result), /private|example\.test|secret|TREE_MISSING_CHILD|MESSAGE_IN_PROGRESS/);
+    assert.equal(f.calls.length, 2, 'only trusted probe HTTP_404/FORMAT may select another endpoint');
+    assert.equal(f.timers.size, 0);
+    assert.equal(f.cleared.length, 2);
+  }
+});
+
+test('foreign AbortError and TimeoutError exceptions retain only fixed timeout diagnostics', async () => {
+  for (const name of ['AbortError', 'TimeoutError']) {
+    const nativeError = new DOMException('private https://example.test/?token=secret', name);
+    const f = timedProbe(() => { throw nativeError; });
+    const result = await f.run({ kind: 'identity' });
+    timeoutReply(result);
+    assert.doesNotMatch(JSON.stringify(result), /private|example\.test|secret/);
+    assert.equal(f.timers.size, 0);
+    assert.equal(f.cleared.length, 1);
+  }
+});
+
+test('identity and list retain 20-second budgets while a 30-second detail succeeds inside its 60-second budget', async () => {
+  const identityProbe = timedProbe(() => jsonResponse(session()));
+  assert.equal((await identityProbe.run({ kind: 'identity' })).ok, true);
+  assert.deepEqual(identityProbe.scheduled, [20_000]);
+  assert.equal(identityProbe.timers.size, 0);
+  const listProbe = timedProbe(path => jsonResponse(path === '/api/auth/session' ? session() : { items: [], total: 0 }));
+  assert.equal((await listProbe.run({ kind: 'list', expectedAccountKey: expectedKey, offset: 0 })).ok, true);
+  assert.deepEqual(listProbe.scheduled, [20_000, 20_000, 20_000]);
+  assert.equal(listProbe.timers.size, 0);
+  for (const format of ['auto', 'tree', 'flat', 'page']) {
+    const f = timedProbe((path, options, clock) => {
+      if (path === '/api/auth/session') return jsonResponse(session());
+      clock.advance(30_000);
+      assert.equal(options.signal.aborted, false);
+      return jsonResponse(['auto', 'tree'].includes(format) ? completeTree() : messagePage(['m1', 'm2'], {
+        has_previous_page: false, has_next_page: false,
+      }));
+    });
+    const result = await f.run({ ...autoRequest, format, requireComplete: true });
+    assert.equal(result.ok, true);
+    assert.equal(result.completeness, format === 'page' ? 'page' : 'complete');
+    assert.deepEqual(f.scheduled, [20_000, 60_000, 20_000], 'identity checks must retain their shorter budgets');
+    assert.equal(f.timers.size, 0);
+    assert.equal(f.cleared.length, 3);
+  }
+});
+
+test('responses arriving after the deadline are discarded even when a transport ignores abort', async () => {
+  for (const phase of ['headers', 'text', 'reader-done']) {
+    const f = timedProbe((path, options, clock) => {
+      if (path === '/api/auth/session') return jsonResponse(session());
+      const response = jsonResponse(completeTree());
+      if (phase === 'headers') { clock.advance(60_000); return response; }
+      if (phase === 'text') return { ok: true, headers: response.headers, body: null,
+        text: async () => { clock.advance(60_000); return JSON.stringify(completeTree()); } };
+      let reads = 0;
+      return { ok: true, headers: response.headers, body: { getReader: () => ({ read: async () => {
+        if (++reads === 1) return { done: false, value: new TextEncoder().encode(JSON.stringify(completeTree())) };
+        clock.advance(60_000); return { done: true };
+      } }) } };
+    });
+    timeoutReply(await f.run(autoRequest));
+    assert.equal(f.calls.length, 2, 'late details never reach the final identity check');
+    assert.equal(f.timers.size, 0);
+    assert.equal(f.cleared.length, 2);
+  }
+});
+
+test('stream progress does not reset the total detail deadline and generic post-abort errors remain timeouts', async () => {
+  for (const behavior of ['progress', 'generic-error']) {
+    const f = timedProbe((path, options, clock) => {
+      if (path === '/api/auth/session') return jsonResponse(session());
+      return { ok: true, headers: new Headers({ 'content-type': 'application/json' }), body: { getReader: () => ({ read: async () => {
+        clock.advance(25_000);
+        if (behavior === 'generic-error' && options.signal.aborted) throw new TypeError('private post-abort error');
+        return { done: false, value: new TextEncoder().encode(' ') };
+      } }) } };
+    });
+    const result = await f.run(autoRequest);
+    timeoutReply(result);
+    assert.doesNotMatch(JSON.stringify(result), /private/);
+    assert.deepEqual(f.scheduled, [20_000, 60_000]);
+    assert.equal(f.timers.size, 0);
+    assert.equal(f.cleared.length, 2);
+  }
+});
+
+test('trusted HTTP errors keep their code and fixed copy while always clearing the request timer', async () => {
+  for (const status of [401, 403, 404, 429, 503]) {
+    const f = timedProbe(() => new Response('private response body', { status }));
+    const result = await f.run({ kind: 'identity' });
+    assert.equal(result.error.code, `HTTP_${status}`);
+    assert.doesNotMatch(JSON.stringify(result), /private/);
+    assert.deepEqual(f.scheduled, [20_000]);
+    assert.equal(f.cleared.length, 1);
+    assert.equal(f.timers.size, 0);
+  }
+});

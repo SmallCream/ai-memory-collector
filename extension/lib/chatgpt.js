@@ -1,10 +1,14 @@
 // Serialized by chrome.scripting.executeScript: keep this function self-contained.
 // Experimental, read-only website endpoints. Session credentials never leave it.
 export async function probeChatGPT(request) {
-  // Only failures created here may expose a reason; fetch errors and response
-  // content cannot inject diagnostics even when they use a known reason name.
-  const reasons = new WeakMap();
-  const fail = (code, message, reason) => { const e = new Error(message); e.code = code; if (reason) reasons.set(e, reason); throw e; };
+  // Only failures created here may expose codes, messages or reasons. Native
+  // DOMExceptions carry numeric codes (AbortError uses 20), not our protocol.
+  const failures = new WeakMap();
+  const fail = (code, message, reason) => {
+    const error = new Error(message);
+    failures.set(error, { code, message, ...(reason ? { reason } : {}) });
+    throw error;
+  };
   const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
   const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
   // Keep this serialized copy identical to message-generation.js; parity is tested.
@@ -98,15 +102,19 @@ export async function probeChatGPT(request) {
     if (request.requireComplete !== undefined && typeof request.requireComplete !== 'boolean') {
       fail('REQUEST', '详情完整度检查参数无效。');
     }
-    async function getJSON(path, token) {
+    async function getJSON(path, token, timeoutMs = 20000) {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 20000);
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      const checkDeadline = () => {
+        if (controller.signal.aborted) fail('TIMEOUT', '请求超时，请稍后重试。');
+      };
       try {
         const response = await fetch(path, {
           method: 'GET', credentials: 'include', cache: 'no-store', redirect: 'error',
           headers: token ? { Accept: 'application/json', Authorization: `Bearer ${token}` } : { Accept: 'application/json' },
           signal: controller.signal,
         });
+        checkDeadline();
         if (!response.ok) {
           const status = response.status;
           fail(`HTTP_${status}`, status === 429 ? '平台限流，任务会保留进度，稍后重试。' :
@@ -123,6 +131,7 @@ export async function probeChatGPT(request) {
           const decoder = new TextDecoder();
           while (true) {
             const { done, value } = await reader.read();
+            checkDeadline();
             if (done) break;
             size += value.byteLength;
             if (size > 8 * 1024 * 1024) { await reader.cancel(); fail('SIZE', '响应超过 8 MiB 上限，本次未归档。'); }
@@ -131,9 +140,15 @@ export async function probeChatGPT(request) {
           text += decoder.decode();
         } else {
           text = await response.text();
+          checkDeadline();
           if (new TextEncoder().encode(text).length > 8 * 1024 * 1024) fail('SIZE', '响应超过 8 MiB 上限，本次未归档。');
         }
         try { return JSON.parse(text); } catch { fail('FORMAT', '返回结构无法解析，请等待适配器更新。'); }
+      } catch (error) {
+        // Some transports reject with a generic exception after aborting. The
+        // request's own signal still proves that its deadline has expired.
+        if (!failures.has(error)) checkDeadline();
+        throw error;
       } finally { clearTimeout(timer); }
     }
     async function session() {
@@ -265,14 +280,16 @@ export async function probeChatGPT(request) {
       format = request.format === 'auto' ? 'tree' : request.format === 'page' ? 'flat' : request.format;
       const read = async type => {
         const suffix = type === 'flat' ? `conversations/${request.conversationId}?num_turns=100${request.before ? `&before=${encodeURIComponent(request.before)}` : ''}` : `conversation/${request.conversationId}`;
-        const value = await getJSON(`/backend-api/${suffix}`, before.token);
+        // Long histories need more time than identity/list requests. This is a
+        // total deadline for headers and body, not a renewed per-chunk timeout.
+        const value = await getJSON(`/backend-api/${suffix}`, before.token, 60000);
         detailShape(value, type);
         return value;
       };
       try { payload = await read(format); }
       catch (error) {
         // Auth, rate limits, identity mismatches and partial trees never fall back.
-        if (request.format !== 'auto' || !['HTTP_404', 'FORMAT'].includes(error.code)) throw error;
+        if (request.format !== 'auto' || !['HTTP_404', 'FORMAT'].includes(failures.get(error)?.code)) throw error;
         format = 'flat';
         payload = await read(format);
       }
@@ -287,8 +304,10 @@ export async function probeChatGPT(request) {
       ...(request.kind === 'detail' ? { detailFormat: format, completeness } : {}),
       coverage: request.kind === 'detail' ? '已检查返回结构；全部历史和平台全部分支完整度仍未验证，附件仅保留引用' : payload.coverage };
   } catch (error) {
-    return { ok: false, error: { code: error.code || (error.name === 'AbortError' ? 'TIMEOUT' : 'NETWORK'),
-      message: error.code ? error.message : error.name === 'AbortError' ? '请求超时，请稍后重试。' : '请求未完成，请检查网站登录状态和网络。',
-      ...(reasons.has(error) ? { reason: reasons.get(error) } : {}) } };
+    const known = failures.get(error);
+    if (known) return { ok: false, error: known };
+    const timeout = error?.name === 'AbortError' || error?.name === 'TimeoutError';
+    return { ok: false, error: { code: timeout ? 'TIMEOUT' : 'NETWORK',
+      message: timeout ? '请求超时，请稍后重试。' : '请求未完成，请检查网站登录状态和网络。' } };
   }
 }

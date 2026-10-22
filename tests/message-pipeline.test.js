@@ -24,7 +24,7 @@ function message(number) {
 function setup() {
   const fs = memoryBinaryFs(), requests = [];
   const messages = Array.from({ length: 8 }, (_, index) => message(index + 1));
-  let clock = initialTime, updatedAt = sourceTime, failedBefore = false, tree = null;
+  let clock = initialTime, updatedAt = sourceTime, failedBefore = false, tree = null, abortNextDetail = false;
   // A structured private URL changes its signature between reads. The normal
   // archive sanitizer must make it equal to its already-redacted local copy.
   messages[6].metadata = { attachments: [{ id: 'file-synthetic', name: 'sample.png',
@@ -38,6 +38,14 @@ function setup() {
     if (url.pathname === '/api/auth/session') return response({ user: { id: rawUser, name: 'Pipeline' }, accessToken: 'synthetic-session-secret' });
     if (url.pathname === '/backend-api/conversations') return response({ offset: 0, total: 1,
       items: [{ id: conversationId, title: 'Pipeline conversation', create_time: sourceTime - 1000, update_time: updatedAt }] });
+    if (abortNextDetail) {
+      abortNextDetail = false;
+      // Use the native browser-style AbortError, including its numeric code,
+      // rather than a hand-written { name: 'AbortError' } error stub.
+      const controller = new AbortController();
+      controller.abort();
+      throw controller.signal.reason;
+    }
     if (url.pathname === `/backend-api/conversation/${conversationId}`) return tree ? response(tree) : response({}, 404);
     assert.equal(url.pathname, `/backend-api/conversations/${conversationId}`);
     assert.equal(url.searchParams.get('num_turns'), '100');
@@ -71,6 +79,7 @@ function setup() {
     advance: milliseconds => { clock += milliseconds; },
     append: () => { messages.push(message(messages.length + 1)); updatedAt += 60; clock += 60_000; },
     failOlder: () => { failedBefore = true; },
+    abortDetailOnce: () => { abortNextDetail = true; },
     setTree: value => { tree = value; },
     manifest: async () => readAccountManifest(fs.directory, account),
   };
@@ -149,6 +158,48 @@ test('an interrupted older-page request preserves the previous complete archive 
   assert.equal(f.fs.text(entry.jsonPath), original);
   assert.equal(JSON.stringify(await f.manifest()), originalManifest);
   assert.deepEqual(await f.engine.getOutbox(accountKey), []);
+});
+
+test('a native aborted detail is a timeout, preserves the saved archive and index, then retries successfully', async () => {
+  const f = setup();
+  assert.equal((await run(f)).status, 'completed');
+  const entry = (await f.manifest()).conversations[conversationId];
+  const originalJSON = f.fs.text(entry.jsonPath), originalMD = f.fs.text(entry.markdownPath);
+  const originalManifest = JSON.stringify(await f.manifest());
+  const indexKey = `collectorIndex:${accountKey}`;
+  const originalIndex = structuredClone(await f.fs.getSetting(indexKey));
+  await f.engine.acknowledgeOutbox(accountKey, (await f.engine.getOutbox(accountKey)).map(item => item.id));
+  f.append(); f.abortDetailOnce(); f.requests.length = 0;
+
+  const waiting = await run(f);
+  assert.equal(waiting.status, 'running');
+  assert.equal(waiting.error.code, 'TIMEOUT');
+  assert.equal(waiting.error.reason, undefined);
+  assert.doesNotMatch(JSON.stringify(waiting.error), /INVALID_RESPONSE|SCRIPT_ENVELOPE_INVALID/);
+  assert.equal(waiting.nextRetryAt, initialTime + 120_000);
+  assert.deepEqual(f.flatRequests(), [`/backend-api/conversations/${conversationId}?num_turns=100`]);
+  assert.equal(f.fs.text(entry.jsonPath), originalJSON);
+  assert.equal(f.fs.text(entry.markdownPath), originalMD);
+  assert.equal(JSON.stringify(await f.manifest()), originalManifest);
+  assert.deepEqual(await f.fs.getSetting(indexKey), originalIndex);
+  assert.deepEqual(await f.engine.getOutbox(accountKey), []);
+
+  const requestsBeforeRetry = f.requests.length;
+  await f.engine.tick({ account, tabId: 1 });
+  assert.equal(f.requests.length, requestsBeforeRetry, 'retry must respect its scheduled backoff');
+  f.advance(60_000);
+  let finished;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    finished = await f.engine.tick({ account, tabId: 1 });
+    if (finished.status !== 'running') break;
+  }
+  assert.equal(finished.status, 'completed');
+  const updated = (await f.manifest()).conversations[conversationId];
+  assert.notEqual(updated.contentHash, entry.contentHash);
+  assert.equal(JSON.parse(f.fs.text(updated.jsonPath)).messages.length, 9);
+  assert.match(f.fs.text(updated.markdownPath), /Message 9\b/);
+  assert.equal((await f.fs.getSetting(indexKey)).items[conversationId].contentHash, updated.contentHash);
+  assert.deepEqual((await f.engine.getOutbox(accountKey)).map(item => item.conversationId), [conversationId]);
 });
 
 test('an existing tree archive is not replaced by a selected-branch page when the tree endpoint becomes unavailable', async () => {
