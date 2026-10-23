@@ -1,7 +1,8 @@
 import { getSetting, setSetting } from './lib/storage.js';
 import { getAdapter } from './adapters/index.js';
 import { createCollectorEngine } from './lib/collector-engine.js';
-import { readAccountManifest, hasConversationFiles, readConversationBaseline, saveConversation, applyRemoteFiles } from './lib/archive-store.js';
+import { readAccountManifest, hasConversationFiles, readConversationBaseline, readConversationArchive,
+  repairMissingMarkdown, saveConversation, applyRemoteFiles } from './lib/archive-store.js';
 import { syncArchives } from './lib/github-sync.js';
 import { probeRepository } from './lib/github.js';
 import { createCollectorService, ALARM_NAME } from './lib/collector-service.js';
@@ -10,22 +11,29 @@ import { createAssetService } from './lib/asset-service.js';
 import { createChatGPTAssetResolver } from './lib/chatgpt-assets.js';
 import { createRestoreService } from './lib/restore-service.js';
 import { fetchRepositorySnapshot, downloadRepositoryFile } from './lib/github-restore.js';
+import { createLocalMaintenance } from './lib/local-maintenance.js';
 
 const resolver = createChatGPTAssetResolver(chrome, { allowLibraryDownload: true, allowFileDownload: true });
 const adapter = getAdapter('chatgpt');
-const assets = createAssetService({ getSetting, setSetting, readAccountManifest, saveConversation,
+const lockedSave = input => service.withFileLock(() => saveConversation(input));
+const lockedApply = input => service.withFileLock(() => applyRemoteFiles(input));
+const assets = createAssetService({ getSetting, setSetting, readAccountManifest, saveConversation: lockedSave,
   resolveAsset: resolver.resolve, downloadRepositoryFile,
   refreshConversation: ({ tabId, ...request }) => adapter.detail(tabId, request),
   enqueueArchive: input => service.engine.enqueueArchive(input) });
 const restore = createRestoreService({ getSetting, setSetting, fetchRepositorySnapshot, downloadRepositoryFile,
-  applyRemoteFiles, readLocalManifest: readAccountManifest, hydrateAssets: assets.hydrateAssets,
+  applyRemoteFiles: lockedApply, readLocalManifest: readAccountManifest, hydrateAssets: assets.hydrateAssets,
   // Replayed local capture journals already carry authorized account ownership.
   // Queue them without creating a binding; only enabled configured accounts upload.
   enqueueRecovered: ({ account, archive }) => service.engine.enqueueArchive({ account: { ...account, enabled: true }, archive }) });
+const maintenance = createLocalMaintenance({ getSetting, setSetting, readAccountManifest, readConversationArchive,
+  repairMissingMarkdown: input => service.withFileLock(() => repairMissingMarkdown(input)),
+  enqueueArchive: input => service.engine.enqueueArchive(input), requeueMissing: input => assets.requeueMissing(input) });
 const service = createCollectorService({ browser: chrome, getSetting, setSetting,
   adapter, createEngine: createCollectorEngine,
-  readAccountManifest, hasConversationFiles, readConversationBaseline, saveConversation: assets.save, applyRemoteFiles, syncArchives, probeRepository,
-  assetService: assets, restoreService: restore });
+  readAccountManifest, hasConversationFiles, readConversationBaseline, readConversationArchive,
+  saveConversation: assets.save, applyRemoteFiles: lockedApply, syncArchives, probeRepository,
+  assetService: assets, restoreService: restore, maintenanceService: maintenance, cancelAssets: resolver.cancel });
 const extensionURL = new URL(chrome.runtime.getURL('/'));
 const ignore = promise => Promise.resolve(promise).catch(() => {});
 const trustedUI = sender => {
@@ -86,7 +94,10 @@ chrome.runtime.onInstalled.addListener(details => {
 chrome.runtime.onStartup.addListener(() => ignore(service.initialize().then(() => service.pump())));
 chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === ALARM_NAME) ignore(service.pump()); });
 chrome.tabs.onUpdated.addListener((id, change, tab) => {
-  if (change.url || change.status === 'complete') ignore(service.enableTab(tab).then(() => service.pump()));
+  if (change.url || change.status === 'complete') ignore(service.enableTab(tab).then(async () => {
+    if (change.url && !/^https:\/\/chatgpt\.com(?:\/|$)/.test(change.url)) await service.tabGone(id);
+    await service.pump();
+  }));
 });
 chrome.tabs.onActivated.addListener(info => ignore(chrome.tabs.get(info.tabId).then(async tab => {
   await service.enableTab(tab);

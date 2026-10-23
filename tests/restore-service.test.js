@@ -94,6 +94,20 @@ test('restores multiple accounts without website login or enabling capture; one 
   assert.ok(!JSON.stringify(env.settings.get(RESTORE_SETTING_KEY), (key, value) => key === 'directory' ? null : value).includes(config.token));
 });
 
+test('text-only cloud restoration reports missing cloud attachments without retrying a completed text restore', async () => {
+  const env = setup();
+  env.hydrate(async () => ({ downloaded: 0, pending: 0, failed: 0, cloudMissing: 2 }));
+  await env.start(); await env.tick();
+  const state = await env.tick();
+  assert.equal(state.status, 'partial'); assert.equal(state.restored, 1);
+  assert.equal(state.cloudMissing, 2); assert.equal(state.missingCloudConversations, 1);
+  assert.equal(state.failed, 0); assert.equal(state.pending, 0); assert.equal(state.nextRetryAt, null);
+  assert.equal(state.error, null);
+  await env.tick();
+  assert.equal(env.hydration.length, 1);
+  assert.equal((await env.restart().state()).cloudMissing, 2);
+});
+
 test('restore file downloads and local writes expose real running activity without blocking status reads', async () => {
   const env = setup(); await env.start(); await env.tick();
   const original = env.dependencies.downloadRepositoryFile;
@@ -193,13 +207,13 @@ test('manual file conflicts are skipped without asset or second file writes', as
   assert.ok(!JSON.stringify(state).includes('private content'));
 });
 
-test('changed directory blocks old checkpoints; explicit force starts independent restore', async () => {
+test('changed directory blocks an old tick but a normal start creates an independent restore', async () => {
   const env = setup(); await env.start(); await env.tick();
   const other = { kind: 'directory', queryPermission: async () => 'granted', rootId: {} };
   assert.equal((await env.tick({ directory: other })).error.code, 'DIRECTORY_CHANGED');
   assert.equal(env.calls.length, 0);
-  await assert.rejects(env.start({ directory: other }), { code: 'DIRECTORY_CHANGED' });
-  assert.equal((await env.start({ directory: other, force: true })).status, 'running');
+  assert.equal((await env.start({ directory: other })).status, 'running');
+  assert.equal(env.fetchCount(), 2);
   await env.tick({ directory: other });
   assert.equal((await env.tick({ directory: other })).status, 'completed');
 });
@@ -209,6 +223,50 @@ test('changed repository blocks before download or write', async () => {
   const state = await env.tick({ config: { ...config, repository: 'example/other' } });
   assert.equal(state.status, 'blocked'); assert.equal(state.error.code, 'RESTORE_CONFIG_CHANGED');
   assert.equal(env.downloads.length, 0);
+});
+
+test('a normal start replaces a finished or pending restore after changing repository or branch', async () => {
+  for (const complete of [false, true]) for (const target of [
+    { ...config, repository: 'example/other' }, { ...config, branch: 'next' },
+  ]) {
+    const env = setup(); await env.start();
+    if (complete) { await env.tick(); await env.tick(); }
+    const prior = env.settings.get(RESTORE_SETTING_KEY);
+    env.snapshot({ entries: prior.entries, empty: prior.empty, repository: target.repository, branch: target.branch,
+      commitSha: '3'.repeat(40), treeSha: '4'.repeat(40) });
+    const next = await env.start({ config: target });
+    assert.equal(next.status, 'running'); assert.equal(next.phase, 'metadata');
+    assert.equal(next.repository, target.repository); assert.equal(next.branch, target.branch);
+    assert.equal(next.commitSha, '3'.repeat(40)); assert.equal(env.fetchCount(), 2);
+    await env.tick({ config: target });
+    assert.equal((await env.tick({ config: target })).status, 'completed');
+  }
+});
+
+test('changing restore target waits until an active file write has checkpointed', async () => {
+  const env = setup();
+  let release, entered;
+  const writing = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const apply = env.dependencies.applyRemoteFiles;
+  const service = createRestoreService({ ...env.dependencies, applyRemoteFiles: async input => {
+    entered(); await gate; return apply(input);
+  } });
+  await service.start({ config, directory: env.directory });
+  await service.tick({ config, directory: env.directory });
+  const tick = service.tick({ config, directory: env.directory });
+  await writing;
+  const target = { ...config, repository: 'example/other' };
+  const prior = env.settings.get(RESTORE_SETTING_KEY);
+  env.snapshot({ entries: prior.entries, empty: prior.empty, repository: target.repository, branch: target.branch,
+    commitSha: '3'.repeat(40), treeSha: '4'.repeat(40) });
+  const started = service.start({ config: target, directory: env.directory });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(env.fetchCount(), 1);
+  assert.equal(env.settings.get(RESTORE_SETTING_KEY).repository, config.repository);
+  release(); assert.equal((await tick).status, 'completed');
+  assert.equal((await started).repository, target.repository);
+  assert.equal(env.fetchCount(), 2); assert.equal(env.calls.length, 1);
 });
 
 test('invalid account ownership is isolated and valid account can still restore', async () => {
@@ -363,6 +421,14 @@ test('missing recovery hook keeps a durable receipt across force restart until d
   await service.start({ config, directory: env.directory }); await service.tick({ config, directory: env.directory });
   const pending = await service.tick({ config, directory: env.directory });
   assert.equal(pending.issues[0].code, 'RESTORE_RECOVERY_PENDING');
+  const other = { kind: 'directory', queryPermission: async () => 'granted', rootId: {} };
+  for (const force of [false, true]) {
+    await assert.rejects(service.start({ config: { ...config, repository: 'example/other' }, directory: env.directory, force }),
+      { code: 'RESTORE_CONFIG_CHANGED' });
+    await assert.rejects(service.start({ config, directory: other, force }), { code: 'DIRECTORY_CHANGED' });
+    assert.equal(env.fetchCount(), 1);
+    assert.deepEqual(env.settings.get(RESTORE_SETTING_KEY).items[0].pendingRecovered, recovered);
+  }
   await service.start({ config, directory: env.directory, force: true });
   assert.equal(env.fetchCount(), 1); assert.deepEqual(env.settings.get(RESTORE_SETTING_KEY).items[0].pendingRecovered, recovered);
   const received = [];

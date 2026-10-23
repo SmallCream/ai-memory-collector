@@ -1,14 +1,15 @@
 const CONFIG_KEY = 'collectorConfigV2';
 export const INTERVALS = [15, 30, 60];
-export const DEFAULT_CONFIG = Object.freeze({ schemaVersion: 2, setupComplete: false,
-  autoEnabled: true, intervalMinutes: 30, accounts: {},
-  github: { enabled: false, repository: '', branch: '', token: '', lfsEnabled: true } });
+export const DEFAULT_CONFIG = Object.freeze({ schemaVersion: 3, setupComplete: false,
+  autoEnabled: true, localAssetsEnabled: true, intervalMinutes: 30, accounts: {},
+  github: { enabled: false, autoRestore: false, repository: '', branch: '', token: '', lfsEnabled: false } });
 
 export function publicConfig(config) {
-  return { setupComplete: config.setupComplete, autoEnabled: config.autoEnabled,
+  return { setupComplete: config.setupComplete, autoEnabled: config.autoEnabled, localAssetsEnabled: config.localAssetsEnabled !== false,
     intervalMinutes: config.intervalMinutes, github: {
       enabled: config.github.enabled, repository: config.github.repository,
-      branch: config.github.branch, hasToken: Boolean(config.github.token), lfsEnabled: config.github.lfsEnabled !== false,
+      branch: config.github.branch, hasToken: Boolean(config.github.token), lfsEnabled: config.github.lfsEnabled === true,
+      autoRestore: config.github.autoRestore === true,
     } };
 }
 
@@ -16,10 +17,18 @@ export function createConfigStore({ getSetting, setSetting }) {
   let queue = Promise.resolve();
   async function read() {
     const saved = await getSetting(CONFIG_KEY);
-    if (saved?.schemaVersion === 2) return {
-      ...structuredClone(DEFAULT_CONFIG), ...saved,
-      github: { ...DEFAULT_CONFIG.github, ...saved.github },
-    };
+    if (saved?.schemaVersion === 2 || saved?.schemaVersion === 3) {
+      const legacy = saved.schemaVersion === 2;
+      return {
+        ...structuredClone(DEFAULT_CONFIG), ...saved, schemaVersion: 3,
+        localAssetsEnabled: saved.localAssetsEnabled !== false,
+        github: { ...DEFAULT_CONFIG.github, ...saved.github,
+          // Before v3 one switch enabled uploads and repository restoration.
+          // Preserve that behavior on upgrade, while new installs stay local.
+          autoRestore: legacy ? saved.github?.enabled === true : saved.github?.autoRestore === true,
+          lfsEnabled: legacy ? saved.github?.lfsEnabled !== false : saved.github?.lfsEnabled === true },
+      };
+    }
     const previous = await getSetting('formPreferences') || await getSetting('githubTarget') || {};
     const config = structuredClone(DEFAULT_CONFIG);
     // Keep the same IndexedDB origin/name and directory handle. Migration never

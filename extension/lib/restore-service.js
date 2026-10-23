@@ -99,6 +99,8 @@ function summarize(job) {
     total: job.items.length, processed: done.length + job.items.filter(item => item.status === 'skipped').length,
     restored: done.filter(item => item.outcome === 'added' || item.outcome === 'updated').length,
     unchanged: done.filter(item => item.outcome === 'unchanged').length,
+    cloudMissing: job.items.reduce((total, item) => total + (Number.isSafeInteger(item.cloudMissing) && item.cloudMissing > 0 ? item.cloudMissing : 0), 0),
+    missingCloudConversations: job.items.filter(item => item.cloudMissing > 0).length,
     skipped: job.items.filter(item => item.status === 'skipped' || item.outcome === 'skipped').length,
     failed: [...job.metadata, ...job.items].filter(item => item.status === 'failed' || item.status === 'retry').length,
     pending: [...job.metadata, ...job.items].filter(item => ['pending', 'restoring', 'hydrating', 'retry'].includes(item.status)).length,
@@ -168,7 +170,7 @@ export function createRestoreService({ getSetting, setSetting, fetchRepositorySn
       job.status = 'running'; job.phase = job.metadata.some(item => item.status === 'pending' || item.status === 'retry') ? 'metadata' : 'conversations';
       job.completedAt = null;
     } else {
-      job.status = all.some(item => item.status === 'failed' || item.status === 'skipped' || item.outcome === 'skipped') ? 'partial' : 'completed';
+      job.status = all.some(item => item.status === 'failed' || item.status === 'skipped' || item.outcome === 'skipped' || item.cloudMissing > 0) ? 'partial' : 'completed';
       job.phase = 'done'; job.completedAt = now();
     }
   }
@@ -188,9 +190,12 @@ export function createRestoreService({ getSetting, setSetting, fetchRepositorySn
         return publish(previous);
       }
       if (previous && !force) {
-        if (!configMatches(previous, config)) throw fail('RESTORE_CONFIG_CHANGED');
-        if (!await sameDirectory(previous.directory, directory)) throw fail('DIRECTORY_CHANGED');
-        if (['running', 'blocked'].includes(previous.status)) {
+        // start() is serialized behind any active file write. Once that write
+        // and its recovery receipt have settled, a different destination gets
+        // its own snapshot instead of retrying an incompatible checkpoint.
+        // The pendingRecovered guard above remains authoritative even on force.
+        const sameTarget = configMatches(previous, config) && await sameDirectory(previous.directory, directory);
+        if (sameTarget && ['running', 'blocked'].includes(previous.status)) {
           previous.status = 'running'; previous.error = null;
           return publish(previous);
         }
@@ -289,6 +294,7 @@ export function createRestoreService({ getSetting, setSetting, fetchRepositorySn
               title: item.entry.title, conversationId: item.entry.conversationId }, () => hydrateAssets({ directory, account: item.account, entry: item.restoredEntry,
               remoteEntry: item.entry, config, snapshot: { repository: job.repository, branch: job.branch,
                 commitSha: job.commitSha, treeSha: job.treeSha, entries: job.entries, empty: job.empty } }));
+            item.cloudMissing = Number.isSafeInteger(result?.cloudMissing) && result.cloudMissing > 0 ? result.cloudMissing : 0;
             if (result?.failed) throw fail('ASSET_RESTORE_FAILED');
             if (result?.pending) { item.status = 'hydrating'; finish(job); return publish(job); }
           }

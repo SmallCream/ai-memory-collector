@@ -22,7 +22,10 @@ function fixture(options = {}) {
   Object.assign(config, { setupComplete: true, accounts: { [accountKey]: account } }, options.config || {});
   config.github = { ...DEFAULT_CONFIG.github, ...options.github };
   store.set('collectorConfigV2', structuredClone(config)); store.set('directory', root);
-  const clone = value => value?.kind === 'directory' ? value : structuredClone(value);
+  // Real directory handles support structured cloning; preserve our in-memory
+  // handle when it is nested in a durable maintenance/backfill checkpoint.
+  const clone = value => value?.kind === 'directory' ? value : value?.directory?.kind === 'directory'
+    ? { ...structuredClone({ ...value, directory: null }), directory: value.directory } : structuredClone(value);
   const getSetting = async key => clone(store.get(key));
   const setSetting = async (key, value) => store.set(key, clone(value));
   const tabs = [{ id: 1, url: 'https://chatgpt.com/c/demo', active: true }];
@@ -58,11 +61,16 @@ function fixture(options = {}) {
   }
   const dependencies = { browser, getSetting, setSetting, adapter, createEngine: createCollectorEngine,
     readAccountManifest: async dir => ({ conversations: Object.fromEntries(dir.entries) }),
+    readConversationArchive: async (dir, _account, id) => {
+      if (!dir.entries.has(id)) throw issue('LOCAL_VERIFY');
+      return saved(dir, id);
+    },
     saveConversation: async ({ directory: dir, detail }) => {
       calls.saves.push(dir.name); await options.saveGate?.promise;
       return saved(dir, detail.payload.conversation_id);
     },
-    syncArchives: async input => { calls.uploads.push(structuredClone(input)); await options.syncGate?.promise;
+    syncArchives: async input => { const { isCurrent, ...request } = input;
+      calls.uploads.push(structuredClone(request)); await options.syncGate?.promise;
       if (options.syncError) throw issue(options.syncError);
       return options.syncResult || { remoteWinners: [], conflicts: [], commitSha: 'commit' }; },
     applyRemoteFiles: async ({ directory: dir }) => { calls.applies.push(dir.name); await options.applyGate?.promise; return options.applyResult || {}; },
@@ -176,7 +184,7 @@ test('manual restore runs without a source tab, account binding or automatic upl
 });
 
 test('scheduled remote checks run without pending uploads or ChatGPT tabs and respect interval', async () => {
-  const f = fixture({ config: { accounts: {} }, github: { repository: 'owner/data', token: 'secret', enabled: true } });
+  const f = fixture({ config: { accounts: {} }, github: { repository: 'owner/data', token: 'secret', enabled: false, autoRestore: true } });
   f.tabs.length = 0; let starts = 0;
   f.dependencies.restoreService = {
     state: async () => ({ status: 'completed' }),
@@ -189,7 +197,7 @@ test('scheduled remote checks run without pending uploads or ChatGPT tabs and re
 });
 
 test('pending LFS work retains text outbox and only commits after upload preparation', async () => {
-  const f = fixture({ github: { repository: 'owner/data', token: 'secret', enabled: true } });
+  const f = fixture({ github: { repository: 'owner/data', token: 'secret', enabled: true, lfsEnabled: true } });
   let prepared = false, acknowledged = 0;
   f.dependencies.assetService = {
     tick: async () => ({ pending: 0 }),
@@ -207,7 +215,7 @@ test('pending LFS work retains text outbox and only commits after upload prepara
 
 test('GitHub retry replaces stale LFS progress with its failure and preserves backoff and delivery checkpoints', async () => {
   const options = { config: { autoEnabled: false }, syncError: 'GITHUB_NETWORK',
-    github: { repository: 'owner/data', token: 'secret', enabled: true } };
+    github: { repository: 'owner/data', token: 'secret', enabled: true, lfsEnabled: true } };
   const f = fixture(options), key = `githubStatus:${accountKey}`, running = [];
   let prepared = false, acknowledged = 0;
   f.dependencies.assetService = {
@@ -253,7 +261,7 @@ test('GitHub retry replaces stale LFS progress with its failure and preserves ba
     assert.equal(state.message, ''); assert.equal(state.nextRetryAt, 0);
   }
   assert.equal(acknowledged, 1); assert.equal((await f.service.engine.getOutbox(accountKey)).length, 0);
-  assert.equal(f.store.get(key).status, 'synced'); assert.equal(f.store.get(key).error, undefined);
+  assert.equal(f.store.get(key).status, 'synced'); assert.equal(f.store.get(key).error, null);
   assert.equal(f.calls.lists, 0); assert.equal(f.calls.details, 0);
 });
 
@@ -340,7 +348,7 @@ test('restart reconciles completion before choosing another initial job, without
 });
 
 test('directory replacement waits for the current local write, resets its index and preserves pending uploads', async () => {
-  const saveGate = deferred(), f = fixture({ saveGate });
+  const saveGate = deferred(), f = fixture({ saveGate, github: { enabled: true } });
   await f.service.pump(); await f.service.pump();
   const pumping = f.service.pump(); await turn();
   assert.deepEqual(f.calls.saves, ['original']);
@@ -430,11 +438,54 @@ test('GitHub omitted token preserves it, explicit empty clears it and a changed 
 test('destination changes during an upload cannot acknowledge data for the new repository', async () => {
   const syncGate = deferred(), f = fixture({ syncGate, github: { enabled: false, repository: 'owner/old', token: 'token' } });
   await complete(f); await f.service.command({ type: 'collector:github-config', enabled: true }, 1);
-  const uploading = f.service.command({ type: 'collector:retry-github' }, 1); await turn();
-  f.config().github.repository = 'owner/new'; syncGate.resolve();
-  await assert.rejects(uploading, error => error.code === 'GITHUB_TARGET_CHANGED');
+  const uploading = f.service.command({ type: 'collector:retry-github' }, 1);
+  for (let n = 0; n < 20 && !f.calls.uploads.length; n++) await turn();
+  assert.equal(f.calls.uploads.length, 1);
+  await f.service.command({ type: 'collector:github-config', repository: 'owner/new' }, 1);
+  const revised = structuredClone(f.store.get(`githubStatus:${accountKey}`));
+  syncGate.resolve(); await uploading;
   assert.equal((await f.service.engine.getOutbox(accountKey)).length, 1);
-  assert.equal((await f.service.state(1)).githubStatus.error.code, 'GITHUB_TARGET_CHANGED');
+  assert.deepEqual(f.store.get(`githubStatus:${accountKey}`), revised);
+  assert.equal(revised.needsBackfill, true); assert.equal(revised.manual, false);
+  await f.service.pump();
+  assert.equal(f.calls.uploads.at(-1).config.repository, 'owner/new');
+  assert.equal((await f.service.engine.getOutbox(accountKey)).length, 0);
+});
+
+test('turning off backup while a manual request is in flight preserves the new cancelled intent', async () => {
+  for (const syncError of [undefined, 'NETWORK']) {
+    const gate = deferred(), f = fixture({ syncGate: gate, syncError,
+      github: { enabled: false, repository: 'owner/repo', token: 'token' } });
+    await complete(f);
+    const uploading = f.service.command({ type: 'collector:retry-github' }, 1);
+    for (let n = 0; n < 20 && !f.calls.uploads.length; n++) await turn();
+    assert.equal(f.calls.uploads.length, 1);
+    await f.service.command({ type: 'collector:github-config', enabled: false }, 1);
+    const revised = structuredClone(f.store.get(`githubStatus:${accountKey}`));
+    gate.resolve(); await uploading;
+    assert.deepEqual(f.store.get(`githubStatus:${accountKey}`), revised);
+    assert.equal(revised.manual, false); assert.equal(revised.error, null);
+    assert.equal((await f.service.engine.getOutbox(accountKey)).length, 1);
+    await f.service.pump(); assert.equal(f.calls.uploads.length, 1);
+  }
+});
+
+test('a new manual backup intent survives the older attempt at the same destination', async () => {
+  const gate = deferred(), f = fixture({ syncGate: gate,
+    github: { enabled: true, repository: 'owner/repo', token: 'token' } });
+  await f.service.pump(); await f.service.pump(); await f.service.pump();
+  const running = f.service.pump();
+  for (let n = 0; n < 20 && !f.calls.uploads.length; n++) await turn();
+  assert.equal(f.calls.uploads.length, 1);
+  await f.service.command({ type: 'collector:retry-github' }, 1);
+  const revised = structuredClone(f.store.get(`githubStatus:${accountKey}`));
+  assert.equal(revised.manual, true); assert.equal(revised.needsBackfill, true);
+  gate.resolve(); await running;
+  assert.deepEqual(f.store.get(`githubStatus:${accountKey}`), revised);
+  assert.equal((await f.service.engine.getOutbox(accountKey)).length, 1);
+  await f.service.pump();
+  assert.equal(f.calls.uploads.length, 2);
+  assert.equal(f.store.get(`githubStatus:${accountKey}`).manual, false);
 });
 
 test('internal attachment retry forwards only explicit true and keeps the active account scope', async () => {
@@ -463,4 +514,216 @@ test('internal attachment retry rejects missing permissions and switched or disa
     });
     assert.equal(retried, false);
   }
+});
+
+test('local-only capture keeps no new upload bodies and toggling attachment download is independent', async () => {
+  const f = fixture(), requests = [];
+  f.dependencies.assetService = { tick: async input => { requests.push(input); return { runnable: false }; } };
+  f.service = createCollectorService(f.dependencies);
+  await f.service.command({ type: 'collector:configure', localAssetsEnabled: false }, 1);
+  await complete(f);
+  assert.equal(f.root.entries.size, 1);
+  assert.equal((await f.service.engine.getOutbox(accountKey)).length, 0);
+  assert.equal(f.calls.uploads.length, 0);
+  assert.ok(requests.length > 0 && requests.every(input => input.captureEnabled === false));
+  await f.service.command({ type: 'collector:configure', localAssetsEnabled: true }, 1);
+  await f.service.pump();
+  assert.equal(requests.at(-1).captureEnabled, true);
+  assert.equal(f.config().github.enabled, false);
+});
+
+test('text-only GitHub backup never prepares or acknowledges LFS uploads', async () => {
+  const f = fixture({ github: { enabled: true, lfsEnabled: false, repository: 'owner/repo', token: 'token' } });
+  f.dependencies.assetService = { tick: async () => ({ runnable: false }),
+    prepareUploads: async () => { throw new Error('must not upload attachments'); },
+    acknowledgeUploads: async () => { throw new Error('must not discard attachment checkpoint'); } };
+  f.service = createCollectorService(f.dependencies);
+  await complete(f);
+  assert.equal(f.calls.uploads.length, 1);
+  assert.deepEqual(f.calls.uploads[0].assetPointers, []);
+  assert.equal((await f.service.state(1)).githubStatus.status, 'synced');
+});
+
+test('manual backup rebuilds a bounded local queue and finishes without enabling automatic uploads', async () => {
+  const f = fixture({ ids: ['one', 'two', 'three'], github: { repository: 'owner/repo', token: 'token', enabled: false } });
+  await complete(f);
+  assert.equal((await f.service.engine.getOutbox(accountKey)).length, 0);
+  const before = { lists: f.calls.lists, details: f.calls.details };
+  f.tabs.length = 0; f.permissions.delete(site);
+  await f.service.command({ type: 'collector:retry-github' });
+  assert.equal(f.calls.uploads[0].bundles.length, 2);
+  assert.equal(f.store.get(`githubStatus:${accountKey}`).manual, true);
+  await f.service.pump();
+  assert.equal(f.calls.uploads.length, 2);
+  assert.equal(f.calls.uploads[1].bundles.length, 1);
+  assert.equal(f.store.get(`githubStatus:${accountKey}`).manual, false);
+  assert.equal(f.store.get(`githubStatus:${accountKey}`).status, 'synced');
+  assert.equal(f.config().github.enabled, false);
+  assert.deepEqual({ lists: f.calls.lists, details: f.calls.details }, before);
+  await f.service.pump(); assert.equal(f.calls.uploads.length, 2);
+});
+
+test('enabling GitHub stages existing local history without rereading source conversations', async () => {
+  const f = fixture({ ids: ['one', 'two'], github: { repository: 'owner/repo', token: 'token', enabled: false } });
+  await complete(f);
+  const details = f.calls.details;
+  await f.service.command({ type: 'collector:github-config', enabled: true, lfsEnabled: false }, 1);
+  await f.service.pump();
+  assert.equal(f.calls.uploads.length, 1); assert.equal(f.calls.uploads[0].bundles.length, 2);
+  assert.equal(f.calls.details, details);
+  assert.equal(f.store.get(`githubStatus:${accountKey}`).needsBackfill, false);
+});
+
+test('manual-only backup retains its intent while local queue preparation waits for retry', async () => {
+  const f = fixture({ github: { repository: 'owner/repo', token: 'token', enabled: false } });
+  const read = f.dependencies.readConversationArchive; let failOnce = true;
+  f.dependencies.readConversationArchive = async (...args) => {
+    if (failOnce) { failOnce = false; throw issue('LOCAL_PENDING'); }
+    return read(...args);
+  };
+  f.service = createCollectorService(f.dependencies);
+  await complete(f); f.tabs.length = 0;
+  await f.service.command({ type: 'collector:retry-github' });
+  const waiting = f.store.get(`githubStatus:${accountKey}`);
+  assert.equal(waiting.backfill.status, 'waiting'); assert.equal(waiting.manual, true);
+  assert.equal(f.calls.uploads.length, 0);
+  await f.service.pump(); assert.equal(f.calls.uploads.length, 0);
+  f.advance(60_001); await f.service.pump();
+  assert.equal(f.calls.uploads.length, 1);
+  assert.equal(f.store.get(`githubStatus:${accountKey}`).manual, false);
+  assert.equal(f.config().github.enabled, false);
+});
+
+test('auto upload does not implicitly start remote restoration', async () => {
+  const f = fixture({ config: { accounts: {} }, github: { enabled: true, autoRestore: false, repository: 'owner/repo', token: 'token' } });
+  let started = 0, restored = 0;
+  f.dependencies.restoreService = { state: async () => ({ status: 'idle' }), start: async () => { started++; }, tick: async () => { restored++; } };
+  f.service = createCollectorService(f.dependencies);
+  await f.service.pump();
+  assert.equal(started, 0); assert.equal(restored, 0);
+});
+
+test('manual local repair works without a source login and keeps automatic attachment download disabled', async () => {
+  const f = fixture({ config: { localAssetsEnabled: false } }), calls = [];
+  f.tabs.length = 0; f.permissions.delete(site);
+  f.dependencies.maintenanceService = {
+    start: async input => { calls.push(['start', input.account.accountKey]); },
+    tick: async input => { calls.push(['tick', input.account.accountKey]); return { runnable: false }; },
+    state: async () => ({ status: 'idle' }),
+  };
+  f.dependencies.assetService = { requestMissing: async input => { calls.push(['missing', input.account.accountKey]); } };
+  f.service = createCollectorService(f.dependencies);
+  await f.service.command({ type: 'collector:repair-local' });
+  await f.service.pump();
+  assert.deepEqual(calls, [['start', accountKey], ['missing', accountKey], ['tick', accountKey]]);
+  assert.equal(f.config().localAssetsEnabled, false);
+});
+
+test('source rate limit gates manual attachment work with a separate network condition', async () => {
+  const f = fixture(), requests = [];
+  f.dependencies.adapter.detail = async () => { throw Object.assign(issue('HTTP_429'), { retryAfterMs: 600_000 }); };
+  f.dependencies.assetService = { tick: async input => { requests.push(input); return { runnable: false }; } };
+  f.service = createCollectorService(f.dependencies);
+  await f.service.pump(); await f.service.pump(); await f.service.pump();
+  assert.equal(requests.at(-1).captureEnabled, true);
+  assert.equal(requests.at(-1).networkAllowed, false);
+});
+
+test('pause cancels the active source request before waiting for its account lock', async () => {
+  const f = fixture(), began = deferred(), blocked = deferred(); let cancelled = 0;
+  f.dependencies.adapter.detail = async () => { began.resolve(); await blocked.promise; throw issue('COLLECTION_PAUSED'); };
+  f.dependencies.adapter.cancel = (tabId, request) => {
+    assert.equal(tabId, 1); assert.equal(request.accountKey, accountKey); cancelled++; blocked.resolve();
+  };
+  await f.service.pump(); await f.service.pump();
+  const running = f.service.pump(); await began.promise;
+  await f.service.command({ type: 'collector:pause' }, 1); await running;
+  assert.equal(cancelled, 1); assert.equal(f.calls.saves.length, 0);
+  assert.equal((await f.service.engine.getState(accountKey)).status, 'paused');
+});
+
+const sourceInterruptions = [
+  { name: 'tab closure', code: 'SOURCE_UNAVAILABLE',
+    interrupt: async f => { f.tabs.splice(0); await f.service.tabGone(1); },
+    recover: async f => { f.tabs.push({ id: 1, url: 'https://chatgpt.com/', active: true }); } },
+  { name: 'permission revocation', code: 'SITE_PERMISSION_DENIED',
+    interrupt: async f => { f.permissions.delete(site); await f.service.initialize(); },
+    recover: async f => { f.permissions.add(site); await f.service.initialize(); } },
+  { name: 'expired login', code: 'HTTP_401',
+    interrupt: async f => {
+      f.identities.delete(1);
+      await assert.rejects(f.service.identify(f.tabs[0], true), error => error.code === 'HTTP_401');
+    },
+    recover: async f => { f.identities.set(1, { platform: 'chatgpt', accountKey, displayName: 'Demo' }); } },
+];
+
+for (const interruption of sourceInterruptions) {
+  test(`${interruption.name} cancels an active read and automatically resumes after source recovery`, { timeout: 5000 }, async () => {
+    const f = fixture(), began = deferred(), aborted = deferred(); let cancelled = 0;
+    const original = f.dependencies.adapter.detail;
+    f.dependencies.adapter.detail = async () => { began.resolve(); await aborted.promise; throw issue('COLLECTION_PAUSED'); };
+    f.dependencies.adapter.cancel = (tabId, request) => {
+      assert.equal(tabId, 1); assert.equal(request.accountKey, accountKey); cancelled++; aborted.resolve();
+    };
+    await f.service.pump(); await f.service.pump();
+    const running = f.service.pump(); await began.promise;
+    await interruption.interrupt(f); await running;
+    const job = await f.service.engine.getState(accountKey);
+    assert.equal(cancelled, 1); assert.equal(job.status, 'blocked');
+    assert.equal(job.error.code, interruption.code); assert.equal(job.failed, 0);
+    assert.equal(job.diagnostics.items[0].attempt, 0); assert.equal(f.calls.saves.length, 0);
+    f.dependencies.adapter.detail = original;
+    await interruption.recover(f);
+    assert.equal((await complete(f)).status, 'completed');
+    assert.equal(f.calls.details, 1); assert.equal(f.calls.saves.length, 1);
+  });
+
+  test(`${interruption.name} preserves an explicit user pause after source recovery`, async () => {
+    const f = fixture();
+    await f.service.pump(); await f.service.pump();
+    await f.service.command({ type: 'collector:pause' }, 1);
+    await interruption.interrupt(f);
+    assert.equal((await f.service.engine.getState(accountKey)).status, 'paused');
+    await interruption.recover(f); await f.service.pump();
+    assert.equal((await f.service.engine.getState(accountKey)).status, 'paused');
+    assert.equal(f.calls.details, 0); assert.equal(f.calls.saves.length, 0);
+  });
+}
+
+test('a user pause racing with tab interruption remains paused after reopening', { timeout: 5000 }, async () => {
+  const f = fixture(), began = deferred(), aborted = deferred(); let userPause;
+  const original = f.dependencies.adapter.detail;
+  f.dependencies.adapter.detail = async () => { began.resolve(); await aborted.promise; throw issue('COLLECTION_PAUSED'); };
+  f.dependencies.adapter.cancel = () => {
+    // The source event already observed running, but a user pause arrives before
+    // the canceled reader releases the account lock.
+    userPause = f.service.engine.pause(accountKey); aborted.resolve();
+  };
+  await f.service.pump(); await f.service.pump();
+  const running = f.service.pump(); await began.promise;
+  f.tabs.splice(0); await f.service.tabGone(1); await running; await userPause;
+  assert.equal((await f.service.engine.getState(accountKey)).status, 'paused');
+  f.dependencies.adapter.detail = original;
+  f.tabs.push({ id: 1, url: 'https://chatgpt.com/', active: true }); await f.service.pump();
+  assert.equal((await f.service.engine.getState(accountKey)).status, 'paused');
+  assert.equal(f.calls.saves.length, 0);
+});
+
+test('a slow account does not block another account from advancing its collection', async () => {
+  const otherKey = 'acct-' + 'b'.repeat(24), f = fixture(), began = deferred(), release = deferred();
+  f.config().accounts[otherKey] = { ...account, accountKey: otherKey, storageKey: otherKey };
+  f.tabs.push({ id: 2, url: 'https://chatgpt.com/c/other', active: false });
+  f.identities.set(2, { platform: 'chatgpt', accountKey: otherKey });
+  const original = f.dependencies.adapter.detail;
+  let otherDetails = 0;
+  f.dependencies.adapter.detail = async (id, request) => {
+    if (id === 1) { began.resolve(); await release.promise; }
+    else { otherDetails++; throw issue('HTTP_404'); }
+    return original(id, request);
+  };
+  await f.service.pump(); await f.service.pump();
+  const running = f.service.pump(); await began.promise;
+  for (let n = 0; n < 20 && !otherDetails; n++) await turn();
+  assert.equal(otherDetails, 1);
+  release.resolve(); await running;
 });

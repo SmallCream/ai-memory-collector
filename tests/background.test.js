@@ -50,6 +50,7 @@ function background({ command, open } = {}) {
     getSetting: noop, setSetting: noop, createCollectorEngine: noop,
     createChatGPTAssetResolver: () => ({ resolve: noop }),
     createAssetService: () => ({ save: noop, hydrateAssets: noop }), createRestoreService: () => ({}),
+    createLocalMaintenance: () => ({}), readConversationArchive: noop, repairMissingMarkdown: noop,
     fetchRepositorySnapshot: noop, downloadRepositoryFile: noop,
     readAccountManifest: noop, hasConversationFiles: noop, readConversationBaseline: noop,
     saveConversation: noop, applyRemoteFiles: noop, syncArchives: noop, probeRepository: noop });

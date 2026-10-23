@@ -4,13 +4,26 @@ export async function probeChatGPT(request) {
   // Only failures created here may expose codes, messages or reasons. Native
   // DOMExceptions carry numeric codes (AbortError uses 20), not our protocol.
   const failures = new WeakMap();
-  const fail = (code, message, reason) => {
+  const fail = (code, message, reason, retryAfterMs) => {
     const error = new Error(message);
-    failures.set(error, { code, message, ...(reason ? { reason } : {}) });
+    failures.set(error, { code, message, ...(reason ? { reason } : {}),
+      ...(Number.isFinite(retryAfterMs) ? { retryAfterMs } : {}) });
     throw error;
   };
   const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
   const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
+  let registry, scope;
+  const requestId = typeof request?.requestId === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(request.requestId) ? request.requestId : null;
+  const checkCancelled = () => { if (scope?.cancelled) fail('COLLECTION_PAUSED', '采集已暂停，未完成的网络结果不会写入归档。'); };
+  function retryAfter(response) {
+    if (![429, 503].includes(response.status)) return undefined;
+    const raw = response.headers.get('retry-after');
+    if (typeof raw !== 'string' || raw.length > 100) return undefined;
+    const value = raw.trim();
+    const milliseconds = /^\d+$/.test(value) ? Number(value) * 1000 :
+      /^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(value) ? Date.parse(value) - Date.now() : NaN;
+    return Number.isFinite(milliseconds) ? Math.min(86_400_000, Math.max(0, Math.ceil(milliseconds))) : undefined;
+  }
   // Keep this serialized copy identical to message-generation.js; parity is tested.
   function inspectMessageGeneration(native) {
     const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -102,13 +115,25 @@ export async function probeChatGPT(request) {
     if (request.requireComplete !== undefined && typeof request.requireComplete !== 'boolean') {
       fail('REQUEST', '详情完整度检查参数无效。');
     }
+    if (request.requestId !== undefined && !requestId) fail('REQUEST', '采集请求标识无效。');
+    if (requestId) {
+      const key = '__aiMemoryCollectorRequestsV1';
+      registry = globalThis[key] instanceof Map ? globalThis[key] : (globalThis[key] = new Map());
+      scope = { accountKey: request.expectedAccountKey || null, createdAt: Date.now(),
+        cancelled: registry.get(requestId)?.cancelled === true, controller: null };
+      registry.set(requestId, scope);
+      checkCancelled();
+    }
     async function getJSON(path, token, timeoutMs = 20000) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
+      if (scope) scope.controller = controller;
       const checkDeadline = () => {
+        checkCancelled();
         if (controller.signal.aborted) fail('TIMEOUT', '请求超时，请稍后重试。');
       };
       try {
+        checkDeadline();
         const response = await fetch(path, {
           method: 'GET', credentials: 'include', cache: 'no-store', redirect: 'error',
           headers: token ? { Accept: 'application/json', Authorization: `Bearer ${token}` } : { Accept: 'application/json' },
@@ -120,7 +145,7 @@ export async function probeChatGPT(request) {
           fail(`HTTP_${status}`, status === 429 ? '平台限流，任务会保留进度，稍后重试。' :
             status === 401 ? '登录已失效，请在网站重新登录。' :
             status === 403 ? '网站拒绝访问或需要验证，请回到网站处理。' :
-            status === 404 ? '此接口或对话不可访问；不代表对话已删除。' : `读取失败（HTTP ${status}）。`);
+            status === 404 ? '此接口或对话不可访问；不代表对话已删除。' : `读取失败（HTTP ${status}）。`, undefined, retryAfter(response));
         }
         const contentType = response.headers.get('content-type') || '';
         if (!contentType.includes('application/json')) fail('FORMAT', '网站没有返回 JSON，可能需要登录或完成验证。');
@@ -149,7 +174,7 @@ export async function probeChatGPT(request) {
         // request's own signal still proves that its deadline has expired.
         if (!failures.has(error)) checkDeadline();
         throw error;
-      } finally { clearTimeout(timer); }
+      } finally { clearTimeout(timer); if (scope?.controller === controller) scope.controller = null; }
     }
     async function session() {
       const payload = await getJSON('/api/auth/session');
@@ -309,5 +334,5 @@ export async function probeChatGPT(request) {
     const timeout = error?.name === 'AbortError' || error?.name === 'TimeoutError';
     return { ok: false, error: { code: timeout ? 'TIMEOUT' : 'NETWORK',
       message: timeout ? '请求超时，请稍后重试。' : '请求未完成，请检查网站登录状态和网络。' } };
-  }
+  } finally { if (registry && registry.get(requestId) === scope) registry.delete(requestId); }
 }

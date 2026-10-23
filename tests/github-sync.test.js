@@ -423,6 +423,51 @@ async function pictureBundle({ assets = [IMAGE], time = 100, text = 'Screenshot'
   return { accountKey: ACCOUNT, files: built.files, manifest: built.manifest, entry: built.manifest.conversations.picture };
 }
 
+test('text-only cloud backup saves conversations without LFS pointers or changing the local bundle', async () => {
+  const b = await pictureBundle(), before = structuredClone(b), server = gitServer();
+  const result = await syncArchives({ config: { ...CONFIG, lfsEnabled: false }, bundles: [b], fetchImpl: server.fetchImpl });
+  assert.equal(result.status, 'synced');
+  assert.equal(server.files()[b.entry.jsonPath], b.files[0].content);
+  assert.equal(server.files()[b.entry.markdownPath], b.files[1].content);
+  assert.equal(server.files()[IMAGE.localPath], undefined);
+  assert.equal(server.files()[ATTRIBUTES], undefined);
+  const asset = JSON.parse(server.files()[MANIFEST]).conversations.picture.assets[0];
+  assert.equal(asset.cloudStatus, 'local-only'); assert.equal(asset.oid, IMAGE.oid);
+  assert.deepEqual(b, before);
+  const replay = await syncArchives({ config: { ...CONFIG, lfsEnabled: false }, bundles: [b], fetchImpl: server.fetchImpl });
+  assert.equal(replay.status, 'unchanged');
+  assert.equal(replay.remoteWinners[0].entry.assets[0].cloudStatus, 'local-only');
+});
+
+test('text-only upload preserves verified remote attachments and rejects mismatched pointers', async () => {
+  const b = await pictureBundle();
+  const server = gitServer({ initial: { ...fileMap(b), [IMAGE.localPath]: formatLfsPointer(IMAGE), [ATTRIBUTES]: RULE } });
+  const result = await syncArchives({ config: { ...CONFIG, lfsEnabled: false }, bundles: [b], fetchImpl: server.fetchImpl });
+  assert.equal(result.status, 'unchanged');
+  assert.equal(server.files()[IMAGE.localPath], formatLfsPointer(IMAGE));
+  assert.equal(JSON.parse(server.files()[MANIFEST]).conversations.picture.assets[0].cloudStatus, undefined);
+  const bad = gitServer({ initial: { [IMAGE.localPath]: 'unrelated user-owned file' } });
+  await assert.rejects(syncArchives({ config: { ...CONFIG, lfsEnabled: false }, bundles: [b], fetchImpl: bad.fetchImpl }),
+    { code: 'ASSET_IMMUTABLE_CONFLICT' });
+  assert.ok(bad.calls.every(call => call.method === 'GET'));
+});
+
+test('enabling attachment backup upgrades an earlier text-only manifest without changing native history', async () => {
+  const b = await pictureBundle(), server = gitServer();
+  await syncArchives({ config: { ...CONFIG, lfsEnabled: false }, bundles: [b], fetchImpl: server.fetchImpl });
+  await syncArchives({ config: { ...CONFIG, lfsEnabled: true }, bundles: [b], assetPointers: [pointer(IMAGE)], fetchImpl: server.fetchImpl });
+  assert.equal(server.files()[IMAGE.localPath], formatLfsPointer(IMAGE));
+  assert.equal(server.files()[b.entry.jsonPath], b.files[0].content);
+  assert.equal(JSON.parse(server.files()[MANIFEST]).conversations.picture.assets[0].cloudStatus, undefined);
+});
+
+test('a disabled attachment scope cannot submit supplied pointers', async () => {
+  const b = await pictureBundle(), server = gitServer();
+  await assert.rejects(syncArchives({ config: { ...CONFIG, lfsEnabled: false }, bundles: [b], assetPointers: [pointer(IMAGE)], fetchImpl: server.fetchImpl }),
+    { code: 'ASSET_UPLOAD_DISABLED' });
+  assert.equal(server.calls.length, 0);
+});
+
 async function downloadableBundle(extension = 'zip', downloaded = true) {
   const initial = bundle('downloadable'), native = JSON.parse(initial.files[0].content);
   const fileName = `report.${extension}`;
@@ -747,4 +792,87 @@ test('nested attributes rules that can override account LFS tracking are preserv
   await assert.rejects(syncArchives({ config: CONFIG, bundles: [b], assetPointers: [pointer(IMAGE)], fetchImpl: server.fetchImpl }), { code: 'LFS_ATTRIBUTES_CONFLICT' });
   assert.equal(server.files()[nested], '*.png -filter\n');
   assert.ok(server.calls.every(call => call.method === 'GET'));
+});
+
+test('turning off or changing the sync target during remote reads stops every later write', async () => {
+  const b = bundle(), server = gitServer(); let current = true;
+  const fetchImpl = async (url, options) => {
+    const response = await server.fetchImpl(url, options);
+    if (options.method === 'GET' && new URL(url).pathname.includes('/git/trees/')) current = false;
+    return response;
+  };
+  await assert.rejects(syncArchives({ config: CONFIG, bundles: [b], fetchImpl, isCurrent: async () => current }),
+    { code: 'GITHUB_TARGET_CHANGED' });
+  assert.ok(server.calls.every(call => call.method === 'GET'));
+  assert.deepEqual(server.files(), {});
+});
+
+test('settings changes while tree or commit responses are pending stop the next write boundary', async () => {
+  for (const afterPath of ['/git/trees', '/git/commits']) {
+    const b = bundle(), server = gitServer(); let current = true;
+    const fetchImpl = async (url, options) => {
+      const response = await server.fetchImpl(url, options);
+      if (options.method === 'POST' && new URL(url).pathname.endsWith(afterPath)) {
+        const read = response.json.bind(response);
+        response.json = async () => { const data = await read(); current = false; return data; };
+      }
+      return response;
+    };
+    await assert.rejects(syncArchives({ config: CONFIG, bundles: [b], fetchImpl, isCurrent: async () => current }),
+      { code: 'GITHUB_TARGET_CHANGED' });
+    const writes = server.calls.filter(call => call.method !== 'GET');
+    assert.deepEqual(writes.map(call => call.path), afterPath === '/git/trees' ? ['/git/trees'] : ['/git/trees', '/git/commits']);
+    assert.deepEqual(server.files(), {}, 'unreferenced objects must not advance the branch');
+  }
+});
+
+test('nested empty-repository initialization rechecks settings after its internal GET before PUT', async () => {
+  const b = bundle(), server = gitServer({ empty: true }); let current = true, branchReads = 0;
+  const fetchImpl = async (url, options) => {
+    const response = await server.fetchImpl(url, options);
+    if (options.method === 'GET' && new URL(url).pathname.endsWith('/branches') && ++branchReads === 2) current = false;
+    return response;
+  };
+  await assert.rejects(syncArchives({ config: CONFIG, bundles: [b], fetchImpl, isCurrent: async () => current }),
+    { code: 'GITHUB_TARGET_CHANGED' });
+  assert.equal(branchReads, 2, 'the change occurs inside commitProbe, after the outer empty-repository check');
+  assert.ok(server.calls.every(call => call.method === 'GET'));
+  assert.equal(server.head(), null);
+});
+
+test('a target change after a conflicting PATCH prevents a retry from writing to the old target', async () => {
+  let current = true;
+  const server = gitServer({ onPatch: ({ add }) => { add({ 'concurrent.txt': 'keep' }); current = false; } });
+  await assert.rejects(syncArchives({ config: CONFIG, bundles: [bundle()], fetchImpl: server.fetchImpl, isCurrent: async () => current }),
+    { code: 'GITHUB_TARGET_CHANGED' });
+  assert.equal(server.calls.filter(call => call.path === '/git/trees' && call.method === 'POST').length, 1);
+  assert.equal(server.calls.filter(call => call.method === 'PATCH').length, 1);
+  assert.deepEqual(server.files(), { 'concurrent.txt': 'keep' });
+});
+
+test('already-issued PATCH requests retain readback and lost-response verification after settings change', async () => {
+  for (const losePatchResponse of [false, true]) {
+    let current = true;
+    const b = bundle(), server = gitServer({ losePatchResponse, onPatch: () => { current = false; } });
+    const result = await syncArchives({ config: CONFIG, bundles: [b], fetchImpl: server.fetchImpl, isCurrent: async () => current });
+    assert.equal(result.status, 'synced');
+    assert.equal(server.files()[b.entry.jsonPath], b.files[0].content);
+    const patchIndex = server.calls.findIndex(call => call.method === 'PATCH');
+    assert.ok(patchIndex > 0);
+    assert.ok(server.calls.slice(patchIndex + 1).length > 0);
+    assert.ok(server.calls.slice(patchIndex + 1).every(call => call.method === 'GET'));
+    assert.equal(server.calls.filter(call => call.method === 'PATCH').length, 1);
+  }
+});
+
+test('missing current authorization and config-read errors fail closed without requests or private error text', async () => {
+  for (const isCurrent of [async () => false, async () => undefined, async () => { throw new Error('private-token-secret'); }]) {
+    const server = gitServer();
+    await assert.rejects(syncArchives({ config: CONFIG, bundles: [bundle()], fetchImpl: server.fetchImpl, isCurrent }), error => {
+      assert.equal(error.code, 'GITHUB_TARGET_CHANGED');
+      assert.doesNotMatch(error.message, /private|token|secret/);
+      return true;
+    });
+    assert.equal(server.calls.length, 0);
+  }
 });

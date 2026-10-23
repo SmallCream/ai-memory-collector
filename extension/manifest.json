@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "AI Memory Collector",
-  "version": "0.3.16",
-  "description": "按账号采集 ChatGPT 对话与附件，保存 JSON、Markdown，同步到私有 GitHub 并恢复本地备份。",
+  "version": "0.3.17",
+  "description": "按账号自动备份 ChatGPT 对话、图片和附件到本地，支持增量采集、缺失补齐及可选私有 GitHub 同步。",
   "minimum_chrome_version": "120",
   "permissions": ["scripting", "sidePanel", "alarms", "activeTab"],
   "optional_host_permissions": [

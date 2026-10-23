@@ -13,7 +13,11 @@ const MAX_PAGES = 5_000;
 const MAX_ATTEMPTS = 3;
 const COPY = value => value == null ? value : structuredClone(value);
 const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
-const keys = accountKey => ({ job: `collectorJob:${accountKey}`, index: `collectorIndex:${accountKey}`, outbox: `collectorOutbox:${accountKey}` });
+const keys = accountKey => ({ job: `collectorJob:${accountKey}`, index: `collectorIndex:${accountKey}`, outbox: `collectorOutbox:${accountKey}`,
+  retry: `collectorRetry:${accountKey}`, localChanges: `collectorLocalChanges:${accountKey}` });
+const MAX_RETRY_AFTER = 24 * 60 * 60_000;
+const manualFailure = code => ['FORMAT', 'SIZE', 'ARCHIVE_FORMAT', 'ARCHIVE_SIZE'].includes(code);
+const sourceVersion = item => JSON.stringify([item.listUpdateTime ?? null, item.title || '']);
 const ERROR_MESSAGES = {
   ACCOUNT_CHANGED: '采集所用会话已切换账号，原任务已暂停。',
   IDENTITY: '无法确认登录身份，请在 ChatGPT 完成登录后继续。',
@@ -59,7 +63,11 @@ function fail(code, message = ERROR_MESSAGES[code] || '采集未完成，进度�
 
 function safeError(error) {
   const code = /^[A-Z][A-Z0-9_]{0,60}$/.test(error?.code || '') ? error.code : 'COLLECTION_FAILED';
-  return { code, ...sanitizeDetailFailure({ ...error, code }), message: detailFailureMessage({ ...error, code }) || ERROR_MESSAGES[code] || (code.startsWith('HTTP_5') ? '网站暂时不可用，已保留进度。' : '采集未完成，已有归档和进度已保留。') };
+  const retryAfterMs = Number.isFinite(error?.retryAfterMs) && error.retryAfterMs >= 0
+    ? Math.min(MAX_RETRY_AFTER, Math.ceil(error.retryAfterMs)) : null;
+  return { code, ...sanitizeDetailFailure({ ...error, code }),
+    ...(['HTTP_429', 'HTTP_503'].includes(code) && retryAfterMs !== null ? { retryAfterMs } : {}),
+    message: detailFailureMessage({ ...error, code }) || ERROR_MESSAGES[code] || (code.startsWith('HTTP_5') ? '网站暂时不可用，已保留进度。' : '采集未完成，已有归档和进度已保留。') };
 }
 
 function transient(code) {
@@ -134,6 +142,8 @@ function queueDiagnostics(queue = []) {
       status: own(rank, item.status) ? item.status : 'pending',
       attempt: Number.isSafeInteger(item.attempts) && item.attempts >= 0 ? item.attempts : 0,
       nextRetryAt: diagnosticTime(item.nextRetryAt), code: item.error ? safeError(item.error).code : null,
+      ...(item.retryDisposition ? { retryDisposition: item.retryDisposition } : {}),
+      ...(Number.isSafeInteger(item.totalAttempts) ? { totalAttempts: item.totalAttempts } : {}),
       ...sanitizeDetailFailure(item.error),
     })) };
 }
@@ -162,6 +172,7 @@ function counts(job) {
   job.failed = job.queue.filter(item => item.status === 'failed' || item.status === 'retry').length;
   const times = job.queue.filter(item => item.status === 'retry').map(item => item.nextRetryAt);
   if (job.listRetryAt) times.push(job.listRetryAt);
+  if (job.accountCooldownUntil > (job.updatedAt || 0)) times.push(job.accountCooldownUntil);
   job.nextRetryAt = times.length ? Math.min(...times) : null;
 }
 
@@ -169,6 +180,7 @@ function counts(job) {
  * can be replaced by in-memory stores in deterministic restart/failure tests. */
 export function createCollectorEngine({ getSetting, setSetting, getDirectory, readAccountManifest,
   hasConversationFiles = async () => false, readConversationBaseline = async () => null,
+  shouldQueueUpload = async () => true,
   adapter, saveConversation, now = Date.now, onChange = () => {},
   makeId = () => crypto.randomUUID() } = {}) {
   for (const dependency of [getSetting, setSetting, getDirectory, readAccountManifest, saveConversation]) {
@@ -195,8 +207,8 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
   }
 
   async function publish(job) {
-    counts(job);
     job.updatedAt = now();
+    counts(job);
     await store(keys(job.accountKey).job, job);
     try { await onChange(stateOf(job)); } catch { /* UI notification is not the checkpoint. */ }
     return stateOf(job);
@@ -219,10 +231,82 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
     });
   }
 
+  async function retryLedger(account) {
+    const saved = await getSetting(keys(account.accountKey).retry);
+    if (saved?.schemaVersion === 1 && saved.accountKey === account.accountKey && saved.storageKey === account.storageKey &&
+        saved.items && typeof saved.items === 'object' && !Array.isArray(saved.items)) return saved;
+    return { schemaVersion: 1, accountKey: account.accountKey, storageKey: account.storageKey,
+      items: {}, listing: null, accountCooldownUntil: 0 };
+  }
+
+  async function persistRetry(account, ledger) { await store(keys(account.accountKey).retry, ledger); }
+
+  async function applyRetryPolicy(job, account, item) {
+    const ledger = await retryLedger(account), previous = own(ledger.items, item.id) ? ledger.items[item.id] : null;
+    if (!previous) return;
+    if (job.mode === 'full' || previous.version !== sourceVersion(item)) {
+      delete ledger.items[item.id]; await persistRetry(account, ledger); return;
+    }
+    item.totalAttempts = previous.totalAttempts || 0;
+    if (previous.manualOnly || previous.nextRetryAt > now()) {
+      // Deferred items do not keep a whole scan running: newer IDs still get
+      // collected, then the account can discover updates on its next scan.
+      item.status = 'failed'; item.error = safeError(previous.error);
+      item.nextRetryAt = previous.manualOnly ? null : previous.nextRetryAt;
+      item.retryDisposition = previous.manualOnly ? 'manual' : 'cooldown';
+    }
+  }
+
+  async function rememberFailure(job, item, info, attempts) {
+    const ledger = await retryLedger(job), id = item?.id;
+    const previous = id ? (own(ledger.items, id) ? ledger.items[id] : null) : ledger.listing;
+    const same = previous && (!item || previous.version === sourceVersion(item));
+    const totalAttempts = (same ? previous.totalAttempts || 0 : 0) + 1;
+    const shortDelay = Math.min(15 * 60_000, 60_000 * 2 ** (attempts - 1));
+    const longDelay = info.code === 'HTTP_404' ? MAX_RETRY_AFTER :
+      Math.min(MAX_RETRY_AFTER, 30 * 60_000 * 2 ** Math.min(6, Math.max(0, Math.floor((totalAttempts - 3) / 3))));
+    const canRetry = transient(info.code) && attempts < MAX_ATTEMPTS;
+    const nextRetryAt = now() + Math.max(canRetry ? shortDelay : longDelay, info.retryAfterMs || 0);
+    const record = { ...(item ? { version: sourceVersion(item) } : {}), totalAttempts,
+      manualOnly: manualFailure(info.code), nextRetryAt, error: info, lastFailedAt: now() };
+    if (id) Object.defineProperty(ledger.items, id, { enumerable: true, writable: true, configurable: true, value: record });
+    else ledger.listing = record;
+    if (info.code === 'HTTP_429' || info.code === 'HTTP_503' && info.retryAfterMs !== undefined) {
+      ledger.accountCooldownUntil = Math.max(ledger.accountCooldownUntil || 0, nextRetryAt);
+    }
+    job.accountCooldownUntil = ledger.accountCooldownUntil || 0;
+    await persistRetry(job, ledger);
+    return { nextRetryAt, totalAttempts, canRetry, manualOnly: record.manualOnly };
+  }
+
+  async function clearFailure(account, id) {
+    const ledger = await retryLedger(account);
+    if (id ? !own(ledger.items, id) : !ledger.listing) return;
+    if (id) delete ledger.items[id]; else ledger.listing = null;
+    await persistRetry(account, ledger);
+  }
+
+  async function recordLocalChange(account, item, files) {
+    const key = keys(account.accountKey).localChanges;
+    const before = await getSetting(key);
+    const items = before?.schemaVersion === 1 && before.accountKey === account.accountKey && before.storageKey === account.storageKey
+      ? before.items || {} : {};
+    const file = files.find(value => value.path.endsWith('/archive/manifest.json'));
+    let entry;
+    try { entry = file ? JSON.parse(file.content).conversations?.[item.id] : null; } catch { throw fail('STORAGE'); }
+    if (!entry) throw fail('STORAGE');
+    // Only identifiers/hashes are retained. Enabling cloud backup rebuilds the
+    // immutable upload bundle from the verified local files.
+    Object.defineProperty(items, item.id, { enumerable: true, configurable: true, writable: true,
+      value: { contentHash: entry.contentHash, markdownHash: entry.markdownHash || null, updatedAt: now() } });
+    await store(key, { schemaVersion: 1, accountKey: account.accountKey, storageKey: account.storageKey, items });
+  }
+
   async function createJob(account, tabId, mode, previousJob = null) {
     pauseRequests.delete(account.accountKey);
     const directory = await directoryFor(account);
-    await verify(account, tabId);
+    const ledger = await retryLedger(account);
+    if (!(ledger.accountCooldownUntil > now())) await verify(account, tabId);
     const manifest = await readAccountManifest(directory, account);
     const index = await getSetting(keys(account.accountKey).index);
     const indexed = index?.schemaVersion === 1 && index.accountKey === account.accountKey && index.storageKey === account.storageKey
@@ -243,7 +327,14 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
       discovered: 0, processed: 0, added: 0, updated: 0, unchanged: 0, failed: 0, skipped: 0,
       total: null, queue: [], known: COPY(known), manifestIds, unfinishedIds: unfinished, enumerationComplete: false,
       initializedComplete: false, listAttempts: 0, listRetryAt: null, nextRetryAt: null, error: null,
+      accountCooldownUntil: ledger.accountCooldownUntil || 0,
     };
+    if (mode === 'full' && ledger.listing) { ledger.listing = null; await persistRetry(account, ledger); }
+    if (ledger.listing && mode !== 'full') {
+      if (ledger.listing.manualOnly) {
+        job.status = 'partial'; job.completedAt = now(); job.error = safeError(ledger.listing.error);
+      } else if (ledger.listing.nextRetryAt > now()) job.listRetryAt = ledger.listing.nextRetryAt;
+    }
     return publish(job);
   }
 
@@ -272,6 +363,8 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
     const restartDiscovery = !job.enumerationComplete && ['ENUMERATION_INCOMPLETE', 'PAGINATION_STALLED', 'PAGINATION_CHANGED'].includes(job.error?.code);
     job.status = 'running'; job.error = null; job.completedAt = null;
     job.listAttempts = 0; job.listRetryAt = null;
+    const ledger = await retryLedger(job);
+    ledger.listing = null;
     job.phase = job.enumerationComplete ? 'details' : 'list';
     if (restartDiscovery) {
       // A moving, update-sorted list may have skipped an earlier page. A new
@@ -281,8 +374,12 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
     for (const item of job.queue) {
       if (item.status === 'failed' || item.status === 'retry') {
         item.status = 'pending'; item.attempts = 0; item.nextRetryAt = null; item.error = null;
+        delete item.retryDisposition; delete item.totalAttempts; delete ledger.items[item.id];
       }
     }
+    // Manual retry may reactivate a source, but cannot bypass server throttling.
+    job.accountCooldownUntil = ledger.accountCooldownUntil || 0;
+    await persistRetry(job, ledger);
     return publish(job);
   }
 
@@ -309,14 +406,16 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
       return publish(job);
     }
     const attempts = item ? ++item.attempts : ++job.listAttempts;
-    const retryAt = now() + Math.min(15 * 60_000, 60_000 * 2 ** (attempts - 1));
+    const retry = await rememberFailure(job, item, info, attempts);
     if (item) {
       item.error = info;
-      item.status = transient(info.code) && attempts < MAX_ATTEMPTS ? 'retry' : 'failed';
-      item.nextRetryAt = item.status === 'retry' ? retryAt : null;
+      item.totalAttempts = retry.totalAttempts;
+      item.status = retry.canRetry ? 'retry' : 'failed';
+      item.nextRetryAt = retry.manualOnly ? null : retry.nextRetryAt;
+      item.retryDisposition = retry.manualOnly ? 'manual' : retry.canRetry ? 'automatic' : 'cooldown';
       return publish(job);
     }
-    if (transient(info.code) && attempts < MAX_ATTEMPTS) job.listRetryAt = retryAt;
+    if (retry.canRetry) job.listRetryAt = retry.nextRetryAt;
     else { job.status = 'partial'; job.completedAt = now(); job.initializedComplete = false; }
     return publish(job);
   }
@@ -344,6 +443,9 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
           seenItem.listUpdateTime = updated === null || seenItem.listUpdateTime === null
             ? null : Math.max(updated, seenItem.listUpdateTime);
           seenItem.title = title;
+          seenItem.attempts = 0; seenItem.nextRetryAt = null; seenItem.error = null;
+          delete seenItem.retryDisposition; delete seenItem.totalAttempts;
+          await applyRetryPolicy(job, account, seenItem);
         }
         continue;
       }
@@ -352,6 +454,7 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
         listUpdateTime: updated, status: 'pending', attempts: 0, nextRetryAt: null, error: null };
       const skip = await canSkip(job, account, directory, item);
       if (skip) item.status = 'skipped';
+      else await applyRetryPolicy(job, account, item);
       job.queue.push(item); seen.set(source.id, item);
       if (skip) job.skipped++;
     }
@@ -359,6 +462,7 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
     job.discovered = job.queue.length; job.pages++;
     if (Number.isSafeInteger(page.total) && page.total >= 0) job.total = page.total;
     job.listAttempts = 0; job.listRetryAt = null; job.error = null;
+    await clearFailure(account);
     if (page.nextOffset === null) {
       if (job.total !== null && job.discovered < job.total) throw fail('ENUMERATION_INCOMPLETE');
       job.enumerationComplete = true; job.phase = 'details';
@@ -366,7 +470,10 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
     return publish(job);
   }
 
-  async function appendOutbox(account, item, files) {
+  async function appendOutbox(account, item, files, { forceUpload = false } = {}) {
+    if (!forceUpload && !await shouldQueueUpload(account)) {
+      await recordLocalChange(account, item, files); return;
+    }
     const key = keys(account.accountKey).outbox;
     const previous = await getSetting(key);
     const state = outboxState(previous);
@@ -400,6 +507,12 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
     // It cannot erase a later version queued while an older upload was in flight.
     await store(key, { schemaVersion: 1, accountKey: account.accountKey,
       bundles: [...state.bundles.filter(entry => entry.conversationId !== item.id), bundle], sharedFiles: [...shared.values()] });
+    const changes = await getSetting(keys(account.accountKey).localChanges);
+    const dirty = changes?.schemaVersion === 1 && changes.accountKey === account.accountKey &&
+      changes.storageKey === account.storageKey && own(changes.items || {}, item.id) && changes.items[item.id];
+    if (dirty && dirty.contentHash === manifestEntry?.contentHash && dirty.markdownHash === (manifestEntry?.markdownHash || null)) {
+      delete changes.items[item.id]; await store(keys(account.accountKey).localChanges, changes);
+    }
   }
 
   function sharedPath(path) { return path.endsWith('/archive/manifest.json') || path.endsWith('/account.json'); }
@@ -421,6 +534,20 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
       bundles.push({ ...entry, files, manifestEntry });
     }
     return { schemaVersion: 1, bundles, sharedFiles: [...shared.values()] };
+  }
+
+  async function deliverableOutbox(accountKey) {
+    const state = outboxState(await getSetting(keys(accountKey).outbox));
+    const changes = await getSetting(keys(accountKey).localChanges);
+    if (changes?.schemaVersion !== 1 || changes.accountKey !== accountKey) return state;
+    return { ...state, bundles: state.bundles.filter(bundle => {
+      const dirty = bundle.storageKey === changes.storageKey && own(changes.items || {}, bundle.conversationId) && changes.items[bundle.conversationId];
+      // An old durable upload remains stored, but it must not race the newer
+      // local-only version when cloud backup is re-enabled. Backfill replaces
+      // it only after verifying and staging the current on-disk archive.
+      return !dirty || (dirty.contentHash === bundle.manifestEntry?.contentHash &&
+        dirty.markdownHash === (bundle.manifestEntry?.markdownHash || null));
+    }) };
   }
 
   async function detailStep(job, account, tabId, directory, item) {
@@ -468,6 +595,8 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
         value: { listUpdateTime: item.listUpdateTime, checkedAt: now(), contentHash: saved.entry?.contentHash || null } });
       await store(indexKey, { schemaVersion: 1, accountKey: account.accountKey, storageKey: account.storageKey, items });
       item.status = 'saved'; item.result = saved.status; item.error = null; item.nextRetryAt = null;
+      delete item.retryDisposition;
+      await clearFailure(account, item.id);
       job.unfinishedIds = (job.unfinishedIds || []).filter(id => id !== item.id);
       job.error = null;
       return publish(job);
@@ -496,6 +625,10 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
         const job = await load(account);
         if (!job || job.status !== 'running') return stateOf(job);
         if (pauseRequests.has(account.accountKey)) return handleError(job, fail('COLLECTION_PAUSED'));
+        const ledger = await retryLedger(account);
+        job.accountCooldownUntil = ledger.accountCooldownUntil || 0;
+        if (job.accountCooldownUntil > now()) return publish(job);
+        job.accountCooldownUntil = 0;
         if (job.listRetryAt && job.listRetryAt > now()) return stateOf(job);
         if (job.phase === 'details' && !job.queue.some(entry => entry.status === 'pending' || entry.status === 'retry' && entry.nextRetryAt <= now()) &&
             job.queue.some(entry => entry.status === 'retry')) return stateOf(job);
@@ -535,16 +668,24 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
         pauseRequests.delete(account.accountKey);
         const job = await load(account);
         if (!job) return createJob(account, tabId, account.initialized ? 'incremental' : 'initial');
-        try { await directoryFor(account); await verify(account, tabId); }
+        try {
+          await directoryFor(account);
+          if (!((await retryLedger(account)).accountCooldownUntil > now())) await verify(account, tabId);
+        }
         catch (error) { return handleError(job, error); }
         job.tabId = tabId; return resumeJob(job);
       });
     },
     async getState(accountKey) { return stateOf(await getSetting(keys(accountKey).job)); },
-    suspend(accountKey, code = 'SOURCE_UNAVAILABLE') {
+    suspend(accountKey, code = 'SOURCE_UNAVAILABLE', { interrupted = false } = {}) {
       return locked(accountKey, async () => {
         const job = await getSetting(keys(accountKey).job);
-        if (!job || job.status !== 'running') return stateOf(job);
+        // Cancelling an in-flight source read reports COLLECTION_PAUSED before
+        // this lock is acquired. Its original running state was observed by the
+        // caller, so classify that interruption as recoverable. A concurrent
+        // explicit user pause remains authoritative and must not auto-resume.
+        const sourceInterrupted = interrupted && job?.status === 'paused' && !pauseRequests.has(accountKey);
+        if (!job || job.status !== 'running' && !sourceInterrupted) return stateOf(job);
         job.status = 'blocked'; job.error = safeError(fail(code));
         return publish(job);
       });
@@ -553,12 +694,13 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
       return locked(accountKey, async () => {
         await store(keys(accountKey).index, null);
         await store(keys(accountKey).job, null);
+        await store(keys(accountKey).retry, null);
         try { await onChange(null); } catch { /* UI event only. */ }
         return null;
       });
     },
     async getOutboxSummary(accountKey) {
-      const state = outboxState(await getSetting(keys(accountKey).outbox));
+      const state = await deliverableOutbox(accountKey);
       return { total: state.bundles.length, items: state.bundles.slice(0, 50).map(bundle => ({
         conversationId: diagnosticId(bundle.conversationId),
         title: diagnosticLabel(bundle.manifestEntry?.title) || diagnosticLabel(bundle.conversationId) || '未命名对话',
@@ -566,7 +708,7 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
       })) };
     },
     async getOutbox(accountKey) {
-      const state = outboxState(await getSetting(keys(accountKey).outbox));
+      const state = await deliverableOutbox(accountKey);
       const headers = new Map(state.sharedFiles.filter(file => file.path.endsWith('/archive/manifest.json')).map(file => {
         const { conversations, ...header } = JSON.parse(file.content);
         return [file.path, header];
@@ -583,7 +725,7 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
           conversations: { [bundle.conversationId]: bundle.manifestEntry } }, null, 2) + '\n' };
       })] })));
     },
-    enqueueArchive({ account, archive }) {
+    enqueueArchive({ account, archive, forceUpload = false }) {
       validateAccount(account);
       return locked(account.accountKey, async () => {
         const id = archive?.entry?.conversationId;
@@ -595,8 +737,18 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
         const current = (await readAccountManifest(directory, account))?.conversations?.[id];
         if (current && ((current.contentHash && archive.entry.contentHash && current.contentHash !== archive.entry.contentHash) ||
             (current.markdownHash && archive.entry.markdownHash && current.markdownHash !== archive.entry.markdownHash))) return;
-        await appendOutbox(account, { id }, archive.files);
+        await appendOutbox(account, { id }, archive.files, { forceUpload });
       });
+    },
+    async getRetryState(accountKey) {
+      const ledger = await getSetting(keys(accountKey).retry);
+      const cooldownUntil = ledger?.schemaVersion === 1 && ledger.accountKey === accountKey
+        ? Math.max(0, Number(ledger.accountCooldownUntil) || 0) : 0;
+      return { accountCooldownUntil: cooldownUntil, cooldownUntil };
+    },
+    async getLocalChanges(accountKey) {
+      const state = await getSetting(keys(accountKey).localChanges);
+      return state?.schemaVersion === 1 && state.accountKey === accountKey ? COPY(state.items || {}) : {};
     },
     acknowledgeOutbox(accountKey, ids) {
       return locked(accountKey, async () => {

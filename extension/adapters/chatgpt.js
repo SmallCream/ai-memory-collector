@@ -1,12 +1,15 @@
 import { probeChatGPT } from '../lib/chatgpt.js';
 import { collectMessagePages, fullMessageSync } from '../lib/message-sync.js';
 import { sanitizeDetailFailure } from '../lib/detail-errors.js';
-import { waitForDetailRequest, DetailRequestTimeoutError } from '../lib/detail-request-lifetime.js';
+import { waitForDetailRequest, DetailRequestTimeoutError, CollectorRequestCancelledError,
+  createRequestControl, safeRetryAfter } from '../lib/detail-request-lifetime.js';
 
 export class AdapterError extends Error {
-  constructor(code, message, reason) {
+  constructor(code, message, reason, retryAfterMs) {
     super(message); this.name = 'AdapterError'; this.code = code;
     Object.assign(this, sanitizeDetailFailure({ code, reason }));
+    const delay = safeRetryAfter(code, retryAfterMs);
+    if (delay !== undefined) this.retryAfterMs = delay;
   }
 }
 
@@ -24,7 +27,10 @@ const record = value => value !== null && typeof value === 'object' && !Array.is
 
 /** Injectable Chrome dependency supports tests without a live logged-in account. */
 export function createChatGPTAdapter(browser, { now = Date.now, timers = globalThis } = {}) {
+  const requests = createRequestControl(() => browser ?? globalThis.chrome);
   async function run(tabId, request) {
+    return requests.run(tabId, request.expectedAccountKey, async scope => {
+    request = { ...request, requestId: scope.id };
     const api = browser ?? globalThis.chrome;
     if (!Number.isSafeInteger(tabId) || tabId < 0) throw new AdapterError('TAB_REQUIRED', '请打开已登录的 ChatGPT 标签页。');
     let tab;
@@ -35,12 +41,13 @@ export function createChatGPTAdapter(browser, { now = Date.now, timers = globalT
     }
     let results;
     try {
-      const execute = () => api.scripting.executeScript({ target: { tabId, frameIds: [0] }, world: 'ISOLATED',
-        func: probeChatGPT, args: [request] });
+      const execute = () => scope.race(() => api.scripting.executeScript({ target: { tabId, frameIds: [0] }, world: 'ISOLATED',
+        func: probeChatGPT, args: [request] }));
       results = request.kind === 'detail'
         ? await waitForDetailRequest(execute, { runtime: api.runtime, timers })
         : await execute();
     } catch (error) {
+      if (error instanceof CollectorRequestCancelledError) throw error;
       if (error instanceof DetailRequestTimeoutError) {
         await checkSourceAfterRead();
         throw new AdapterError('TIMEOUT', '详情读取等待超时，已保留进度，稍后重试。');
@@ -78,7 +85,7 @@ export function createChatGPTAdapter(browser, { now = Date.now, timers = globalT
       }
       const code = result.error.code;
       const message = typeof result?.error?.message === 'string' ? result.error.message : '未取得有效的采集结果，请稍后重试。';
-      throw new AdapterError(code, message, result?.error?.reason);
+      throw new AdapterError(code, message, result?.error?.reason, result?.error?.retryAfterMs);
     }
     if (!validIdentity(result.identity) ||
         (request.expectedAccountKey && result.identity.accountKey !== request.expectedAccountKey)) {
@@ -88,11 +95,13 @@ export function createChatGPTAdapter(browser, { now = Date.now, timers = globalT
     // old document finished a request after the tab navigated elsewhere.
     await checkSourceAfterRead();
     return result;
+    });
   }
   return Object.freeze({
     platform: 'chatgpt',
     origin: 'https://chatgpt.com',
     matches: isChatGPTUrl,
+    cancel: (tabId, options) => requests.cancel(tabId, options),
     async identify(tabId) { return (await run(tabId, { kind: 'identity' })).identity; },
     async list(tabId, { accountKey, offset = 0 } = {}) {
       const result = await run(tabId, { kind: 'list', expectedAccountKey: accountKey, offset });

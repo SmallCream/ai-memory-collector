@@ -250,7 +250,7 @@ test('unknown and changed timestamps remain eligible for incremental detail coll
 
 test('transient failures retain retry item while unrelated details finish; retry does not advance index', async () => {
   let rejectA = true;
-  const f = setup({ detailError: id => id === 'a' && rejectA ? 'HTTP_429' : null });
+  const f = setup({ detailError: id => id === 'a' && rejectA ? 'NETWORK' : null });
   await f.engine.start({ account, tabId: 1, mode: 'initial' });
   await f.engine.tick({ account, tabId: 1 });
   await f.engine.tick({ account, tabId: 1 });
@@ -471,7 +471,7 @@ test('collection details remain readable during actual list, detail and filesyst
 test('collection diagnostics expose bounded sanitized queue metadata and distinguish retry from terminal failure', async () => {
   const f = setup({ list: async () => ({ items: Array.from({ length: 65 }, (_, index) => ({
     ...source(`item-${index}`), title: `Title ${index} https://example.invalid/private?sig=secret github_pat_syntheticsecret`,
-  })), nextOffset: null, total: 65 }), detailError: id => id === 'item-0' ? 'HTTP_429' : 'HTTP_404' });
+  })), nextOffset: null, total: 65 }), detailError: id => id === 'item-0' ? 'NETWORK' : 'HTTP_404' });
   await f.engine.start({ account, tabId: 1, mode: 'initial' });
   await f.engine.tick({ account, tabId: 1 });
   await f.engine.tick({ account, tabId: 1 });
@@ -558,7 +558,7 @@ test('numeric seconds, milliseconds, numeric strings and ISO time share the same
   const f = setup({ list: async () => ({ items: [source('a', time)], nextOffset: null, total: 1 }) });
   await f.engine.start({ account, tabId: 1, mode: 'initial' }); await complete(f.engine);
   for (const equivalent of [milliseconds, String(seconds), String(milliseconds), new Date(milliseconds).toISOString()]) {
-    time = equivalent; f.calls.details.length = 0;
+    time = equivalent; f.calls.details.length = 0; f.advance(30 * 60_000);
     await f.engine.start({ account, tabId: 1, mode: 'incremental' });
     const state = await complete(f.engine);
     assert.deepEqual(f.calls.details, [], `timestamp ${equivalent}`);
@@ -607,12 +607,12 @@ test('an index hash mismatch cannot hide a different archived version, but a com
   });
 });
 
-test('a partial initial scan retries only unfinished details and newly discovered IDs', async () => {
+test('after source changes a partial initial scan retries only unfinished details and newly discovered IDs', async () => {
   const f = setup({ detailError: id => id === 'a' ? 'HTTP_404' : null });
   await f.engine.start({ account, tabId: 1, mode: 'initial' });
   assert.equal((await complete(f.engine)).status, 'partial');
   f.setDetailError(null);
-  f.setList(async () => ({ items: [source('a'), source('b'), source('new')], nextOffset: null, total: 3 }));
+  f.setList(async () => ({ items: [source('a', 1001), source('b'), source('new')], nextOffset: null, total: 3 }));
   f.calls.details.length = 0;
   await f.engine.start({ account, tabId: 1, mode: 'initial' });
   const state = await complete(f.engine);
@@ -622,13 +622,13 @@ test('a partial initial scan retries only unfinished details and newly discovere
   assert.equal(state.diagnostics.skipped, 1);
 });
 
-test('a failed full recheck remains retryable in the next incremental scan even with an unchanged complete archive', async () => {
+test('a failed full recheck remains retryable after cooldown even with an unchanged complete archive', async () => {
   const f = setup();
   await f.engine.start({ account, tabId: 1, mode: 'initial' }); await complete(f.engine);
   f.setDetailError(id => id === 'a' ? 'HTTP_404' : null);
   await f.engine.start({ account, tabId: 1, mode: 'full' });
   assert.equal((await complete(f.engine)).status, 'partial');
-  f.setDetailError(null); f.calls.details.length = 0;
+  f.setDetailError(null); f.calls.details.length = 0; f.advance(24 * 60 * 60_000);
   await f.engine.start({ account, tabId: 1, mode: 'incremental' });
   const state = await complete(f.engine);
   assert.deepEqual(f.calls.details, ['a']);
@@ -648,7 +648,7 @@ test('exhausted outbox failures cannot be skipped by the next scan using the alr
   assert.equal(partial.failed, 1);
   assert.ok(f.local.has('a'));
   assert.deepEqual(await f.engine.getOutbox(account.accountKey), []);
-  reject = false; f.calls.details.length = 0;
+  reject = false; f.calls.details.length = 0; f.advance(30 * 60_000);
   await f.engine.start({ account, tabId: 1, mode: 'incremental' });
   const state = await complete(f.engine);
   assert.deepEqual(f.calls.details, ['a']);
@@ -680,6 +680,7 @@ test('an unfinished discovery checkpoint keeps pending IDs eligible in a fresh s
   const partial = await complete(f.engine);
   assert.equal(partial.status, 'partial');
   assert.equal(partial.error.code, 'ENUMERATION_INCOMPLETE');
+  f.advance(30 * 60_000);
   f.setList(async () => ({ items: [source('a'), source('b')], nextOffset: null, total: 2 }));
   f.calls.details.length = 0;
   await f.engine.start({ account: { ...account, initialized: true }, tabId: 1 });
@@ -716,13 +717,13 @@ test('unfinished local-save delivery survives an intervening scan that never obs
     assert.equal((await complete(f.engine)).status, 'partial');
     assert.ok(f.local.has('a'));
     reject = false;
-    f.setList(missing === 'list-failure' ? async () => { throw issue('FORMAT'); }
+    f.setList(missing === 'list-failure' ? async () => { throw issue('PAGINATION_CHANGED'); }
       : async () => ({ items: [source('b')], nextOffset: null, total: 1 }));
     await f.engine.start({ account, tabId: 1, mode: 'incremental' });
     assert.equal((await complete(f.engine)).status, missing === 'list-failure' ? 'partial' : 'completed');
     assert.equal((await f.engine.getOutbox(account.accountKey)).some(item => item.conversationId === 'a'), false);
     f.setList(async () => ({ items: [source('a'), source('b')], nextOffset: null, total: 2 }));
-    f.calls.details.length = 0;
+    f.calls.details.length = 0; f.advance(30 * 60_000);
     await f.engine.start({ account, tabId: 1, mode: 'incremental' });
     const state = await complete(f.engine);
     assert.equal(state.status, 'completed');
@@ -743,4 +744,176 @@ test('a duplicate ID with a later timestamp on another page cancels an earlier u
   assert.deepEqual(f.calls.details, ['a', 'b']);
   assert.equal(state.diagnostics.skipped, 0);
   assert.equal(state.processed, 2);
+});
+
+test('local-only captures keep files and metadata without building upload body copies', async () => {
+  const f = setup();
+  let uploadEnabled = false;
+  const archives = new Map(), save = f.dependencies.saveConversation;
+  f.dependencies.shouldQueueUpload = async () => uploadEnabled;
+  f.dependencies.saveConversation = async input => {
+    const saved = await save(input); archives.set(saved.entry.conversationId, structuredClone(saved)); return saved;
+  };
+  f.engine = createCollectorEngine(f.dependencies);
+  await f.engine.start({ account, tabId: 1 });
+  assert.equal((await complete(f.engine)).status, 'completed');
+  assert.deepEqual(f.calls.saves, ['a', 'b']);
+  assert.equal(f.store.has(key('Outbox')), false);
+  assert.deepEqual(Object.keys(await f.engine.getLocalChanges(account.accountKey)), ['a', 'b']);
+  assert.doesNotMatch(JSON.stringify(await f.engine.getLocalChanges(account.accountKey)), /messages|files|Title|conversation_id/);
+  // Explicit manual backup can stage a verified archive while automatic backup
+  // is disabled; enabling auto-backup can stage the rest without source reads.
+  const before = f.calls.details.length;
+  await f.engine.enqueueArchive({ account, archive: archives.get('a'), forceUpload: true });
+  assert.deepEqual((await f.engine.getOutbox(account.accountKey)).map(x => x.conversationId), ['a']);
+  uploadEnabled = true;
+  await f.engine.enqueueArchive({ account, archive: archives.get('b') });
+  assert.equal((await f.engine.getOutbox(account.accountKey)).length, 2);
+  assert.deepEqual(await f.engine.getLocalChanges(account.accountKey), {});
+  assert.equal(f.calls.details.length, before);
+});
+
+test('disabling cloud keeps old durable deliveries but does not upload them over newer local-only data', async () => {
+  const f = setup({ list: async () => ({ items: [source('a')], nextOffset: null, total: 1 }) });
+  let uploadEnabled = true, latest;
+  const save = f.dependencies.saveConversation;
+  f.dependencies.shouldQueueUpload = async () => uploadEnabled;
+  f.dependencies.saveConversation = async input => {
+    const saved = await save(input);
+    saved.entry.contentHash = `hash-${input.detail.payload.update_time}`;
+    const manifest = saved.files.find(x => x.path.endsWith('/archive/manifest.json'));
+    const parsed = JSON.parse(manifest.content); parsed.conversations.a.contentHash = saved.entry.contentHash;
+    manifest.content = JSON.stringify(parsed); latest = structuredClone(saved); return saved;
+  };
+  f.engine = createCollectorEngine(f.dependencies);
+  await f.engine.start({ account, tabId: 1 }); await complete(f.engine);
+  const old = structuredClone(f.store.get(key('Outbox')));
+  uploadEnabled = false;
+  f.setList(async () => ({ items: [source('a', 1001)], nextOffset: null, total: 1 }));
+  await f.engine.start({ account, tabId: 1 }); await complete(f.engine);
+  assert.deepEqual(f.store.get(key('Outbox')), old, 'pending old receipt is retained, not cleared during a settings change');
+  assert.deepEqual(await f.engine.getOutbox(account.accountKey), [], 'stale body must wait for local backfill');
+  assert.equal((await f.engine.getLocalChanges(account.accountKey)).a.contentHash, 'hash-1001');
+  await f.engine.enqueueArchive({ account, archive: latest, forceUpload: true });
+  const current = await f.engine.getOutbox(account.accountKey);
+  assert.equal(current.length, 1); assert.notEqual(current[0].id, old.bundles[0].id);
+  assert.equal(current[0].manifestEntry.contentHash, 'hash-1001');
+  await f.engine.acknowledgeOutbox(account.accountKey, old.bundles.map(x => x.id));
+  assert.equal((await f.engine.getOutbox(account.accountKey)).length, 1);
+});
+
+test('unavailable source stays in cooldown across scans and restarts while new conversations are saved', async () => {
+  const f = setup({ list: async () => ({ items: [source('a')], nextOffset: null, total: 1 }), detailError: 'HTTP_404' });
+  await f.engine.start({ account, tabId: 1 }); assert.equal((await complete(f.engine)).status, 'partial');
+  assert.equal(f.calls.details.length, 1);
+  f.setList(async () => ({ items: [source('a'), source('new-mobile')], nextOffset: null, total: 2 }));
+  f.setDetailError(id => id === 'a' ? 'HTTP_404' : null);
+  f.engine = createCollectorEngine(f.dependencies);
+  await f.engine.start({ account, tabId: 1 });
+  const after = await complete(f.engine);
+  assert.equal(after.status, 'partial');
+  assert.deepEqual(f.calls.details, ['a', 'new-mobile']);
+  assert.equal(after.diagnostics.items.find(x => x.conversationId === 'a').retryDisposition, 'cooldown');
+  assert.equal(after.diagnostics.items.find(x => x.conversationId === 'a').totalAttempts, 1);
+  f.setDetailError(null); f.advance(24 * 60 * 60_000);
+  await f.engine.start({ account, tabId: 1 });
+  assert.equal((await complete(f.engine)).status, 'completed');
+  assert.deepEqual(f.calls.details, ['a', 'new-mobile', 'a']);
+});
+
+test('unsupported detail waits for manual action or changed source instead of retrying every schedule', async () => {
+  const f = setup({ list: async () => ({ items: [source('a')], nextOffset: null, total: 1 }), detailError: 'SIZE' });
+  await f.engine.start({ account, tabId: 1 }); await complete(f.engine);
+  f.advance(7 * 24 * 60 * 60_000);
+  await f.engine.start({ account, tabId: 1 });
+  const after = await complete(f.engine);
+  assert.equal(after.diagnostics.items[0].retryDisposition, 'manual');
+  assert.equal(f.calls.details.length, 1);
+  f.setList(async () => ({ items: [{ ...source('a'), title: 'Updated source' }], nextOffset: null, total: 1 }));
+  f.setDetailError(null);
+  await f.engine.start({ account, tabId: 1 }); assert.equal((await complete(f.engine)).status, 'completed');
+  assert.equal(f.calls.details.length, 2);
+});
+
+test('exhausted transient failures retain cumulative attempts and a long cooldown between rounds', async () => {
+  const f = setup({ list: async () => ({ items: [source('a')], nextOffset: null, total: 1 }), detailError: 'NETWORK' });
+  await f.engine.start({ account, tabId: 1 });
+  await complete(f.engine); f.advance(60_000); await complete(f.engine); f.advance(120_000);
+  assert.equal((await complete(f.engine)).status, 'partial');
+  f.engine = createCollectorEngine(f.dependencies);
+  await f.engine.start({ account, tabId: 1 });
+  const waiting = await complete(f.engine);
+  assert.equal(waiting.status, 'partial'); assert.equal(f.calls.details.length, 3);
+  assert.equal(waiting.diagnostics.items[0].totalAttempts, 3);
+  f.advance(30 * 60_000);
+  await f.engine.start({ account, tabId: 1 });
+  const retried = await complete(f.engine);
+  assert.equal(f.calls.details.length, 4);
+  assert.equal(retried.diagnostics.items[0].attempt, 1);
+  assert.equal(retried.diagnostics.items[0].totalAttempts, 4);
+});
+
+test('server Retry-After throttles the whole account and survives restart and manual retry', async () => {
+  const f = setup();
+  const detail = f.dependencies.adapter.detail;
+  let rejected = false;
+  f.dependencies.adapter.detail = async (...args) => {
+    if (!rejected) {
+      rejected = true;
+      f.calls.details.push(args[1].conversationId);
+      throw Object.assign(issue('HTTP_429'), { retryAfterMs: 120_000, rawHeader: 'private-header' });
+    }
+    return detail(...args);
+  };
+  await f.engine.start({ account, tabId: 1 });
+  await f.engine.tick({ account, tabId: 1 });
+  const limited = await f.engine.tick({ account, tabId: 1 });
+  assert.equal(limited.nextRetryAt, f.dependencies.now() + 120_000);
+  assert.equal(limited.error.retryAfterMs, 120_000);
+  const calls = structuredClone(f.calls);
+  f.engine = createCollectorEngine(f.dependencies);
+  await f.engine.tick({ account, tabId: 1 });
+  await f.engine.resume({ account, tabId: 1 });
+  await f.engine.tick({ account, tabId: 1 });
+  assert.deepEqual(f.calls, calls, 'no source or identity request may bypass an account cooldown');
+  assert.equal((await f.engine.getRetryState(account.accountKey)).accountCooldownUntil, limited.nextRetryAt);
+  f.advance(120_000);
+  assert.equal((await complete(f.engine)).status, 'completed');
+  assert.deepEqual(f.calls.saves, ['a', 'b']);
+  assert.doesNotMatch(JSON.stringify([...f.store]), /private-header|Untrusted error/);
+});
+
+test('source cancellation can become a recoverable block after the aborted read reports paused', async () => {
+  const f = setup();
+  const entered = deferred(), aborted = deferred(), original = f.dependencies.adapter.detail;
+  f.dependencies.adapter.detail = async () => { entered.resolve(); await aborted.promise; throw issue('COLLECTION_PAUSED'); };
+  await f.engine.start({ account, tabId: 1 }); await f.engine.tick({ account, tabId: 1 });
+  const reading = f.engine.tick({ account, tabId: 1 }); await entered.promise;
+  assert.equal((await f.engine.getState(account.accountKey)).status, 'running');
+  aborted.resolve();
+  assert.equal((await reading).status, 'paused');
+  const blocked = await f.engine.suspend(account.accountKey, 'SOURCE_UNAVAILABLE', { interrupted: true });
+  assert.equal(blocked.status, 'blocked'); assert.equal(blocked.error.code, 'SOURCE_UNAVAILABLE');
+  assert.deepEqual(f.calls.saves, []);
+  f.dependencies.adapter.detail = original;
+  await f.engine.resume({ account, tabId: 1 });
+  assert.equal((await complete(f.engine)).status, 'completed');
+  assert.deepEqual(f.calls.saves, ['a', 'b']);
+});
+
+test('source suspension preserves explicit user pauses, including a pause racing cancellation', async t => {
+  for (const concurrent of [false, true]) await t.test(String(concurrent), async () => {
+    const f = setup();
+    await f.engine.start({ account, tabId: 1 }); await f.engine.tick({ account, tabId: 1 });
+    if (concurrent) {
+      const entered = deferred(), aborted = deferred();
+      f.dependencies.adapter.detail = async () => { entered.resolve(); await aborted.promise; throw issue('COLLECTION_PAUSED'); };
+      const reading = f.engine.tick({ account, tabId: 1 }); await entered.promise;
+      const pausing = f.engine.pause(account.accountKey);
+      aborted.resolve(); await reading; await pausing;
+    } else await f.engine.pause(account.accountKey);
+    assert.equal((await f.engine.suspend(account.accountKey, 'SITE_PERMISSION_DENIED', { interrupted: true })).status, 'paused');
+    assert.equal((await f.engine.start({ account, tabId: 1 })).status, 'paused');
+    assert.deepEqual(f.calls.saves, []);
+  });
 });

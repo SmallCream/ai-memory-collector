@@ -46,6 +46,7 @@ function assetsOf(entry, prefix) {
   for (const asset of entry.assets) {
     if (!record(asset) || !/^[a-f0-9]{64}$/.test(asset.id || '') || ids.has(asset.id)) fail('ARCHIVE_ASSET', '对话资源标识无效或重复。');
     ids.add(asset.id);
+    if (asset.cloudStatus !== undefined && asset.cloudStatus !== 'local-only') fail('ARCHIVE_ASSET', '资源云端备份状态无效。');
     if (asset.localPath !== undefined && (safePath(asset.localPath) !== prefix || !asset.localPath.startsWith(`${prefix}/assets/`))) {
       fail('ACCOUNT_OWNERSHIP', '资源路径超出当前账号目录。');
     }
@@ -248,9 +249,22 @@ async function plan(api, remote, bundles, assetPlan) {
     if (current !== null && current !== expected) fail('ASSET_IMMUTABLE_CONFLICT', '远端附件路径已有不同内容，已保留原文件。');
     if (current === null) {
       const pointer = assetPlan.pointers.get(asset.localPath);
-      if (!pointer || pointer.content !== expected) fail('LFS_ASSET_MISSING', '附件尚未上传 LFS，暂不提交引用该附件的归档。');
+      if (!pointer) {
+        if (!assetPlan.includeAssets || asset.cloudStatus === 'local-only') {
+          // This metadata is written only to the remote manifest. The native
+          // JSON and local file receipts remain unchanged; no missing binary
+          // is represented by a fabricated Git LFS pointer.
+          asset.cloudStatus = 'local-only';
+          return;
+        }
+        fail('LFS_ASSET_MISSING', '附件尚未上传 LFS，暂不提交引用该附件的归档。');
+      }
+      if (pointer.content !== expected) fail('LFS_ASSET_MISSING', '附件尚未上传 LFS，暂不提交引用该附件的归档。');
       await put(asset.localPath, pointer.content);
     }
+    // An immutable matching pointer is stronger evidence than an older
+    // text-only upload marker, including when uploads have since been disabled.
+    delete asset.cloudStatus;
     assetPrefixes.add(prefix);
   }
   // Validate every local ready reference, even if a newer remote conversation wins.
@@ -434,33 +448,54 @@ async function verifyCommit(api, branch, commitSha, treeSha, changes) {
  * Conflicting snapshots are preserved under conflicts/, never forcibly merged.
  * Remote winners are returned for optional guarded local reconciliation.
  */
-export async function syncArchives({ config, bundles, assetPointers = [], fetchImpl = globalThis.fetch } = {}) {
+export async function syncArchives({ config, bundles, assetPointers = [], fetchImpl = globalThis.fetch,
+  isCurrent = async () => true } = {}) {
+  async function requireCurrent() {
+    let current = false;
+    try { current = typeof isCurrent === 'function' && await isCurrent(); } catch { /* A failed config read cannot authorize a write. */ }
+    if (current !== true) fail('GITHUB_TARGET_CHANGED', '同步设置或目标已变化，尚未发送的上传已停止；本地数据和待处理记录已保留。');
+  }
   const checked = validateBundles(bundles);
+  if (config?.lfsEnabled === false && assetPointers.length) fail('ASSET_UPLOAD_DISABLED', '附件上传已关闭，本次未提交附件指针。');
   const assetPlan = validatePointers(checked, assetPointers);
+  assetPlan.includeAssets = config?.lfsEnabled !== false;
   const parts = typeof config?.repository === 'string' ? config.repository.split('/') : [];
   if (parts.length !== 2) fail('INVALID_REPOSITORY', '仓库格式应为 owner/repository。');
-  const input = { owner: parts[0], repo: parts[1], branch: config.branch, token: config.token, fetchImpl };
+  // Guard the transport too: commitProbe has its own read-before-PUT sequence,
+  // and changing settings while that GET is pending must prevent its later PUT.
+  // Reads after an already-issued PATCH still run to confirm its actual outcome.
+  const guardedFetch = async (url, options) => {
+    if (!['GET', 'HEAD'].includes(String(options?.method || 'GET').toUpperCase())) await requireCurrent();
+    return fetchImpl.call(globalThis, url, options);
+  };
+  const input = { owner: parts[0], repo: parts[1], branch: config.branch, token: config.token, fetchImpl: guardedFetch };
   const api = createGitHubClient(input);
+  await requireCurrent();
   let info = await inspectGitHubRepository(api);
   if (info.empty) {
     // GitHub's refs API cannot initialize an empty repository. Seed only the fixed
     // synthetic probe; the complete conversation group is still one later commit.
+    await requireCurrent();
     await commitProbe(input);
     info = await inspectGitHubRepository(api);
     if (info.empty) fail('WRITE_UNCONFIRMED', '空仓库初始化尚未确认，请稍后重试。');
   }
   for (let attempt = 0; attempt < 3; attempt++) {
+    await requireCurrent();
     const head = attempt === 0 ? info.headSha : await headOf(api, info.branch);
     const remote = await snapshot(api, head);
     const { changes, conflicts, remoteWinners } = await plan(api, remote, checked, assetPlan);
     if (!changes.size) return { status: 'unchanged', commitSha: head, branch: info.branch, filesChanged: 0, conflicts, remoteWinners };
+    await requireCurrent();
     const tree = (await api.request('/git/trees', { method: 'POST', body: { base_tree: remote.treeSha,
       tree: [...changes].map(([path, content]) => ({ path, mode: '100644', type: 'blob', content })) } })).data;
     if (!sha(tree?.sha)) fail('INVALID_RESPONSE', 'GitHub 未返回有效文件树。');
+    await requireCurrent();
     const commit = (await api.request('/git/commits', { method: 'POST', body: {
       message: 'archive: sync AI conversation changes', tree: tree.sha, parents: [head] } })).data;
     if (!sha(commit?.sha)) fail('INVALID_RESPONSE', 'GitHub 未返回有效提交。');
     try {
+      await requireCurrent();
       await api.request(`/git/refs/heads/${info.branch.split('/').map(encodeURIComponent).join('/')}`, {
         method: 'PATCH', body: { sha: commit.sha, force: false } });
     } catch (error) {

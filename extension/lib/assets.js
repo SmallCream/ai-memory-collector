@@ -232,6 +232,9 @@ export function sanitizeAssetRecords(records) {
       if (typeof asset[key] === 'string') item[key] = cleanName(asset[key]);
     }
     if (asset.capturePolicy === 'internal-viewer') item.capturePolicy = 'internal-viewer';
+    // A text-only cloud backup may describe a file that exists only on its
+    // source computer. This marker never proves local bytes or an LFS object.
+    if (asset.cloudStatus === 'local-only') item.cloudStatus = 'local-only';
     if (item.capturePolicy === 'internal-viewer' && item.errorCode === 'HTTP_404' && asset.autoRetrySuspended === true &&
         !READY.has(item.status) && item.status !== 'external') item.autoRetrySuspended = true;
     if (safePath(asset.localPath)) item.localPath = asset.localPath;

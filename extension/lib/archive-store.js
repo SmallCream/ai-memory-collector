@@ -168,6 +168,53 @@ export async function readConversationBaseline(directory, account, conversationI
   return { payload, entry };
 }
 
+/** Read an immutable, verified local snapshot for optional cloud backfill. */
+export async function readConversationArchive(directory, account, conversationId, { get = getSetting } = {}) {
+  const prefix = accountPrefix(account);
+  if (!safeSegment(conversationId, 160)) fail('ARCHIVE_FORMAT', '对话标识无效，未读取本地归档。');
+  await ensurePermission(directory);
+  if (await get(`archiveJournal:${account.platform}:${account.accountKey}`)) {
+    fail('LOCAL_PENDING', '本地还有未完成的文件写入，请恢复保存后继续。');
+  }
+  const manifest = await readAccountManifest(directory, account);
+  const entry = own(manifest?.conversations || {}, conversationId) ? manifest.conversations[conversationId] : null;
+  if (!entry) fail('ARCHIVE_MISSING', '本地未找到该对话的归档记录。');
+  const nativeText = await read(directory, entry.jsonPath), markdownText = await read(directory, entry.markdownPath);
+  const accountText = await read(directory, `${prefix}/account.json`);
+  if (nativeText === null || markdownText === null || accountText === null) {
+    fail('ARCHIVE_MISSING', '本地归档文件缺失，请先补齐后再备份。');
+  }
+  if (await digest(nativeText) !== entry.contentHash || await digest(markdownText) !== entry.markdownHash) {
+    fail('LOCAL_CONFLICT', '本地文件与归档记录不一致，已保留原文件。');
+  }
+  const native = parse(nativeText), storedAccount = parse(accountText);
+  if (!record(native) || (native.conversation_id ?? native.id) !== conversationId ||
+      (native.conversation_id && native.id && native.conversation_id !== native.id)) {
+    fail('ARCHIVE_FORMAT', '本地对话标识与清单不一致。');
+  }
+  if (storedAccount.accountKey !== account.accountKey || storedAccount.platform !== account.platform || storedAccount.dataPath !== prefix) {
+    fail('ACCOUNT_MISMATCH', '本地账号记录与当前归档不一致。');
+  }
+  assertNativeNotPartial(native);
+  // A source or attachment writer may have advanced the manifest while files
+  // were read. Never enqueue an old body with a newer descriptor.
+  const latest = await readAccountManifest(directory, account);
+  if (json(latest?.conversations?.[conversationId]) !== json(entry) ||
+      await get(`archiveJournal:${account.platform}:${account.accountKey}`)) {
+    fail('LOCAL_PENDING', '本地归档正在更新，请稍后重新读取。');
+  }
+  const scopedManifest = { ...manifest, conversations: { [conversationId]: entry } };
+  const files = [
+    { path: entry.jsonPath, content: nativeText }, { path: entry.markdownPath, content: markdownText },
+    { path: `${prefix}/archive/manifest.json`, content: json(scopedManifest) },
+    { path: `${prefix}/account.json`, content: accountText },
+  ];
+  if (files.reduce((sum, file) => sum + new TextEncoder().encode(file.content).length, 0) > MAX_BATCH_BYTES) {
+    fail('ARCHIVE_SIZE', '本地归档超过本次读取大小限制。');
+  }
+  return { entry, files };
+}
+
 /** Cheap presence check for incremental scans; it does not read or hash history. */
 export async function hasConversationFiles(directory, account, entry) {
   // Reuse the writer's ownership/path rules before touching either file.
@@ -270,7 +317,7 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
     await set(journalKey, null);
     return { ...plan.result, files: plan.files };
   }
-  async function saveUnlocked({ directory, account, detail, preferredEntry, assets, remoteMessageSync }) {
+  async function saveUnlocked({ directory, account, detail, preferredEntry, assets, remoteMessageSync, preserveNativeHash }) {
     const prefix = accountPrefix(account);
     if (!detail?.identity || detail.identity.accountKey !== account.accountKey) {
       fail('ACCOUNT_MISMATCH', '采集结果与任务账号不一致，未写入文件。');
@@ -309,6 +356,9 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
     const built = await buildArchive({ conversation: native, identity: detail.identity, capturedAt: detail.capturedAt,
       existingManifest: builderManifest, productionPrefix: prefix, assets: assets ?? prior?.assets ?? preferredEntry?.assets });
     const entry = built.manifest.conversations[id];
+    if (preserveNativeHash && entry.contentHash !== preserveNativeHash) {
+      fail('LOCAL_CONFLICT', '阅读文件重建需要修改原始 JSON，已停止并保留原文件。');
+    }
     if (detail.completeness === 'partial' || built.summary.coverage.messages === 'partial') {
       fail('PARTIAL_DETAIL', '这条对话尚未完整读取或有消息尚不能确认已结束，已保留原归档，稍后重试。');
     }
@@ -396,6 +446,51 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
     if (!input.directory || typeof input.directory !== 'object') return Promise.reject(new ArchiveStoreError('DIRECTORY_REQUIRED', '请选择保存目录。'));
     return withLock(input.directory, input.account.accountKey, () => saveUnlocked(input));
   }
+  function repairMissingMarkdown({ directory, account, conversationId }) {
+    accountPrefix(account);
+    if (!safeSegment(conversationId, 160)) return Promise.reject(new ArchiveStoreError('ARCHIVE_FORMAT', '对话标识无效。'));
+    if (!directory || typeof directory !== 'object') return Promise.reject(new ArchiveStoreError('DIRECTORY_REQUIRED', '请选择保存目录。'));
+    return withLock(directory, account.accountKey, async () => {
+      await ensurePermission(directory);
+      const journalKey = `archiveJournal:${account.platform}:${account.accountKey}`;
+      const pending = await get(journalKey);
+      if (pending && pending.result?.entry?.conversationId !== conversationId) {
+        // The original owner must finish delivery of another conversation's
+        // checkpoint. A Markdown repair must not clear that unrelated receipt.
+        fail('LOCAL_PENDING', '另一个对话还有未完成的保存，请恢复后继续本地检查。');
+      }
+      const recovered = pending ? await execute(directory, account, pending, journalKey) : null;
+      const manifest = await readAccountManifest(directory, account);
+      const entry = manifest?.conversations?.[conversationId];
+      if (!entry) fail('ARCHIVE_MISSING', '本地未找到该对话的归档记录。');
+      const markdown = await read(directory, entry.markdownPath);
+      if (markdown !== null) {
+        // Existing empty or user-edited files are not disposable. A journal
+        // created by this writer is the only authority to recover its output.
+        if (!markdown || await digest(markdown) !== entry.markdownHash) {
+          fail('LOCAL_CONFLICT', '本地阅读文件与记录不一致，已保留原文件。');
+        }
+        return { repaired: Boolean(recovered?.entry?.conversationId === conversationId), recovered };
+      }
+      const nativeText = await read(directory, entry.jsonPath);
+      if (nativeText === null) fail('ARCHIVE_MISSING', '原始 JSON 缺失，需要重新采集该对话。');
+      if (!nativeText || await digest(nativeText) !== entry.contentHash) {
+        fail('LOCAL_CONFLICT', '原始 JSON 与归档记录不一致，未重建阅读文件。');
+      }
+      const native = parse(nativeText);
+      if (!record(native) || (native.conversation_id ?? native.id) !== conversationId) {
+        fail('ARCHIVE_FORMAT', '原始 JSON 的对话标识不一致。');
+      }
+      const saved = await saveUnlocked({ directory, account, assets: entry.assets,
+        preserveNativeHash: entry.contentHash, detail: {
+          identity: { accountKey: account.accountKey, displayName: account.displayName || account.alias || account.accountKey },
+          payload: native, capturedAt: sourceTime(entry.firstCapturedAt) || sourceTime(entry.lastChangedAt) || new Date().toISOString(),
+          completeness: entry.sourceCompleteness === 'complete' ? 'complete' : 'unknown',
+        } });
+      if (recovered) saved.recovered = recovered;
+      return { ...saved, repaired: true };
+    });
+  }
   async function applyRemoteFiles({ directory, account, files }) {
     const prefix = accountPrefix(account);
     if (!Array.isArray(files) || files.length !== 4) fail('REMOTE_ARCHIVE', '远端归档缺少同版本的数据、阅读文件或账号清单。');
@@ -458,6 +553,8 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
   return {
     readAccountManifest,
     readConversationBaseline: (directory, account, conversationId) => readConversationBaseline(directory, account, conversationId, { get }),
+    readConversationArchive: (directory, account, conversationId) => readConversationArchive(directory, account, conversationId, { get }),
+    repairMissingMarkdown,
     saveConversation,
     applyRemoteFiles,
   };
@@ -466,3 +563,4 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
 const production = createArchiveStore();
 export const saveConversation = input => production.saveConversation(input);
 export const applyRemoteFiles = input => production.applyRemoteFiles(input);
+export const repairMissingMarkdown = input => production.repairMissingMarkdown(input);
