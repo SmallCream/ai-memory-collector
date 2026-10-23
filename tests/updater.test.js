@@ -106,6 +106,20 @@ test('remembered folder is reused; identical code and Finder metadata need no up
   assert.equal(readFileSync(join(f.target, '.DS_Store'), 'utf8'), 'finder fixture');
 });
 
+test('legacy P0 installation upgrades to the renamed v0.2 product in the same directory', t => {
+  const f = fixture(t, { installed: '0.1.5', remote: '0.2.0' });
+  const manifest = JSON.parse(readFileSync(join(f.target, 'manifest.json'), 'utf8'));
+  manifest.name = 'AI Memory Collector · P0';
+  writeFileSync(join(f.target, 'manifest.json'), JSON.stringify(manifest));
+  const result = f.run();
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  assert.equal(f.version(), '0.2.0');
+  assert.equal(JSON.parse(readFileSync(join(f.target, 'manifest.json'), 'utf8')).name, 'AI Memory Collector');
+  assert.equal(f.backups().length, 1);
+  assert.equal(f.version(f.backups()[0]), '0.1.5');
+  assert.equal(readFileSync(join(f.state, 'target-path'), 'utf8').trim(), f.target);
+});
+
 test('network failure does not modify the installed extension', t => {
   const f = fixture(t);
   const result = f.run([], { AMC_TEST_NETWORK_FAIL: '1' });

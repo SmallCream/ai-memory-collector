@@ -6,13 +6,26 @@ import assert from 'node:assert/strict';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const extension = resolve(root, 'extension');
 const manifest = JSON.parse(await readFile(resolve(extension, 'manifest.json'), 'utf8'));
+const pkg = JSON.parse(await readFile(resolve(root, 'package.json'), 'utf8'));
 assert.equal(manifest.manifest_version, 3);
-assert.deepEqual(manifest.permissions, ['scripting']);
-assert.deepEqual(manifest.optional_host_permissions, ['https://chatgpt.com/*', 'https://api.github.com/*']);
-assert.equal(manifest.content_scripts, undefined);
+assert.equal(manifest.version, pkg.version, 'Package and extension versions differ');
+assert.deepEqual([...manifest.permissions].sort(), ['activeTab', 'alarms', 'scripting', 'sidePanel']);
+assert.deepEqual(manifest.optional_host_permissions, [
+  'https://chatgpt.com/*', 'https://api.github.com/*', 'https://github.com/*',
+  'https://lfs.github.com/*', 'https://github-cloud.githubusercontent.com/*',
+  'https://objects.githubusercontent.com/*', 'https://media.githubusercontent.com/*',
+  'https://github-cloud.s3.amazonaws.com/*', 'https://*.oaiusercontent.com/*', 'https://*/*',
+]);
+assert.equal(manifest.host_permissions, undefined, 'Site access must remain optional');
+assert.equal(manifest.content_scripts, undefined, 'Content entry is registered only after site authorization');
 assert.equal(manifest.externally_connectable, undefined);
-await access(resolve(extension, manifest.background.service_worker));
-await access(resolve(extension, manifest.options_ui.page));
+assert.equal(manifest.background.type, 'module');
+assert.equal(manifest.side_panel.default_path, 'panel.html');
+assert.ok(Number(manifest.minimum_chrome_version) >= 120);
+assert.match(manifest.content_security_policy.extension_pages, /script-src 'self';/);
+assert.ok(!/unsafe-eval|unsafe-inline/.test(manifest.content_security_policy.extension_pages));
+for (const path of [manifest.background.service_worker, manifest.side_panel.default_path,
+  manifest.options_ui.page, 'content.js', 'adapters/index.js']) await access(resolve(extension, path));
 async function checkDirectory(directory) {
   for (const item of await readdir(directory, { withFileTypes: true })) {
     const path = resolve(directory, item.name);
@@ -31,5 +44,13 @@ const panel = await readFile(resolve(extension, 'panel.js'), 'utf8');
 const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map(x => x[1]);
 assert.equal(new Set(ids).size, ids.length, 'Duplicate HTML IDs');
 for (const match of panel.matchAll(/\$\('([^']+)'\)/g)) assert.ok(ids.includes(match[1]), `Missing UI element: ${match[1]}`);
-for (const match of html.matchAll(/(?:src|href)="([^"#:]+)"/g)) await access(resolve(extension, match[1]));
-console.log('Manifest, JavaScript syntax, module imports and panel references passed.');
+for (const match of html.matchAll(/(?:src|href)="([^"#:]+)"/g)) {
+  assert.ok(!/^(?:https?:)?\/\//.test(match[1]), 'Extension UI must use packaged assets');
+  await access(resolve(extension, match[1]));
+}
+assert.ok(!/\son[a-z]+\s*=/i.test(html), 'Use packaged event handlers, not inline JavaScript');
+for (const match of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)) {
+  assert.match(match[1], /\bsrc=/);
+  assert.equal(match[2].trim(), '');
+}
+console.log('Manifest, versions, permissions, JavaScript syntax, module imports and panel references passed.');

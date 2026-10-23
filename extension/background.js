@@ -1,75 +1,111 @@
-const collectorURL = new URL(chrome.runtime.getURL('panel.html'));
-let launchQueue = Promise.resolve();
-let lastOpenedTabId = null;
+import { getSetting, setSetting } from './lib/storage.js';
+import { getAdapter } from './adapters/index.js';
+import { createCollectorEngine } from './lib/collector-engine.js';
+import { readAccountManifest, hasConversationFiles, readConversationBaseline, readConversationArchive,
+  repairMissingMarkdown, saveConversation, applyRemoteFiles } from './lib/archive-store.js';
+import { syncArchives } from './lib/github-sync.js';
+import { probeRepository } from './lib/github.js';
+import { createCollectorService, ALARM_NAME } from './lib/collector-service.js';
+import { safeError } from './lib/config.js';
+import { createAssetService } from './lib/asset-service.js';
+import { createChatGPTAssetResolver } from './lib/chatgpt-assets.js';
+import { createRestoreService } from './lib/restore-service.js';
+import { fetchRepositorySnapshot, downloadRepositoryFile } from './lib/github-restore.js';
+import { createLocalMaintenance } from './lib/local-maintenance.js';
 
-function isCollectorURL(value) {
-  try {
-    const url = new URL(value);
-    return url.protocol === collectorURL.protocol && url.host === collectorURL.host &&
-      url.pathname === collectorURL.pathname;
-  } catch { return false; }
-}
+const resolver = createChatGPTAssetResolver(chrome, { allowLibraryDownload: true, allowFileDownload: true });
+const adapter = getAdapter('chatgpt');
+const lockedSave = input => service.withFileLock(() => saveConversation(input));
+const lockedApply = input => service.withFileLock(() => applyRemoteFiles(input));
+const assets = createAssetService({ getSetting, setSetting, readAccountManifest, saveConversation: lockedSave,
+  resolveAsset: resolver.resolve, downloadRepositoryFile,
+  refreshConversation: ({ tabId, ...request }) => adapter.detail(tabId, request),
+  enqueueArchive: input => service.engine.enqueueArchive(input) });
+const restore = createRestoreService({ getSetting, setSetting, fetchRepositorySnapshot, downloadRepositoryFile,
+  applyRemoteFiles: lockedApply, readLocalManifest: readAccountManifest, hydrateAssets: assets.hydrateAssets,
+  // Replayed local capture journals already carry authorized account ownership.
+  // Queue them without creating a binding; only enabled configured accounts upload.
+  enqueueRecovered: ({ account, archive }) => service.engine.enqueueArchive({ account: { ...account, enabled: true }, archive }) });
+const maintenance = createLocalMaintenance({ getSetting, setSetting, readAccountManifest, readConversationArchive,
+  repairMissingMarkdown: input => service.withFileLock(() => repairMissingMarkdown(input)),
+  enqueueArchive: input => service.engine.enqueueArchive(input), requeueMissing: input => assets.requeueMissing(input) });
+const service = createCollectorService({ browser: chrome, getSetting, setSetting,
+  adapter, createEngine: createCollectorEngine,
+  readAccountManifest, hasConversationFiles, readConversationBaseline, readConversationArchive,
+  saveConversation: assets.save, applyRemoteFiles: lockedApply, syncArchives, probeRepository,
+  assetService: assets, restoreService: restore, maintenanceService: maintenance, cancelAssets: resolver.cancel });
+const extensionURL = new URL(chrome.runtime.getURL('/'));
+const ignore = promise => Promise.resolve(promise).catch(() => {});
+const trustedUI = sender => {
+  try { const url = new URL(sender.url); return sender.id === chrome.runtime.id &&
+    url.protocol === extensionURL.protocol && url.host === extensionURL.host && url.pathname === '/panel.html'; } catch { return false; }
+};
+const trustedSource = sender => {
+  try { return sender.id === chrome.runtime.id && Number.isInteger(sender.tab?.id) &&
+    new URL(sender.url).origin === 'https://chatgpt.com' && sender.frameId === 0; } catch { return false; }
+};
 
-function isMissingTab(error) {
-  return /No tab with id|Invalid tab ID/i.test(error?.message || '');
-}
-
-async function findCollector(preferredWindowId) {
-  // Enumerate only this extension's pages; no permission to read all tab URLs.
-  const contexts = await chrome.runtime.getContexts({ contextTypes: ['TAB'] });
-  const candidates = contexts.filter(context => Number.isInteger(context.tabId) && context.tabId >= 0 &&
-    isCollectorURL(context.documentUrl));
-  const existing = candidates.find(context => context.windowId === preferredWindowId) || candidates[0];
-  if (existing) return existing;
-
-  // tabs.create may resolve before the document appears in getContexts. Remember
-  // that tab during loading so rapid clicks cannot create multiple collectors.
-  if (lastOpenedTabId !== null) {
-    let tab;
-    try { tab = await chrome.tabs.get(lastOpenedTabId); }
-    catch (error) {
-      if (!isMissingTab(error)) throw error;
-      lastOpenedTabId = null;
-      return null;
-    }
-    if (isCollectorURL(tab.pendingUrl || tab.url)) return { tabId: tab.id, windowId: tab.windowId };
-    if (!tab.url && !tab.pendingUrl) throw new Error('Cannot verify the existing collector tab.');
-    lastOpenedTabId = null;
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!message || typeof message.type !== 'string') return false;
+  const ui = trustedUI(sender), source = trustedSource(sender);
+  if (!ui && !source) return false;
+  if (source && !['collector:open-panel', 'collector:content-state'].includes(message.type)) {
+    sendResponse({ ok: false, error: { code: 'FORBIDDEN', message: '网页只能打开采集器或读取简短状态。' } }); return false;
   }
-  return null;
-}
-
-async function openCollector(sourceTab = {}) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const existing = await findCollector(sourceTab.windowId);
-    if (!existing) {
-      const url = new URL(collectorURL);
-      if (Number.isInteger(sourceTab.id) && sourceTab.id >= 0) url.searchParams.set('tab', String(sourceTab.id));
-      const created = await chrome.tabs.create({ url: url.href });
-      lastOpenedTabId = created.id;
-      return;
-    }
-    try {
-      // Activate only. Navigating/reloading would discard the current operation
-      // and would silently change the source selected by the existing collector.
-      const tab = await chrome.tabs.update(existing.tabId, { active: true });
-      lastOpenedTabId = existing.tabId;
-      await chrome.windows.update(tab?.windowId ?? existing.windowId, { focused: true });
-      return;
-    } catch (error) {
-      if (!isMissingTab(error) || attempt === 1) throw error;
-      if (lastOpenedTabId === existing.tabId) lastOpenedTabId = null;
-      // The user may close a tab between discovery and activation. Re-enumerate
-      // before creating a replacement, in case another collector remains open.
-    }
-  }
-}
-
-chrome.action.onClicked.addListener((tab) => {
-  // MV3 can deliver another click while a previous create/focus is awaiting.
-  launchQueue = launchQueue.then(() => openCollector(tab)).catch(() => {
-    console.warn('无法打开采集台，请稍后再点击扩展图标。');
-  });
-  return launchQueue;
+  const tabId = source ? sender.tab.id : Number.isInteger(message.tabId) ? message.tabId : undefined;
+  let work;
+  if (message.type === 'collector:open-panel') {
+    // Preserve the content button's user gesture; do not await storage first.
+    try { work = Promise.resolve(chrome.sidePanel.open({ tabId })).then(() => ({ ok: true })); }
+    catch (error) { sendResponse({ ok: false, error: safeError(error) }); return false; }
+  } else if (message.type === 'collector:content-state') {
+    work = service.contentState(tabId);
+  } else if (message.type === 'collector:close-panel') {
+    work = (async () => {
+      const id = tabId ?? (await service.state()).tabId;
+      if (!Number.isInteger(id)) return { ok: true };
+      await ignore(chrome.tabs.sendMessage(id, { type: message.hide ? 'collector:hide-entry' : 'collector:show-entry' }));
+      if (chrome.sidePanel.close) await chrome.sidePanel.close({ tabId: id });
+      else {
+        await chrome.sidePanel.setOptions({ tabId: id, enabled: false });
+        await chrome.sidePanel.setOptions({ tabId: id, path: `panel.html?tab=${id}`, enabled: true });
+      }
+      return { ok: true };
+    })();
+  } else work = service.command(message, tabId);
+  Promise.resolve(work).then(sendResponse).catch(error => sendResponse({ ok: false, error: safeError(error) }));
+  return true;
 });
 
+chrome.action.onClicked.addListener(tab => {
+  if (tab.url?.startsWith('https://chatgpt.com/')) {
+    ignore(chrome.tabs.sendMessage(tab.id, { type: 'collector:show-entry' }));
+    ignore(chrome.sidePanel.open({ tabId: tab.id }).catch(async () => {
+      await service.enableTab(tab);
+      await chrome.sidePanel.open({ tabId: tab.id });
+    }));
+  } else ignore(chrome.runtime.openOptionsPage());
+});
+chrome.runtime.onInstalled.addListener(details => {
+  ignore(service.initialize().then(() => {
+    if (details.reason === 'install') return chrome.tabs.create({ url: chrome.runtime.getURL('panel.html?setup=1') });
+  }));
+});
+chrome.runtime.onStartup.addListener(() => ignore(service.initialize().then(() => service.pump())));
+chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === ALARM_NAME) ignore(service.pump()); });
+chrome.tabs.onUpdated.addListener((id, change, tab) => {
+  if (change.url || change.status === 'complete') ignore(service.enableTab(tab).then(async () => {
+    if (change.url && !/^https:\/\/chatgpt\.com(?:\/|$)/.test(change.url)) await service.tabGone(id);
+    await service.pump();
+  }));
+});
+chrome.tabs.onActivated.addListener(info => ignore(chrome.tabs.get(info.tabId).then(async tab => {
+  await service.enableTab(tab);
+  if (tab.url?.startsWith('https://chatgpt.com/')) await service.identify(tab, true).catch(() => {});
+  await service.pump();
+})));
+chrome.tabs.onRemoved.addListener(id => ignore(service.tabGone(id)));
+chrome.permissions.onAdded.addListener(() => ignore(service.initialize()));
+chrome.permissions.onRemoved.addListener(() => ignore(service.initialize()));
+// Check on every worker incarnation; an update/restart may clear an alarm.
+ignore(service.initialize());

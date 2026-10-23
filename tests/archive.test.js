@@ -99,6 +99,49 @@ test('partial page and in-progress content are marked partial', async () => {
   assert.equal(result.summary.coverage.branches, 'partial');
 });
 
+test('historical unfinished states remain exact in native JSON while generation metadata stays out of reading Markdown', async () => {
+  for (const status of ['pending', 'streaming', 'in_progress']) {
+    const source = fixture();
+    // A selected ancestor has an explicit end-of-turn answer later on this path.
+    source.mapping.question.message.status = status;
+    Object.assign(source.mapping.reply2.message, { status: 'finished_successfully', end_turn: true });
+    const result = await build(source);
+    assert.deepEqual(JSON.parse(result.files[0].content), source);
+    assert.equal(result.summary.coverage.messages, 'unknown');
+    const expected = { policy: 'closed-descendant-v1', historicalUnfinishedCount: 1, unresolvedUnfinishedCount: 0 };
+    assert.deepEqual(result.summary.generationState, expected);
+    assert.deepEqual(result.manifest.conversations['demo-conversation'].generationState, expected);
+    assert.ok(result.summary.warnings.some(warning => warning.includes('原样保留 1 条历史未完成状态消息')));
+    assert.match(result.files[1].content, /说明 authorization 和 token/);
+    assert.match(result.files[1].content, /选中的回复/);
+    assert.doesNotMatch(result.files[1].content, /历史未完成状态|closed-descendant|采集不能/);
+    assert.deepEqual((await build(source, { existingManifest: result.manifest })).files, result.files);
+  }
+});
+
+test('an unfinished sibling or current node remains partial despite a completed answer elsewhere', async () => {
+  for (const target of ['reply1', 'reply2']) {
+    const source = fixture();
+    Object.assign(source.mapping.reply2.message, { status: 'finished_successfully', end_turn: true });
+    source.mapping[target].message.status = 'pending';
+    const result = await build(source);
+    assert.equal(result.summary.coverage.messages, 'partial');
+    assert.equal(result.summary.generationState.unresolvedUnfinishedCount, 1);
+    assert.deepEqual(JSON.parse(result.files[0].content), source);
+  }
+});
+
+test('flat history cannot use a later answer as proof that an earlier pending status is historical', async () => {
+  const source = { id: 'flat-pending', messages: [
+    { id: 'q', author: { role: 'user' }, status: 'pending', content: 'Question' },
+    { id: 'a', author: { role: 'assistant' }, status: 'finished_successfully', end_turn: true, content: 'Answer' },
+  ], page_info: { has_previous_page: false, has_next_page: false } };
+  const result = await build(source);
+  assert.equal(result.summary.coverage.messages, 'partial');
+  assert.equal(result.summary.generationState.historicalUnfinishedCount, 0);
+  assert.equal(result.summary.generationState.unresolvedUnfinishedCount, 1);
+});
+
 test('unsafe or conflicting identity and foreign manifest rejected before files are built', async () => {
   await assert.rejects(build(fixture(), { identity: { accountKey: '../other' } }), /账号标识/);
   const source = fixture(); source.conversation_id = '../bad';
@@ -121,14 +164,14 @@ test('manifest traversal rejected, unknown fields such as __proto__ remain inert
   assert.equal({}.injected, undefined);
 });
 
-test('Markdown keeps code literal while making prose HTML and image embeds passive', async () => {
+test('Markdown keeps code literal while blocking active HTML and unresolved images', async () => {
   const source = fixture(); source.title = '<img src=x onerror=alert(1)>';
   const body = '<script>alert(1)</script>\n![track](https://example.test/pixel)\n`<span>inline</span>`\n```html\n<img src=x onerror=alert(1)>\n```';
   source.mapping.reply2.message.content.parts = [body];
   const result = await build(source);
   assert.match(result.files[1].content, /&lt;img/);
-  assert.match(result.files[1].content, /&lt;script>alert\(1\)&lt;\/script>/);
-  assert.ok(result.files[1].content.includes('\\![track](https://example.test/pixel)'));
+  assert.match(result.files[1].content, /script 动态内容未执行/);
+  assert.ok(result.files[1].content.includes('〔图片：track，待补采〕'));
   assert.ok(result.files[1].content.includes('`<span>inline</span>`'));
   assert.ok(result.files[1].content.includes('```html\n<img src=x onerror=alert(1)>\n```'));
   assert.equal(JSON.parse(result.files[0].content).mapping.reply2.message.content.parts[0], body);
@@ -188,7 +231,7 @@ test('readable Markdown contains just title, speakers and normally formatted con
   assert.deepEqual(JSON.parse(result.files[0].content), source);
   assert.equal(result.summary.coverage.messages, 'partial');
   assert.ok(result.manifest.conversations['reading-demo'].warnings.length);
-  assert.equal(result.manifest.conversations['reading-demo'].rendererVersion, 'p0-2');
+  assert.equal(result.manifest.conversations['reading-demo'].rendererVersion, 'rich-2');
 });
 
 test('internal and hidden messages stay in JSON but do not clutter the reading view', async () => {
