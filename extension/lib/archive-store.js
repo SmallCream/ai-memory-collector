@@ -1,4 +1,4 @@
-import { buildArchive } from './archive.js';
+import { buildArchive, RENDERER_VERSION } from './archive.js';
 import { extractAssets, reconcileAssetCapturePolicy } from './assets.js';
 import { getSetting, setSetting } from './storage.js';
 import { sanitizeMessageSync, selectMessageSync } from './message-sync-receipt.js';
@@ -10,6 +10,15 @@ const locks = new WeakMap();
 const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const json = value => `${JSON.stringify(value, null, 2)}\n`;
+
+/** Upgrade known older derived formats, never downgrade a future renderer. */
+export function needsMarkdownRefresh(entry) {
+  if (!entry) return false;
+  if (entry.rendererVersion == null) return true;
+  const previous = /^rich-([1-9][0-9]*)$/.exec(entry.rendererVersion);
+  const current = /^rich-([1-9][0-9]*)$/.exec(RENDERER_VERSION);
+  return Boolean(previous && current && Number(previous[1]) < Number(current[1]));
+}
 
 export class ArchiveStoreError extends Error {
   constructor(code, message) { super(message); this.name = 'ArchiveStoreError'; this.code = code; }
@@ -470,7 +479,12 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
         if (!markdown || await digest(markdown) !== entry.markdownHash) {
           fail('LOCAL_CONFLICT', '本地阅读文件与记录不一致，已保留原文件。');
         }
-        return { repaired: Boolean(recovered?.entry?.conversationId === conversationId), recovered };
+        if (!needsMarkdownRefresh(entry)) {
+          return { repaired: Boolean(recovered?.entry?.conversationId === conversationId), recovered };
+        }
+        // A derived-format upgrade follows the same guarded journal path as a
+        // missing file. Matching the old Markdown digest is required before
+        // regenerating it; source JSON and account ownership are checked below.
       }
       const nativeText = await read(directory, entry.jsonPath);
       if (nativeText === null) fail('ARCHIVE_MISSING', '原始 JSON 缺失，需要重新采集该对话。');

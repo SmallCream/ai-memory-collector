@@ -1,6 +1,6 @@
 import { getSetting, setSetting } from './lib/storage.js';
 import { detailFailureMessage, sanitizeDetailFailure } from './lib/detail-errors.js';
-import { assetFailureDiagnosticMessage } from './lib/asset-failure.js';
+import { assetFailureDiagnosticMessage, assetFailureAttemptSummaries } from './lib/asset-failure.js';
 
 const $ = id => document.getElementById(id);
 const setupPage = new URL(location.href).searchParams.get('setup') === '1';
@@ -95,6 +95,12 @@ function assetLabel(value, fallback) {
     .replace(/(?:https?:\/\/|blob:|data:)[^\s<>"']+/gi, '[链接已隐藏]')
     .replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, '').slice(0, 200);
 }
+function attachmentName(failure, fallback = '未命名附件') {
+  const id = /^file[-_][A-Za-z0-9_-]{1,160}$/.test(failure.fileId || '') ? failure.fileId :
+    /^libfile_[A-Za-z0-9_-]{1,160}$/.test(failure.libraryFileId || '') ? failure.libraryFileId :
+      /^[a-f0-9]{64}$/.test(failure.assetId || '') ? `附件 ${failure.assetId.slice(0, 12)}` : fallback;
+  return assetLabel(failure.fileName, id);
+}
 function renderAssetFailures(diagnostics) {
   const failures = Array.isArray(diagnostics?.failures) ? diagnostics.failures : [];
   show('asset-failures', failures.length > 0);
@@ -108,14 +114,19 @@ function renderAssetFailures(diagnostics) {
     const title = document.createElement('strong');
     title.textContent = assetLabel(failure.conversationTitle, '未命名对话');
     const filename = document.createElement('p');
-    filename.textContent = assetLabel(failure.fileName, '未命名附件');
+    filename.textContent = attachmentName(failure);
     const code = assetFailureCode(failure.code);
     const explanation = document.createElement('p');
     explanation.textContent = assetFailureDiagnosticMessage({ code, reason: failure.reason }) || assetFailureMessage(code);
     const metadata = document.createElement('p'); metadata.classList.add('muted');
     const held = waitReasons[failure.waitingFor] || (failure.retryHeld ? '等待条件恢复或手动重试' : '');
     metadata.textContent = `${code} · 已尝试 ${count(failure.attempt)} 次${held ? ` · ${held}` : time(failure.retryAt) ? ` · 重试等待至 ${time(failure.retryAt)}` : ''}`;
-    item.append(title, filename, explanation, metadata); list.append(item);
+    item.append(title, filename, explanation, metadata);
+    for (const summary of assetFailureAttemptSummaries(failure.responseDiagnostics)) {
+      const response = document.createElement('p'); response.classList.add('muted'); response.textContent = summary;
+      item.append(response);
+    }
+    list.append(item);
   }
 }
 function renderInternalAttachments(diagnostics, missing) {
@@ -131,7 +142,7 @@ function renderInternalAttachments(diagnostics, missing) {
     const title = document.createElement('strong');
     title.textContent = assetLabel(failure.conversationTitle, '未命名对话');
     const filename = document.createElement('p');
-    filename.textContent = assetLabel(failure.fileName, '未命名内部附件');
+    filename.textContent = attachmentName(failure, '未命名内部附件');
     const explanation = document.createElement('p');
     explanation.textContent = '工具内部看图附件（container.open_image），尚未取得原始图片。';
     const metadata = document.createElement('p'); metadata.classList.add('muted');

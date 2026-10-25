@@ -1,6 +1,7 @@
 /** Bounded local checks and repair; this module never reads the source website. */
 import { accountPrefix, readAccountManifest as defaultReadManifest,
-  readConversationArchive as defaultReadArchive, repairMissingMarkdown as defaultRepairMarkdown } from './archive-store.js';
+  readConversationArchive as defaultReadArchive, repairMissingMarkdown as defaultRepairMarkdown,
+  needsMarkdownRefresh } from './archive-store.js';
 import { validateAssetPath } from './asset-store.js';
 import { getSetting as defaultGet, setSetting as defaultSet } from './storage.js';
 
@@ -52,7 +53,7 @@ export function createLocalMaintenance({ getSetting = defaultGet, setSetting = d
   }
   function publicState(value) {
     if (!value) return { status: 'idle', runnable: false, missingConversations: [] };
-    const { directory, afterId, currentId, phase, assetAfterId, deliveryConversationId, ...result } = value;
+    const { directory, afterId, currentId, phase, assetAfterId, deliveryConversationId, deliveryBefore, ...result } = value;
     return { ...clone(result), runnable: value.status === 'running' || value.status === 'requested' };
   }
   function initial(account, directory, manual = false) {
@@ -81,14 +82,31 @@ export function createLocalMaintenance({ getSetting = defaultGet, setSetting = d
   async function deliverRepair(directory, account, state) {
     const conversationId = state.deliveryConversationId;
     if (!conversationId) return;
+    const journalKey = `archiveJournal:${account.platform}:${account.accountKey}`;
+    const pendingBefore = await getSetting(journalKey);
     // The intent is committed before writing Markdown. If the worker stops
     // after writing, the next tick still delivers the verified repaired files.
-    const repaired = await repairMissingMarkdown({ directory, account, conversationId });
-    if (repaired?.recovered?.files) await enqueueArchive({ account, archive: repaired.recovered });
-    const archive = await readConversationArchive(directory, account, conversationId);
-    await enqueueArchive({ account, archive });
-    state.repairedMarkdown++;
+    try {
+      const repaired = await repairMissingMarkdown({ directory, account, conversationId });
+      if (repaired?.recovered?.files) await enqueueArchive({ account, archive: repaired.recovered });
+      const archive = await readConversationArchive(directory, account, conversationId);
+      await enqueueArchive({ account, archive });
+      state.repairedMarkdown++;
+    } catch (error) {
+      const before = state.deliveryBefore;
+      // A user-edited old Markdown must not block all following conversations.
+      // Skip only a migration proven not to have committed anything: no journal
+      // existed on entry or remains now, and the manifest is still the exact
+      // old snapshot. Older delivery intents without this proof remain pending.
+      if (error?.code !== 'LOCAL_CONFLICT' || !before || !needsMarkdownRefresh(before) || pendingBefore ||
+          await getSetting(journalKey)) throw error;
+      const manifest = await readAccountManifest(directory, account), current = manifest?.conversations?.[conversationId];
+      if (!current || current.contentHash !== before.contentHash || current.markdownHash !== before.markdownHash ||
+          (current.rendererVersion ?? null) !== before.rendererVersion) throw error;
+      report(state, conversationId, 'LOCAL_CONFLICT');
+    }
     state.deliveryConversationId = null;
+    state.deliveryBefore = null;
     state.phase = 'assets';
     await setSetting(key(account), state);
   }
@@ -146,12 +164,20 @@ export function createLocalMaintenance({ getSetting = defaultGet, setSetting = d
           } else if (state.phase === 'markdown') {
             const file = await metadata(directory, entry.markdownPath);
             state.checked++; remaining--;
-            if (file === null) {
+            const invalid = file !== null && (!Number.isFinite(file.size) || file.size <= 0 || file.size > 24 * 1024 * 1024);
+            if (invalid) {
+              report(state, id, 'LOCAL_CONFLICT');
+              state.phase = 'assets';
+            } else if (file === null || needsMarkdownRefresh(entry)) {
+              // Old generated Markdown may exist but omit supported media.
+              // The writer verifies both old digests before changing it. Store
+              // delivery intent first so a restart cannot lose this upgrade.
               state.deliveryConversationId = id;
+              state.deliveryBefore = needsMarkdownRefresh(entry) ? { contentHash: entry.contentHash,
+                markdownHash: entry.markdownHash, rendererVersion: entry.rendererVersion ?? null } : null;
               await setSetting(key(account), state);
               await deliverRepair(directory, account, state);
             } else {
-              if (!Number.isFinite(file.size) || file.size <= 0 || file.size > 24 * 1024 * 1024) report(state, id, 'LOCAL_CONFLICT');
               state.phase = 'assets';
             }
           } else {

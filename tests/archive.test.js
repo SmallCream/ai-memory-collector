@@ -231,7 +231,7 @@ test('readable Markdown contains just title, speakers and normally formatted con
   assert.deepEqual(JSON.parse(result.files[0].content), source);
   assert.equal(result.summary.coverage.messages, 'partial');
   assert.ok(result.manifest.conversations['reading-demo'].warnings.length);
-  assert.equal(result.manifest.conversations['reading-demo'].rendererVersion, 'rich-2');
+  assert.equal(result.manifest.conversations['reading-demo'].rendererVersion, 'rich-3');
 });
 
 test('internal and hidden messages stay in JSON but do not clutter the reading view', async () => {

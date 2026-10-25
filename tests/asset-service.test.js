@@ -331,6 +331,59 @@ test('bare generated pointer reaches authenticated file download, local image, M
   });
 });
 
+test('real probe response diagnostics survive resolver, persisted retry and restart without raw fields', async () => {
+  const env = setup(), user = 'synthetic-diagnostic-user';
+  const owner = { ...account, accountKey: `acct-${(await hashBytes(new TextEncoder().encode(`chatgpt:${user}`))).slice(0, 24)}` };
+  const source = detail(); source.identity.accountKey = owner.accountKey;
+  const calls = [];
+  const browser = { tabs: { get: async () => ({ url: 'https://chatgpt.com/c/synthetic' }) },
+    scripting: { executeScript: async options => {
+      const context = vm.createContext({ URL, crypto: webcrypto, TextEncoder, TextDecoder, Uint8Array, DataView,
+        AbortController, setTimeout, clearTimeout, btoa, atob, location: { origin: 'https://chatgpt.com' },
+        document: { querySelectorAll: () => [] }, fetch: async url => {
+          if (url === 'https://chatgpt.com/api/auth/session') return new Response(JSON.stringify({
+            user: { id: user }, accessToken: 'synthetic-session-secret',
+          }), { headers: { 'content-type': 'application/json' } });
+          calls.push(url);
+          return new Response(PNG, { headers: { 'content-type': 'image/jpeg', 'x-secret': 'synthetic-header-secret' } });
+        } });
+      const probe = vm.runInContext(`(${options.func.toString()})`, context);
+      const result = await probe(...options.args);
+      result.error.diagnostics[0].headers = { authorization: 'synthetic-page-secret' };
+      return [{ frameId: 0, result }];
+    } } };
+  const resolver = createChatGPTAssetResolver(browser, { allowFileDownload: true });
+  env.dependencies.resolveAsset = async input => {
+    try { return await resolver.resolve(input); }
+    catch (error) {
+      // A second boundary must not trust callers even after page validation.
+      error.diagnostics[0].url = 'https://example.invalid/?sig=synthetic-service-secret';
+      error.diagnostics.push({ route: 'synthetic-secret-route', code: 'ASSET_FORMAT' });
+      throw error;
+    }
+  };
+  env.restart(); await env.service.save({ directory: env.fs.directory, account: owner, detail: source });
+  await env.service.tick({ directory: env.fs.directory, account: owner, tabId: 7 });
+  const taskKey = `assetJobs:${owner.accountKey}`, state = await env.fs.getSetting(taskKey), error = state.tasks[0].error;
+  assert.equal(error.code, 'ASSET_FORMAT'); assert.match(error.message, /声明的类型与图片内容不一致/);
+  assert.deepEqual(error.diagnostics, [{ route: 'file-download', code: 'ASSET_FORMAT', httpStatus: 200,
+    mimeType: 'image/jpeg', detectedType: 'png', byteLength: PNG.length, reason: 'format_image_mime_mismatch' }]);
+  assert.equal(calls.length, 1);
+  assert.doesNotMatch(JSON.stringify(state), /synthetic-(?:session|header|page|service|secret)|https:\/\//);
+  assert.ok(![...env.fs.files.keys()].some(path => path.includes('/assets/')));
+  env.restart();
+  const diagnostic = await env.service.diagnostics({ directory: env.fs.directory, account: owner });
+  assert.equal(diagnostic.failures[0].reason, 'format_image_mime_mismatch');
+  assert.deepEqual(diagnostic.failures[0].responseDiagnostics, error.diagnostics);
+  assert.equal(diagnostic.failures[0].fileId, 'file_image');
+  assert.equal(diagnostic.captureItems[0].fileName, 'file_image');
+  state.tasks[0].error.diagnostics[0].body = 'synthetic-stored-secret';
+  state.tasks[0].error.diagnostics.push({ route: 'file-download', code: 'synthetic-stored-secret', reason: 'synthetic-stored-secret',
+    mimeType: 'synthetic-stored-secret', detectedType: 'synthetic-stored-secret', byteLength: Infinity });
+  await env.fs.setSetting(taskKey, state);
+  assert.doesNotMatch(JSON.stringify(await env.service.diagnostics({ directory: env.fs.directory, account: owner })), /synthetic-stored-secret/);
+});
+
 test('failure diagnostics immediately reflect durable queue and never expose raw error URLs or tokens', async () => {
   const env = setup(); await env.save(detail()); env.resolveFailure(true);
   await env.tick();

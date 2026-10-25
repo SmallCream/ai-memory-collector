@@ -6,7 +6,7 @@ import { assetPath, readLocalBytes, verifiedLocalAsset, writeLocalAsset, assetEx
 import { createLfsClient, hashBytes, formatLfsPointer, parseLfsPointer } from './lfs.js';
 import { collectorError, safeError } from './config.js';
 import { createActivityLog } from './activity-log.js';
-import { assetFailureReason } from './asset-failure.js';
+import { assetFailureReason, sanitizeAssetFailureDiagnostics } from './asset-failure.js';
 
 const ready = asset => asset.status === 'downloaded' && asset.oid && asset.localPath;
 const key = account => `assetJobs:${account.accountKey}`;
@@ -65,6 +65,8 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
     task.attempt = (task.attempt || 0) + 1;
     task.failureStreak = (task.failureStreak || 0) + 1;
     task.error = safeError(error); task.errorStage = stage;
+    const responseDiagnostics = sanitizeAssetFailureDiagnostics(error?.diagnostics);
+    if (responseDiagnostics.length) task.error.diagnostics = responseDiagnostics;
     if (sourceHash) task.retrySourceHash = sourceHash;
     const hold = heldReason(task.error.code, task.failureStreak);
     if (hold) task.retryHeld = hold; else delete task.retryHeld;
@@ -89,8 +91,9 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
       const reason = assetFailureReason(task.error);
       return { conversationId: label(task.conversationId), assetId: label(task.assetId),
         conversationTitle: label(entry?.title), fileName: label(asset?.fileName),
-        messageId: label(asset?.messageId), fileId: label(asset?.fileId),
+        messageId: label(asset?.messageId), fileId: label(asset?.fileId), libraryFileId: label(asset?.libraryFileId),
         code: safeError(task.error).code, ...(reason ? { reason: reason.reason } : {}),
+        responseDiagnostics: sanitizeAssetFailureDiagnostics(task.error?.diagnostics),
         message: reason?.message || '附件处理未完成，请根据错误代码检查后重试。',
         attempt: Number.isSafeInteger(task.attempt) && task.attempt >= 0 ? task.attempt : 0,
         retryAt: Number.isFinite(task.retryAt) ? task.retryAt : 0,
@@ -98,7 +101,8 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
     };
     const captureItems = state.tasks.slice(0, 50).map(task => {
       const item = describe(task);
-      return { conversationId: item.conversationId, title: item.conversationTitle, fileName: item.fileName,
+      return { conversationId: item.conversationId, title: item.conversationTitle,
+        fileName: item.fileName || item.fileId || item.libraryFileId || (/^[a-f0-9]{64}$/.test(item.assetId) ? `附件 ${item.assetId.slice(0, 12)}` : ''),
         status: deliveryPending(task) ? 'delivering' : task.manualRetry ? 'pending' : suspended(task) ? 'internal-missing' :
           !captureEnabled ? 'paused-setting' : task.retryHeld ? `waiting-${task.retryHeld}` :
           task.error ? (task.retryAt > now() ? 'retry' : 'failed') : 'pending',

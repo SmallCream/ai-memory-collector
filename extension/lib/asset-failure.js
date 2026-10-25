@@ -5,6 +5,12 @@ const definitions = [
     ['附件请求返回了网页，未作为附件保存。', '附件请求返回了网页，未保存。', '图片请求返回了网页，未作为图片保存。']],
   ['ASSET_FORMAT', 'format_image_unconfirmed', '图片文件头无法识别，或响应类型与文件内容不一致。',
     ['附件类型或文件头无法确认，未保存为原图。', '图片类型或文件头无法确认，未保存为原图。']],
+  ['ASSET_FORMAT', 'format_image_header_unknown', '响应中未识别到受支持的图片文件头，未保存。',
+    ['响应中未识别到受支持的图片文件头，未保存。']],
+  ['ASSET_FORMAT', 'format_image_type_unsupported', '响应是当前下载器尚不支持的图片类型，未保存。',
+    ['响应是当前下载器尚不支持的图片类型，未保存。']],
+  ['ASSET_FORMAT', 'format_image_mime_mismatch', '已识别图片文件头，但响应声明的类型与图片内容不一致，未保存。',
+    ['已识别图片文件头，但响应声明的类型与图片内容不一致，未保存。']],
   ['ASSET_FORMAT', 'format_response_unconfirmed', '返回内容为空，或响应类型与来源信息不一致。',
     ['附件类型与来源信息不一致，未保存。']],
   ['ASSET_FORMAT', 'format_content_validation_failed', '附件内容未通过格式校验，未保存。',
@@ -39,4 +45,48 @@ export function assetFailureDiagnosticMessage(error) {
   if (typeof error?.reason !== 'string') return null;
   const found = byReason.get(error.reason);
   return found && found.code === error.code ? found.message : null;
+}
+
+const routes = new Set(['captured-resource', 'library-download', 'interpreter-download', 'file-download', 'visible-image']);
+const mimeTypes = new Set(['missing', 'unknown', 'image/png', 'image/jpeg', 'image/gif', 'image/webp',
+  'image/avif', 'image/heif', 'image/heic', 'image/svg+xml', 'image/bmp', 'image/tiff',
+  'application/octet-stream', 'binary/octet-stream', 'application/json', 'application/problem+json',
+  'text/html', 'text/plain', 'application/zip', 'application/x-zip-compressed', 'application/pdf']);
+const detectedTypes = new Set(['not-read', 'empty', 'unknown', 'png', 'jpeg', 'gif', 'webp',
+  'avif', 'heif', 'bmp', 'tiff', 'svg', 'html', 'json', 'zip', 'pdf']);
+const diagnosticCodes = new Set(['ASSET_FORMAT', 'ASSET_PROTOCOL', 'ASSET_URL', 'ASSET_REDIRECT',
+  'ASSET_NETWORK', 'ASSET_TIMEOUT', 'ASSET_STREAM', 'ASSET_TOO_LARGE', 'ASSET_VARIANT',
+  'ASSET_HASH_MISMATCH', 'ASSET_PENDING', 'COLLECTION_PAUSED']);
+
+/** Only enums and bounded numbers cross the page, storage and UI boundaries. */
+export function sanitizeAssetFailureDiagnostics(value) {
+  if (!Array.isArray(value)) return [];
+  const output = [];
+  for (const entry of value.slice(0, 5)) {
+    if (!entry || typeof entry !== 'object' || !routes.has(entry.route)) continue;
+    const item = { route: entry.route };
+    if (diagnosticCodes.has(entry.code) || typeof entry.code === 'string' && /^HTTP_[1-5]\d{2}$/.test(entry.code)) item.code = entry.code;
+    if (Number.isSafeInteger(entry.httpStatus) && entry.httpStatus >= 100 && entry.httpStatus <= 599) item.httpStatus = entry.httpStatus;
+    if (typeof entry.mimeType === 'string') item.mimeType = mimeTypes.has(entry.mimeType) ? entry.mimeType : 'unknown';
+    if (detectedTypes.has(entry.detectedType)) item.detectedType = entry.detectedType;
+    if (Number.isSafeInteger(entry.byteLength) && entry.byteLength >= 0 && entry.byteLength <= 16 * 1024 * 1024) item.byteLength = entry.byteLength;
+    const reason = byReason.get(entry.reason);
+    if (reason && reason.code === item.code) item.reason = entry.reason;
+    output.push(item);
+  }
+  return output;
+}
+
+/** Fixed Chinese labels; never display response text, raw headers or URLs. */
+export function assetFailureAttemptSummaries(value) {
+  const names = { 'captured-resource': '对话资源', 'library-download': '文件库入口',
+    'interpreter-download': '生成文件入口', 'file-download': '文件下载入口', 'visible-image': '页面原图' };
+  const signatures = { 'not-read': '未读取', empty: '空内容', unknown: '未知',
+    png: 'PNG', jpeg: 'JPEG', gif: 'GIF', webp: 'WebP', avif: 'AVIF', heif: 'HEIF',
+    bmp: 'BMP', tiff: 'TIFF', svg: 'SVG', html: '网页', json: 'JSON', zip: 'ZIP', pdf: 'PDF' };
+  return sanitizeAssetFailureDiagnostics(value).map(item => [names[item.route],
+    item.httpStatus ? `HTTP ${item.httpStatus}` : '', item.code || '',
+    item.mimeType ? `声明：${item.mimeType === 'missing' ? '未声明' : item.mimeType === 'unknown' ? '其他类型' : item.mimeType}` : '',
+    item.detectedType ? `文件头：${signatures[item.detectedType]}` : '',
+    item.byteLength !== undefined ? `${item.byteLength} 字节` : ''].filter(Boolean).join(' · '));
 }

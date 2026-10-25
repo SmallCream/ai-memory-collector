@@ -4,6 +4,7 @@ import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
 import { createChatGPTAssetResolver, probeChatGPTAsset, validateExternalAsset } from '../extension/lib/chatgpt-assets.js';
 import { extractAssets } from '../extension/lib/assets.js';
+import { assetFailureReason } from '../extension/lib/asset-failure.js';
 
 const PNG = new Uint8Array(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9WQAAAAASUVORK5CYII=', 'base64'));
 const hash = async bytes => Buffer.from(await webcrypto.subtle.digest('SHA-256', bytes)).toString('hex');
@@ -52,6 +53,67 @@ function browserFor(h, { tabs, mutate } = {}) {
     return [{ frameId: 0, result: mutate ? mutate(result) : result }];
   } } };
 }
+
+test('serialized failures distinguish unknown headers, unsupported image signatures and MIME mismatches without accepting any', async t => {
+  const avif = new Uint8Array([0, 0, 0, 16, 102, 116, 121, 112, 97, 118, 105, 102, 0, 0, 0, 0]);
+  const cases = [
+    { name: 'unknown header', bytes: new TextEncoder().encode('synthetic-private-response'), mime: 'application/octet-stream', detectedType: 'unknown', reason: 'format_image_header_unknown' },
+    { name: 'HTML with image MIME', bytes: new TextEncoder().encode('<html>synthetic-private-response</html>'), mime: 'image/png', detectedType: 'html', reason: 'format_image_header_unknown' },
+    { name: 'JSON with neutral MIME', bytes: new TextEncoder().encode('{"error":"synthetic-private-response"}'), mime: 'application/octet-stream', detectedType: 'json', reason: 'format_image_header_unknown' },
+    { name: 'AVIF remains unsupported', bytes: avif, mime: 'image/avif', detectedType: 'avif', reason: 'format_image_type_unsupported' },
+    { name: 'known image MIME conflict', bytes: PNG, mime: 'image/jpeg', detectedType: 'png', reason: 'format_image_mime_mismatch' },
+  ];
+  for (const value of cases) await t.test(value.name, async () => {
+    const h = harness({ serve: () => new Response(value.bytes, { headers: { 'content-type': value.mime } }) });
+    const result = await h.run();
+    assert.equal(result.ok, false); assert.equal(result.error.code, 'ASSET_FORMAT');
+    assert.equal(assetFailureReason(result.error).reason, value.reason);
+    assert.deepEqual(JSON.parse(JSON.stringify(result.error.diagnostics)), [{
+      route: 'library-download', httpStatus: 200, mimeType: value.mime, detectedType: value.detectedType,
+      byteLength: value.bytes.length, code: 'ASSET_FORMAT', reason: value.reason,
+    }]);
+    assert.equal(h.calls.filter(call => call.url !== sessionURL).length, 1);
+    assert.doesNotMatch(JSON.stringify(result), /synthetic-private-response|synthetic-secret-token|https:\/\//);
+  });
+});
+
+test('diagnostics retain bounded candidate routes and do not add any retries or expose response bodies', async () => {
+  const images = Array.from({ length: 4 }, (_, index) => image({ src: `blob:https://chatgpt.com/1111-${index}` }));
+  const h = harness({ images, serve: () => new Response('synthetic-private-response', { status: 403,
+    headers: { 'content-type': 'application/json', 'x-private-token': 'synthetic-header-secret' } }) });
+  const result = await h.run({ asset: { ...asset, retrievalURL: estuaryURL }, allowFileDownload: true, conversationId });
+  assert.equal(result.error.code, 'HTTP_403');
+  assert.equal(h.calls.filter(call => call.url !== sessionURL).length, 7);
+  assert.equal(result.error.diagnostics.length, 5);
+  assert.deepEqual(Array.from(result.error.diagnostics, item => item.route), [
+    'captured-resource', 'library-download', 'file-download', 'visible-image', 'visible-image',
+  ]);
+  assert(result.error.diagnostics.every(item => item.httpStatus === 403 && item.mimeType === 'application/json' && item.detectedType === 'not-read'));
+  assert(result.error.diagnostics.every(item => item.byteLength === undefined));
+  assert.doesNotMatch(JSON.stringify(result), /synthetic-(?:private|header|estuary|secret)|https:\/\/|blob:/);
+});
+
+test('resolver filters forged diagnostic fields, MIME values, routes and sizes at the page boundary', async () => {
+  const h = harness({ serve: () => new Response('x', { headers: { 'content-type': 'image/png' } }) });
+  const resolver = createChatGPTAssetResolver(browserFor(h, { mutate: result => ({ ...result, error: {
+    ...result.error, diagnostics: [
+      { route: 'library-download', code: 'ASSET_FORMAT', httpStatus: 200, mimeType: 'image/png', detectedType: 'unknown',
+        byteLength: 1, reason: 'format_image_header_unknown', token: 'synthetic-private', url: estuaryURL, body: 'synthetic-private' },
+      { route: 'file-download', code: 'ASSET_FORMAT', mimeType: 'text/private-secret', detectedType: 'synthetic-private', byteLength: -1 },
+      { route: estuaryURL, code: 'ASSET_FORMAT', mimeType: 'image/png' },
+    ],
+  } }) }), { allowLibraryDownload: true });
+  await assert.rejects(resolver.resolve({ tabId: 3, account: ACCOUNT, conversationId, asset }), error => {
+    assert.equal(error.code, 'ASSET_FORMAT');
+    assert.deepEqual(error.diagnostics, [
+      { route: 'library-download', code: 'ASSET_FORMAT', httpStatus: 200, mimeType: 'image/png', detectedType: 'unknown',
+        byteLength: 1, reason: 'format_image_header_unknown' },
+      { route: 'file-download', code: 'ASSET_FORMAT', mimeType: 'unknown' },
+    ]);
+    assert.doesNotMatch(JSON.stringify(error), /synthetic-private|private-secret|https:\/\//);
+    return true;
+  });
+});
 
 test('serialized page probe checks account before and after and returns verified bounded image bytes', async () => {
   const h = harness();

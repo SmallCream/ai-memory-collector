@@ -1,5 +1,6 @@
 import { assetExtension, inspectAttachmentBytes } from './asset-store.js';
 import { createRequestControl, CollectorRequestCancelledError, safeRetryAfter } from './detail-request-lifetime.js';
+import { sanitizeAssetFailureDiagnostics } from './asset-failure.js';
 
 /** Read-only attachment retrieval. No download URL or session credential leaves the page. */
 export const DEFAULT_ASSET_LIMIT = 16 * 1024 * 1024;
@@ -22,13 +23,15 @@ function sandboxPath(reference) {
 }
 
 export class ChatGPTAssetError extends Error {
-  constructor(code, message, state = 'pending', retryAfterMs) {
+  constructor(code, message, state = 'pending', retryAfterMs, diagnostics) {
     super(message); this.name = 'ChatGPTAssetError'; this.code = code; this.state = state;
     const delay = safeRetryAfter(code, retryAfterMs);
     if (delay !== undefined) this.retryAfterMs = delay;
+    const safeDiagnostics = sanitizeAssetFailureDiagnostics(diagnostics);
+    if (safeDiagnostics.length) this.diagnostics = safeDiagnostics;
   }
 }
-const failure = (code, message, state, retryAfterMs) => { throw new ChatGPTAssetError(code, message, state, retryAfterMs); };
+const failure = (code, message, state, retryAfterMs, diagnostics) => { throw new ChatGPTAssetError(code, message, state, retryAfterMs, diagnostics); };
 const isSource = value => { try { return new URL(value).origin === 'https://chatgpt.com'; } catch { return false; } };
 
 function descriptor(input) {
@@ -104,7 +107,7 @@ export function createChatGPTAssetResolver(browser, { allowLibraryDownload = fal
     if (!result?.ok) {
       const code = /^[A-Z][A-Z0-9_]{0,60}$/.test(result?.error?.code || '') ? result.error.code : 'ASSET_PENDING';
       failure(code, typeof result?.error?.message === 'string' ? result.error.message : '附件尚未取得，等待补采。',
-        result?.error?.state === 'unavailable' ? 'unavailable' : 'pending', result?.error?.retryAfterMs);
+        result?.error?.state === 'unavailable' ? 'unavailable' : 'pending', result?.error?.retryAfterMs, result?.error?.diagnostics);
     }
     if (result.accountKey !== accountKey) failure('ACCOUNT_CHANGED', '附件采集期间账号发生变化，结果已丢弃。');
     const value = result.binary;
@@ -214,8 +217,8 @@ export async function validateExternalAsset({ url, browser = globalThis.chrome, 
 
 // Serialized by executeScript. Keep all helpers and constants inside this function.
 export async function probeChatGPTAsset(request) {
-  const fail = (code, message, state = 'pending', retryAfterMs) => {
-    throw Object.assign(new Error(message), { code, state, ...(Number.isFinite(retryAfterMs) ? { retryAfterMs } : {}) });
+  const fail = (code, message, state = 'pending', retryAfterMs, reason) => {
+    throw Object.assign(new Error(message), { code, state, ...(reason ? { reason } : {}), ...(Number.isFinite(retryAfterMs) ? { retryAfterMs } : {}) });
   };
   const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
   let registry, scope;
@@ -235,6 +238,36 @@ export async function probeChatGPTAsset(request) {
     return error;
   };
   const maxAllowed = 16 * 1024 * 1024;
+  const diagnostics = [];
+  let currentDiagnostic = null;
+  const safeMimes = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif', 'image/heif', 'image/heic',
+    'image/svg+xml', 'image/bmp', 'image/tiff', 'application/octet-stream', 'binary/octet-stream', 'application/json',
+    'application/problem+json', 'text/html', 'text/plain', 'application/zip', 'application/x-zip-compressed', 'application/pdf']);
+  const safeDiagnosticCode = code => typeof code === 'string' && (/^HTTP_[1-5]\d{2}$/.test(code) ||
+    ['ASSET_FORMAT', 'ASSET_PROTOCOL', 'ASSET_URL', 'ASSET_REDIRECT', 'ASSET_NETWORK', 'ASSET_TIMEOUT', 'ASSET_STREAM',
+      'ASSET_TOO_LARGE', 'ASSET_VARIANT', 'ASSET_HASH_MISMATCH', 'ASSET_PENDING', 'COLLECTION_PAUSED'].includes(code)) ? code : null;
+  function signatureType(bytes) {
+    if (!bytes.length) return 'empty';
+    const starts = values => values.every((value, index) => bytes[index] === value);
+    const ascii = (start, count) => String.fromCharCode(...bytes.subarray(start, start + count));
+    if (bytes.length >= 24 && starts([137, 80, 78, 71, 13, 10, 26, 10]) && ascii(12, 4) === 'IHDR') return 'png';
+    if (bytes.length >= 4 && starts([255, 216, 255])) return 'jpeg';
+    if (bytes.length >= 10 && ['GIF87a', 'GIF89a'].includes(ascii(0, 6))) return 'gif';
+    if (bytes.length >= 12 && ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP') return 'webp';
+    if (bytes.length >= 16 && ascii(4, 4) === 'ftyp') {
+      if (['avif', 'avis'].includes(ascii(8, 4))) return 'avif';
+      if (['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'].includes(ascii(8, 4))) return 'heif';
+    }
+    if (bytes.length >= 26 && ascii(0, 2) === 'BM') return 'bmp';
+    if (starts([73, 73, 42, 0]) || starts([77, 77, 0, 42])) return 'tiff';
+    if (starts([80, 75, 3, 4]) || starts([80, 75, 5, 6])) return 'zip';
+    if (ascii(0, 5) === '%PDF-') return 'pdf';
+    const head = new TextDecoder().decode(bytes.subarray(0, 512)).trimStart();
+    if (/^(?:<!doctype\s+html|<html(?:\s|>)|<head(?:\s|>)|<body(?:\s|>))/i.test(head)) return 'html';
+    if (/^(?:<\?xml[^>]*>\s*)?<svg(?:\s|>)/i.test(head)) return 'svg';
+    if (/^(?:\{|\[)/.test(head)) return 'json';
+    return 'unknown';
+  }
   const filePattern = /^file[-_][A-Za-z0-9_-]{1,160}$/;
   const libraryPattern = /^libfile_[A-Za-z0-9_-]{1,160}$/;
   const conversationPattern = /^[a-zA-Z0-9_-]{1,100}$/;
@@ -297,6 +330,14 @@ export async function probeChatGPTAsset(request) {
       checkCancelled();
       if (controller.signal.aborted) fail('ASSET_TIMEOUT', '附件读取超时，请稍后重试。');
     };
+    const rememberResponse = response => {
+      if (sessionRequest || !currentDiagnostic) return;
+      delete currentDiagnostic.httpStatus; delete currentDiagnostic.byteLength;
+      currentDiagnostic.detectedType = 'not-read';
+      if (Number.isSafeInteger(response.status) && response.status >= 100 && response.status <= 599) currentDiagnostic.httpStatus = response.status;
+      const mime = (response.headers?.get?.('content-type') || '').split(';')[0].trim().toLowerCase();
+      currentDiagnostic.mimeType = !mime ? 'missing' : safeMimes.has(mime) ? mime : 'unknown';
+    };
     try {
       checkDeadline();
       const sameOrigin = new URL(url, 'https://chatgpt.com').origin === 'https://chatgpt.com' && !String(url).startsWith('blob:');
@@ -304,6 +345,7 @@ export async function probeChatGPTAsset(request) {
         cache: 'no-store', redirect: sessionRequest ? 'error' : 'manual', referrerPolicy: 'no-referrer',
         headers: token && sameOrigin ? { Authorization: `Bearer ${token}` } : {}, signal: controller.signal };
       let response = await fetch(url, options);
+      rememberResponse(response);
       checkDeadline();
       if (response.type === 'opaqueredirect' && !sessionRequest && allowNativeRedirectFollow &&
           ((asset.libraryFileId && url === `https://chatgpt.com/api/library/files/${asset.libraryFileId}/download`) ||
@@ -314,6 +356,7 @@ export async function probeChatGPTAsset(request) {
         // credentials keep cookies off the CDN. Intermediate anonymous requests
         // are not prevalidated; the final destination is checked before reading.
         response = await fetch(url, { ...options, redirect: 'follow', credentials: 'same-origin' });
+        rememberResponse(response);
         checkDeadline();
         if (response.type === 'opaqueredirect' || response.type === 'opaque' || (response.status >= 300 && response.status < 400)) {
           fail('ASSET_REDIRECT', '附件下载跳转未完成，等待补采。');
@@ -334,6 +377,10 @@ export async function probeChatGPTAsset(request) {
       const disposition = response.headers.get('content-disposition') || '';
       const bytes = await bytesOf(response, sessionRequest ? Math.min(limit, 1024 * 1024) : limit);
       checkDeadline();
+      if (!sessionRequest && currentDiagnostic) {
+        currentDiagnostic.byteLength = bytes.byteLength;
+        currentDiagnostic.detectedType = signatureType(bytes);
+      }
       return { bytes, mime,
         attachment: /^attachment(?:;|$)/i.test(disposition) };
     } catch (error) { checkDeadline(); throw error; }
@@ -380,8 +427,14 @@ export async function probeChatGPTAsset(request) {
         cursor += size + 2;
       }
     }
-    if (!mime || (declared && !['application/octet-stream', 'binary/octet-stream', mime].includes(declared))) {
-      fail('ASSET_FORMAT', '附件类型或文件头无法确认，未保存为原图。');
+    if (!mime) {
+      if (['avif', 'heif', 'bmp', 'tiff', 'svg'].includes(signatureType(bytes))) {
+        fail('ASSET_FORMAT', '响应是当前下载器尚不支持的图片类型，未保存。', 'pending', undefined, 'format_image_type_unsupported');
+      }
+      fail('ASSET_FORMAT', '响应中未识别到受支持的图片文件头，未保存。', 'pending', undefined, 'format_image_header_unknown');
+    }
+    if (declared && !['application/octet-stream', 'binary/octet-stream', mime].includes(declared)) {
+      fail('ASSET_FORMAT', '已识别图片文件头，但响应声明的类型与图片内容不一致，未保存。', 'pending', undefined, 'format_image_mime_mismatch');
     }
     if ((width !== null && (!width || !height || width * height > 100000000)) ||
         (asset.width && width !== null && asset.width !== width) || (asset.height && height !== null && asset.height !== height)) {
@@ -451,6 +504,19 @@ export async function probeChatGPTAsset(request) {
     }
     fail('ASSET_REDIRECT', '附件跳转次数超过限制，等待适配。');
   }
+  async function attemptDownload(value, token, via) {
+    currentDiagnostic = { route: via, detectedType: 'not-read' };
+    try { return await download(value, token, via); }
+    catch (error) {
+      const code = safeDiagnosticCode(error?.code) || (error?.name === 'AbortError' ? 'ASSET_TIMEOUT' : 'ASSET_NETWORK');
+      if (diagnostics.length < 5) {
+        const item = { ...currentDiagnostic, code };
+        if (['format_image_type_unsupported', 'format_image_header_unknown', 'format_image_mime_mismatch'].includes(error?.reason)) item.reason = error.reason;
+        diagnostics.push(item);
+      }
+      throw error;
+    } finally { currentDiagnostic = null; }
+  }
   function visibleImages() {
     if (typeof document === 'undefined') return [];
     const ids = [asset.fileId, asset.libraryFileId].filter(Boolean);
@@ -517,24 +583,24 @@ export async function probeChatGPTAsset(request) {
     if (before.accountKey !== request.expectedAccountKey) fail('ACCOUNT_CHANGED', '当前账号与附件来源账号不一致。');
     let binary, lastError;
     if (asset.retrievalURL) {
-      try { binary = await download(asset.retrievalURL, before.token, 'captured-resource'); }
+      try { binary = await attemptDownload(asset.retrievalURL, before.token, 'captured-resource'); }
       catch (error) { lastError = nextSource(error); }
     }
     if (!binary && request.allowLibraryDownload === true && asset.libraryFileId) {
-      try { binary = await download(`https://chatgpt.com/api/library/files/${asset.libraryFileId}/download`, before.token, 'library-download'); }
+      try { binary = await attemptDownload(`https://chatgpt.com/api/library/files/${asset.libraryFileId}/download`, before.token, 'library-download'); }
       catch (error) { lastError = nextSource(error); }
     }
     if (!binary && interpreterDownloadURL) {
-      try { binary = await download(interpreterDownloadURL, before.token, 'interpreter-download'); }
+      try { binary = await attemptDownload(interpreterDownloadURL, before.token, 'interpreter-download'); }
       catch (error) { lastError = nextSource(error); }
     }
     if (!binary && fileDownloadURL) {
-      try { binary = await download(fileDownloadURL, before.token, 'file-download'); }
+      try { binary = await attemptDownload(fileDownloadURL, before.token, 'file-download'); }
       catch (error) { lastError = nextSource(error); }
     }
     if (!binary) {
       for (const url of visibleImages()) {
-        try { binary = await download(url, before.token, 'visible-image'); break; }
+        try { binary = await attemptDownload(url, before.token, 'visible-image'); break; }
         catch (error) { lastError = nextSource(error); }
       }
     }
@@ -549,6 +615,7 @@ export async function probeChatGPTAsset(request) {
     const known = /^[A-Z][A-Z0-9_]{0,60}$/.test(error?.code || '');
     return { ok: false, error: { code: known ? error.code : error?.name === 'AbortError' ? 'ASSET_TIMEOUT' : 'ASSET_NETWORK',
       state: error?.state === 'unavailable' ? 'unavailable' : 'pending',
+      ...(diagnostics.length ? { diagnostics } : {}),
       ...(['HTTP_429', 'HTTP_503'].includes(error?.code) && Number.isFinite(error.retryAfterMs)
         ? { retryAfterMs: Math.min(86_400_000, Math.max(0, Math.ceil(error.retryAfterMs))) } : {}),
       message: known ? error.message : '附件读取未完成，请检查当前登录状态、站点权限或网络后重试。' } };

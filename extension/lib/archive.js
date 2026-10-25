@@ -2,7 +2,7 @@
 import { renderRichText } from './rich-content.js';
 import { createAssetResolver, sanitizeAssetRecords, extractAssets } from './assets.js';
 import { inspectMessageGeneration } from './message-generation.js';
-export const RENDERER_VERSION = 'rich-2';
+export const RENDERER_VERSION = 'rich-3';
 const PLATFORM = 'chatgpt';
 const SECRET_KEYS = new Set(['accesstoken', 'access_token', 'refreshtoken', 'refresh_token',
   'authorization', 'cookie', 'set-cookie', 'sessiontoken', 'session_token',
@@ -118,6 +118,17 @@ function structuredTable(part, resolveAsset) {
   return output.join('\n');
 }
 
+function readableMediaPart(part, resolveAsset, withAssets) {
+  const type = part.content_type ?? part.type ?? '';
+  const kind = /image/.test(type) ? '图片' : /audio/.test(type) ? '音频' : /video/.test(type) ? '视频' : '附件';
+  const ref = part.file_id ? `file-service://${part.file_id}` : part.library_file_id ? `library:${part.library_file_id}` :
+    part.asset_pointer ?? part.image_url?.url ?? part.image_url ?? part.url ?? part.download_url;
+  const target = typeof ref === 'string' ? resolveAsset(ref) : null;
+  const name = label(part.name ?? part.file_name ?? part.filename ?? kind);
+  if (target) return `${kind === '图片' ? '!' : ''}[${name}](${target.replace(/\(/g, '%28').replace(/\)/g, '%29')})`;
+  return withAssets ? `〔${kind}，待补采〕` : `〔${kind}〕`;
+}
+
 function readablePart(part, resolveAsset, withAssets) {
   if (typeof part === 'string') return renderRichText(part, { resolveAsset });
   if (!isRecord(part)) return part == null ? '' : '〔暂未支持的非文本内容，原始数据保留在 JSON〕';
@@ -132,15 +143,7 @@ function readablePart(part, resolveAsset, withAssets) {
   if (typeof part.text?.value === 'string') return renderRichText(part.text.value, { resolveAsset });
   if (typeof part.html === 'string' && /html/.test(type)) return renderRichText(part.html, { resolveAsset });
   if (/table/.test(type)) return structuredTable(part, resolveAsset) || '〔表格结构暂未支持，原始数据保留在 JSON〕';
-  if (/image|audio|video|file|attachment/.test(type)) {
-    const kind = /image/.test(type) ? '图片' : /audio/.test(type) ? '音频' : /video/.test(type) ? '视频' : '附件';
-    const ref = part.file_id ? `file-service://${part.file_id}` : part.library_file_id ? `library:${part.library_file_id}` :
-      part.asset_pointer ?? part.image_url?.url ?? part.image_url ?? part.url ?? part.download_url;
-    const target = typeof ref === 'string' ? resolveAsset(ref) : null;
-    const name = label(part.name ?? part.file_name ?? part.filename ?? kind);
-    if (target) return `${kind === '图片' ? '!' : ''}[${name}](${target.replace(/\(/g, '%28').replace(/\)/g, '%29')})`;
-    return withAssets ? `〔${kind}，待补采〕` : `〔${kind}〕`;
-  }
+  if (/image|audio|video|file|attachment/.test(type)) return readableMediaPart(part, resolveAsset, withAssets);
   // Unknown user content is never silently deleted.
   return `〔暂未支持的${type ? label(type) : '非文本'}内容，原始数据保留在 JSON〕`;
 }
@@ -148,7 +151,19 @@ function readablePart(part, resolveAsset, withAssets) {
 function displayedMessage(message, resolveAsset, withAssets) {
   if (!isRecord(message)) return null;
   const role = message.author?.role ?? message.role;
-  if (['system', 'developer', 'tool'].includes(role) || message.metadata?.is_visually_hidden_from_conversation === true) return null;
+  if (['system', 'developer'].includes(role) || message.metadata?.is_visually_hidden_from_conversation === true) return null;
+  if (role === 'tool') {
+    // Generated images can be delivered by randomly named tools. The visible
+    // output envelope, not a tool-name allowlist, identifies this native form.
+    // Never render surrounding tool prose, code, reasoning, or metadata files.
+    const body = message.content;
+    if (message.recipient !== 'all' || !['commentary', 'final'].includes(message.channel) ||
+        !isRecord(body) || body.content_type !== 'multimodal_text' || !Array.isArray(body.parts)) return null;
+    const images = body.parts.filter(part => isRecord(part) && part.content_type === 'image_asset_pointer' &&
+      part.metadata?.is_visually_hidden_from_conversation !== true);
+    const text = images.map(part => readableMediaPart(part, resolveAsset, true)).join('\n\n');
+    return text ? { speaker: 'ChatGPT', text } : null;
+  }
   if (role === 'assistant' && (message.channel === 'analysis' ||
       (typeof message.recipient === 'string' && message.recipient && message.recipient !== 'all'))) return null;
   const body = message.content;

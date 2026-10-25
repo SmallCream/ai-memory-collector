@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
 import { detailFailureMessage, sanitizeDetailFailure } from '../extension/lib/detail-errors.js';
-import { assetFailureDiagnosticMessage } from '../extension/lib/asset-failure.js';
+import { assetFailureDiagnosticMessage, assetFailureAttemptSummaries } from '../extension/lib/asset-failure.js';
 
 const html = await readFile(new URL('../extension/panel.html', import.meta.url), 'utf8');
 const script = await readFile(new URL('../extension/panel.js', import.meta.url), 'utf8');
@@ -55,7 +55,7 @@ async function setup(options = {}) {
     setInterval: callback => { intervalCallbacks.push(callback); return 1; }, clearInterval() {},
     setTimeout: options.setTimeout || setTimeout, clearTimeout: options.clearTimeout || clearTimeout,
     getSetting: async key => settings.get(key), setSetting: async (key, value) => { events.push(`setting:${key}`); settings.set(key, value); },
-    detailFailureMessage, sanitizeDetailFailure, assetFailureDiagnosticMessage,
+    detailFailureMessage, sanitizeDetailFailure, assetFailureDiagnosticMessage, assetFailureAttemptSummaries,
     chrome: {
       runtime: { sendMessage: async message => {
         messages.push(structuredClone(message)); events.push(message.type);
@@ -425,6 +425,56 @@ test('attachment failures show recognized format reasons without exposing arbitr
   assert.match(explanations[2], /根据错误代码继续排查/);
   assert.equal(explanations[3], explanations[1]);
   assert.doesNotMatch(explanations.join(' '), /unsafe|https:\/\/|secret=1/);
+});
+
+test('attachment failures identify unnamed files using platform IDs or a short asset ID', async () => {
+  const state = initialState(), assetId = 'a1'.repeat(32);
+  const values = [
+    { fileName: '原图.png', fileId: 'file_imageA', libraryFileId: 'libfile_imageA', assetId },
+    { fileName: '', fileId: 'file_imageA', libraryFileId: 'libfile_imageA', assetId },
+    { fileId: 'https://example.com/?token=private', libraryFileId: 'libfile_imageA', assetId },
+    { fileId: '<script>private</script>', libraryFileId: 'Bearer private', assetId },
+    { fileId: 'private file', libraryFileId: 'private library', assetId: 'https://example.com/private' },
+  ];
+  state.assetDiagnostics = { total: values.length, pending: values.length, failed: values.length,
+    failures: values.map(value => ({ ...value, code: 'ASSET_FORMAT', attempt: 3 })) };
+  const app = await setup({ state });
+  const filenames = app.elements.get('asset-failure-list').children.map(item => item.children[1].textContent);
+  assert.deepEqual(filenames, ['原图.png', 'file_imageA', 'libfile_imageA', '附件 a1a1a1a1a1a1', '未命名附件']);
+  assert.doesNotMatch(filenames.join(' '), /private|https:|Bearer|script/);
+});
+
+test('attachment failure UI shows five safe response observations and preserves legacy rows', async () => {
+  const secret = 'https://example.com/?token=private-token Bearer private-token <script>private-body</script>';
+  const state = initialState();
+  const responseDiagnostics = [
+    { route: 'captured-resource', code: 'ASSET_FORMAT', httpStatus: 200, mimeType: 'image/jpeg', detectedType: 'png', byteLength: 68,
+      url: secret, headers: { Authorization: secret }, message: secret, body: secret },
+    { route: 'library-download', code: 'HTTP_403', httpStatus: 403, mimeType: 'text/html', detectedType: 'not-read' },
+    { route: 'file-download', code: 'ASSET_FORMAT', httpStatus: 200, mimeType: secret, detectedType: 'unknown', byteLength: 8 },
+    { route: 'visible-image', code: secret, httpStatus: -1, mimeType: 'missing', detectedType: secret, byteLength: '32', reason: secret },
+    { route: 'visible-image', code: 'ASSET_FORMAT', mimeType: 'image/avif', detectedType: 'avif', byteLength: 512 },
+    { route: 'interpreter-download', code: 'ASSET_NETWORK', httpStatus: 599, byteLength: 999 },
+  ];
+  state.assetDiagnostics = { total: 2, pending: 2, failed: 2, failures: [
+    { fileId: 'file_imageA', code: 'ASSET_FORMAT', reason: 'format_image_mime_mismatch', attempt: 3, responseDiagnostics },
+    { fileId: 'file_imageB', code: 'ASSET_FORMAT', reason: 'format_image_unconfirmed', attempt: 21 },
+  ] };
+  const app = await setup({ state });
+  const [modern, legacy] = app.elements.get('asset-failure-list').children;
+  assert.equal(modern.children.length, 9);
+  assert.match(modern.children[2].textContent, /已识别图片文件头.*声明的类型/);
+  assert.equal(modern.children[4].textContent, '对话资源 · HTTP 200 · ASSET_FORMAT · 声明：image/jpeg · 文件头：PNG · 68 字节');
+  assert.match(modern.children[5].textContent, /文件库入口.*HTTP 403.*声明：text\/html.*未读取/);
+  assert.match(modern.children[6].textContent, /文件下载入口.*声明：其他类型.*文件头：未知.*8 字节/);
+  assert.equal(modern.children[7].textContent, '页面原图 · 声明：未声明');
+  assert.match(modern.children[8].textContent, /页面原图.*声明：image\/avif.*文件头：AVIF.*512 字节/);
+  const shown = modern.children.map(child => child.textContent).join('\n');
+  assert.doesNotMatch(shown, /private|https:|Bearer|script|Authorization|生成文件入口|HTTP 599|999 字节/);
+  assert.equal(legacy.children.length, 4);
+  assert.match(legacy.children[2].textContent, /图片文件头无法识别，或响应类型/);
+  assert.equal(legacy.children[3].textContent, 'ASSET_FORMAT · 已尝试 21 次');
+  assert.equal(app.permissionRequests.length, 0);
 });
 
 test('image retry works while conversation scan is paused without sending a capture or resume command', async () => {
