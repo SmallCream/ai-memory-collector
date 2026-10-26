@@ -8,7 +8,7 @@ const ACCOUNT = /^acct-[a-f0-9]{24}$/;
 const FILE = /^file[-_][A-Za-z0-9_-]{1,160}$/;
 const LIBRARY = /^libfile_[A-Za-z0-9_-]{1,160}$/;
 const CONVERSATION = /^[a-zA-Z0-9_-]{1,100}$/;
-const FILE_MIMES = { zip: 'application/zip', pdf: 'application/pdf',
+const FILE_MIMES = { zip: 'application/zip', gz: 'application/gzip', tgz: 'application/gzip', pdf: 'application/pdf',
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
@@ -58,7 +58,7 @@ function descriptor(input) {
     kind: input.kind === 'image' ? 'image' : 'attachment',
     messageId: typeof input.messageId === 'string' && CONVERSATION.test(input.messageId) ? input.messageId : null,
     fileName: String(input.fileName ?? input.name ?? sourcePath?.split('/').at(-1) ?? '').slice(0, 200),
-    mimeType: typeof (input.mimeType ?? input.mime_type) === 'string' ? (input.mimeType ?? input.mime_type).toLowerCase() : null,
+    mimeType: typeof (input.mimeType ?? input.mime_type) === 'string' ? (input.mimeType ?? input.mime_type).toLowerCase().replace(/^image\/jpg$/, 'image/jpeg') : null,
     size: positive(input.expectedSize ?? input.size ?? input.sizeBytes ?? input.size_bytes), width: positive(input.width), height: positive(input.height),
     expectedHash: expectedHash || null };
 }
@@ -149,7 +149,7 @@ export async function resolveChatGPTAsset({ browser, allowLibraryDownload = fals
 
 /**
  * A successful anonymous GET establishes availability now, not permanence.
- * Missing permission, CORS failures, redirects and unrecognized content stay unknown;
+ * Missing permission, CORS failures, unrecognized redirects and content stay unknown;
  * callers must not silently turn those results into managed/LFS attachments.
  * This helper does not request permissions or retain a copy of the image.
  */
@@ -173,13 +173,25 @@ export async function validateExternalAsset({ url, browser = globalThis.chrome, 
   const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 15000);
   let reader;
   try {
-    const response = await fetchImpl(source.href, { method: 'GET', credentials: 'omit', headers: {},
-      referrerPolicy: 'no-referrer', redirect: 'manual', cache: 'no-store', signal: controller.signal });
+    const options = { method: 'GET', credentials: 'omit', headers: {},
+      referrerPolicy: 'no-referrer', redirect: 'manual', cache: 'no-store', signal: controller.signal };
+    let response = await fetchImpl(source.href, options);
+    // GitHub's standard public ZIP entry redirects to its canonical codeload
+    // endpoint. Keep the repository/ref exact and check permission on both hosts.
+    const githubArchive = source.hostname === 'github.com' && !source.search && !source.hash &&
+      /^\/([A-Za-z0-9_-][A-Za-z0-9._-]*)\/([A-Za-z0-9_-][A-Za-z0-9._-]*)\/archive\/(refs\/(?:heads|tags)\/[A-Za-z0-9_-][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_-][A-Za-z0-9._-]*)*)\.zip$/.exec(source.pathname);
+    if (githubArchive && (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 400))) {
+      const destination = `https://codeload.github.com/${githubArchive[1]}/${githubArchive[2]}/zip/${githubArchive[3]}`;
+      const location = response.headers?.get?.('location');
+      if (location && new URL(location, source).href !== destination) return unknown('redirect');
+      if (!await browser?.permissions?.contains({ origins: ['https://codeload.github.com/*'] })) return unknown('permission-required');
+      response = await fetchImpl(destination, options);
+    }
     if (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 400)) return unknown('redirect');
     if (!response.ok) return unknown(response.status === 401 || response.status === 403 ? 'authentication-required' : 'http-error', response.status);
     const declaredSize = response.headers.get('content-length');
     if (declaredSize && /^\d+$/.test(declaredSize) && Number(declaredSize) > maxBytes) return unknown('too-large');
-    const declaredMime = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    const declaredMime = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase().replace(/^image\/jpg$/, 'image/jpeg');
     if (declaredMime === 'text/html' || declaredMime === 'application/xhtml+xml') return unknown('html-response');
     if (!['', 'application/octet-stream', 'binary/octet-stream', 'image/png', 'image/jpeg', 'image/gif', 'image/webp', ...Object.values(FILE_MIMES), 'application/x-zip-compressed', 'application/javascript', 'text/x-python', 'application/x-python-code', 'application/yaml', 'application/x-yaml', 'text/yaml', 'text/xml'].includes(declaredMime)) return unknown('unsupported-content');
     reader = response.body?.getReader();
@@ -242,9 +254,10 @@ export async function probeChatGPTAsset(request) {
   const maxAllowed = 16 * 1024 * 1024;
   const diagnostics = [];
   let currentDiagnostic = null;
-  const safeMimes = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif', 'image/heif', 'image/heic',
+  const safeMimes = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp', 'image/avif', 'image/heif', 'image/heic',
     'image/svg+xml', 'image/bmp', 'image/tiff', 'application/octet-stream', 'binary/octet-stream', 'application/json',
-    'application/problem+json', 'text/html', 'text/plain', 'application/zip', 'application/x-zip-compressed', 'application/pdf']);
+    'application/problem+json', 'text/html', 'text/plain', 'application/zip', 'application/x-zip-compressed', 'application/pdf',
+    'application/gzip', 'application/x-gzip', 'application/x-compressed-tar', 'application/x-tar']);
   const safeDiagnosticCode = code => typeof code === 'string' && (/^HTTP_[1-5]\d{2}$/.test(code) ||
     ['ASSET_FORMAT', 'ASSET_PROTOCOL', 'ASSET_URL', 'ASSET_REDIRECT', 'ASSET_NETWORK', 'ASSET_TIMEOUT', 'ASSET_STREAM',
       'ASSET_TOO_LARGE', 'ASSET_VARIANT', 'ASSET_HASH_MISMATCH', 'ASSET_PENDING', 'COLLECTION_PAUSED'].includes(code)) ? code : null;
@@ -263,6 +276,7 @@ export async function probeChatGPTAsset(request) {
     if (bytes.length >= 26 && ascii(0, 2) === 'BM') return 'bmp';
     if (starts([73, 73, 42, 0]) || starts([77, 77, 0, 42])) return 'tiff';
     if (starts([80, 75, 3, 4]) || starts([80, 75, 5, 6])) return 'zip';
+    if (bytes.length >= 18 && starts([31, 139, 8])) return 'gzip';
     if (ascii(0, 5) === '%PDF-') return 'pdf';
     const head = new TextDecoder().decode(bytes.subarray(0, 512)).trimStart();
     if (/^(?:<!doctype\s+html|<html(?:\s|>)|<head(?:\s|>)|<body(?:\s|>))/i.test(head)) return 'html';
@@ -273,14 +287,14 @@ export async function probeChatGPTAsset(request) {
   const filePattern = /^file[-_][A-Za-z0-9_-]{1,160}$/;
   const libraryPattern = /^libfile_[A-Za-z0-9_-]{1,160}$/;
   const conversationPattern = /^[a-zA-Z0-9_-]{1,100}$/;
-  const fileMimes = { zip: 'application/zip', pdf: 'application/pdf',
+  const fileMimes = { zip: 'application/zip', gz: 'application/gzip', tgz: 'application/gzip', pdf: 'application/pdf',
     docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
     txt: 'text/plain', md: 'text/markdown', csv: 'text/csv', tsv: 'text/tab-separated-values', json: 'application/json',
     js: 'text/javascript', mjs: 'text/javascript', cjs: 'text/javascript', ts: 'text/plain', tsx: 'text/plain', jsx: 'text/javascript',
     py: 'text/x-python', css: 'text/css', yaml: 'application/yaml', yml: 'application/yaml', sql: 'application/sql', sh: 'application/x-sh', xml: 'application/xml', log: 'text/plain' };
-  let asset, maximum, fileDownloadURL, interpreterDownloadURL, resolvedFileId;
+  let asset, maximum, fileDownloadURL, interpreterDownloadURL, executorDownloadURL, resolvedFileId;
   function safeURL(value, { blob = false, interpreterResult = false } = {}) {
     let url; try { url = new URL(value, 'https://chatgpt.com'); } catch { fail('ASSET_URL', '附件地址无法识别。'); }
     if (blob && url.protocol === 'blob:' && /^blob:https:\/\/chatgpt\.com\/[A-Za-z0-9-]+$/.test(url.href)) return url;
@@ -303,7 +317,14 @@ export async function probeChatGPTAsset(request) {
       if (interpreterResult && validContentId && !asset.fileId && !resolvedFileId) resolvedFileId = contentIds[0];
       const observedContent = validContentId && contentIds[0] === (asset.fileId || resolvedFileId);
       const exactInterpreter = interpreterDownloadURL && url.href === interpreterDownloadURL;
-      if (!exactLibrary && !observedFile && !observedContent && !exactInterpreter) fail('ASSET_URL', '附件下载地址与当前资源不匹配。');
+      // The live executor URL is observed in the webpage's interpreter response.
+      // Compare the complete ownership tuple, not a filename or broad path prefix.
+      const exactExecutor = executorDownloadURL && url.origin === 'https://chatgpt.com' &&
+        url.pathname === new URL(executorDownloadURL).pathname && !url.hash &&
+        url.searchParams.getAll('message_id').length === 1 && url.searchParams.get('message_id') === asset.messageId &&
+        url.searchParams.getAll('sandbox_path').length === 1 && url.searchParams.get('sandbox_path') === asset.sandboxPath &&
+        [...url.searchParams.keys()].every(key => ['message_id', 'sandbox_path'].includes(key));
+      if (!exactLibrary && !observedFile && !observedContent && !exactInterpreter && !exactExecutor) fail('ASSET_URL', '附件下载地址与当前资源不匹配。');
     }
     return url;
   }
@@ -346,6 +367,13 @@ export async function probeChatGPTAsset(request) {
       const options = { method: 'GET', credentials: sameOrigin ? 'include' : 'omit',
         cache: 'no-store', redirect: sessionRequest ? 'error' : 'manual', referrerPolicy: 'no-referrer',
         headers: token && sameOrigin ? { Authorization: `Bearer ${token}` } : {}, signal: controller.signal };
+      // Match the webpage's routing for live workspace files. These client
+      // markers belong only to the exact, ownership-checked workspace entries.
+      if (token && sameOrigin && executorDownloadURL && [interpreterDownloadURL, executorDownloadURL].includes(url)) {
+        options.headers.Originator = 'Codex Browser';
+        options.headers['X-OpenAI-Web-Frontend'] = 'codex_webview';
+        options.headers['X-OpenAI-Codex-Window-Type'] = 'browser';
+      }
       let response = await fetch(url, options);
       rememberResponse(response);
       checkDeadline();
@@ -400,6 +428,7 @@ export async function probeChatGPTAsset(request) {
     return { accountKey, token: value.accessToken };
   }
   function imageInfo(bytes, declared) {
+    if (declared === 'image/jpg') declared = 'image/jpeg';
     const starts = signature => signature.every((value, index) => bytes[index] === value);
     const ascii = (offset, count) => String.fromCharCode(...bytes.subarray(offset, offset + count));
     let mime, width = null, height = null;
@@ -446,20 +475,24 @@ export async function probeChatGPTAsset(request) {
     if (asset.size && asset.size !== bytes.byteLength) fail('ASSET_VARIANT', '取得的附件大小与原始附件不一致，等待获取原图。');
     return { mime, width, height };
   }
-  function contentInfo(bytes, declared) {
+  async function contentInfo(bytes, declared) {
     const suffix = /\.([a-z0-9]+)$/i.exec(asset.fileName || '')?.[1].toLowerCase();
-    const aliases = { 'application/x-zip-compressed': 'application/zip', 'application/javascript': 'text/javascript',
+    const aliases = { 'application/x-zip-compressed': 'application/zip', 'application/x-gzip': 'application/gzip',
+      'application/x-compressed-tar': 'application/gzip', 'application/javascript': 'text/javascript',
       'application/x-python-code': 'text/x-python', 'text/yaml': 'application/yaml', 'application/x-yaml': 'application/yaml', 'text/xml': 'application/xml' };
+    // ChatGPT can label a gzip-compressed tar archive as its inner tar type.
+    // Restrict this alias to tar.gz/tgz; gzip framing and CRC are checked below.
+    if (/\.(?:tar\.gz|tgz)$/i.test(asset.fileName || '')) aliases['application/x-tar'] = 'application/gzip';
     const normalized = aliases[declared] || declared;
     const expectedMime = fileMimes[suffix] || Object.values(fileMimes).find(mime => mime === (aliases[asset.mimeType] || asset.mimeType)) ||
       Object.values(fileMimes).find(mime => mime === normalized);
     if (asset.kind === 'image' || /^image\//i.test(asset.mimeType || '') || !expectedMime) return imageInfo(bytes, declared);
     const sourceMime = aliases[asset.mimeType] || asset.mimeType;
     const officeType = ['docx', 'xlsx', 'pptx'].some(key => fileMimes[key] === expectedMime);
-    if (sourceMime && !['application/octet-stream', 'binary/octet-stream', expectedMime].includes(sourceMime) && !(officeType && sourceMime === 'application/zip') && !(sourceMime === 'text/plain' && !['zip', 'pdf', 'docx', 'xlsx', 'pptx'].includes(suffix))) {
+    if (sourceMime && !['application/octet-stream', 'binary/octet-stream', expectedMime].includes(sourceMime) && !(officeType && sourceMime === 'application/zip') && !(sourceMime === 'text/plain' && !['zip', 'gz', 'tgz', 'pdf', 'docx', 'xlsx', 'pptx'].includes(suffix))) {
       fail('ASSET_VARIANT', '附件格式与来源信息不一致，未保存。');
     }
-    const binaryType = ['application/zip', 'application/pdf', ...['docx', 'xlsx', 'pptx'].map(key => fileMimes[key])].includes(expectedMime);
+    const binaryType = ['application/zip', 'application/gzip', 'application/pdf', ...['docx', 'xlsx', 'pptx'].map(key => fileMimes[key])].includes(expectedMime);
     const compatibleText = normalized === 'text/plain' && !binaryType;
     const officeZip = officeType && normalized === 'application/zip';
     if (!bytes.length || (normalized && !['application/octet-stream', 'binary/octet-stream', expectedMime].includes(normalized) && !compatibleText && !officeZip)) {
@@ -468,6 +501,18 @@ export async function probeChatGPTAsset(request) {
     const head = new TextDecoder().decode(bytes.subarray(0, 512)).trimStart();
     if (/^(?:<!doctype\s+html|<html(?:\s|>)|<head(?:\s|>)|<body(?:\s|>))/i.test(head)) fail('ASSET_FORMAT', '附件请求返回了网页，未保存。');
     if (asset.size && asset.size !== bytes.byteLength) fail('ASSET_VARIANT', '附件大小与来源信息不一致，未保存。');
+    if (expectedMime === 'application/gzip') {
+      // Consume a bounded decompression stream to validate gzip framing, CRC and
+      // truncation. The archive itself is saved unchanged; no files are extracted.
+      if (bytes.length < 18 || bytes[0] !== 31 || bytes[1] !== 139 || bytes[2] !== 8 || (bytes[3] & 224)) fail('ASSET_FORMAT', '附件内容未通过 gzip 格式校验，未保存。');
+      try {
+        const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+        await bytesOf(new Response(stream), maxAllowed);
+      } catch (error) {
+        if (['ASSET_TOO_LARGE', 'COLLECTION_PAUSED'].includes(error?.code)) throw error;
+        fail('ASSET_FORMAT', 'gzip 附件不完整或校验失败，未保存。');
+      }
+    }
     // Final byte/signature/container validation runs in the extension before a
     // single byte is written. The isolated probe only returns a bounded payload.
     return { mime: expectedMime, width: null, height: null };
@@ -485,13 +530,16 @@ export async function probeChatGPTAsset(request) {
       const entryRoute = url === interpreterDownloadURL || url === fileDownloadURL || (asset.libraryFileId && url === `https://chatgpt.com/api/library/files/${asset.libraryFileId}/download`);
       if (result.mime === 'application/json' && !(jsonFile && (result.attachment || !entryRoute))) {
         let payload; try { payload = JSON.parse(new TextDecoder().decode(result.bytes)); } catch { fail('ASSET_PROTOCOL', '附件下载响应无法解析。'); }
+        if (record(payload) && payload.status === 'error' && payload.error_code === 'file_not_found') {
+          fail('ASSET_PROTOCOL', '来源接口返回 file_not_found，当前入口未提供文件；原始来源已保留。', 'pending', undefined, 'protocol_file_not_found');
+        }
         const links = record(payload) ? ['download_url', 'downloadUrl', 'download_uri', 'downloadUri', 'url'].map(key => payload[key]).filter(value => typeof value === 'string') : [];
         const unique = [...new Set(links)];
         if (unique.length !== 1) fail('ASSET_PROTOCOL', '附件下载响应结构尚未支持，等待适配。');
         next = unique[0];
       }
       if (next) { url = safeURL(next, { interpreterResult: url === interpreterDownloadURL }).href; continue; }
-      const info = contentInfo(result.bytes, result.mime);
+      const info = await contentInfo(result.bytes, result.mime);
       const sha256 = [...new Uint8Array(await crypto.subtle.digest('SHA-256', result.bytes))].map(x => x.toString(16).padStart(2, '0')).join('');
       if (asset.expectedHash && sha256 !== asset.expectedHash) fail('ASSET_HASH_MISMATCH', '附件内容哈希与已知原图不一致。');
       const chunks = [];
@@ -513,7 +561,7 @@ export async function probeChatGPTAsset(request) {
       const code = safeDiagnosticCode(error?.code) || (error?.name === 'AbortError' ? 'ASSET_TIMEOUT' : 'ASSET_NETWORK');
       if (diagnostics.length < 5) {
         const item = { ...currentDiagnostic, code };
-        if (['format_image_type_unsupported', 'format_image_header_unknown', 'format_image_mime_mismatch'].includes(error?.reason)) item.reason = error.reason;
+        if (['format_image_type_unsupported', 'format_image_header_unknown', 'format_image_mime_mismatch', 'protocol_file_not_found'].includes(error?.reason)) item.reason = error.reason;
         diagnostics.push(item);
       }
       throw error;
@@ -578,6 +626,14 @@ export async function probeChatGPTAsset(request) {
       entry.searchParams.set('message_id', asset.messageId);
       entry.searchParams.set('sandbox_path', asset.sandboxPath);
       interpreterDownloadURL = entry.href;
+      // Live-executor artifacts use /workspace paths; keep the legacy /mnt/data
+      // interpreter flow unchanged; both routes retain exact ownership checks.
+      if (asset.sandboxPath.startsWith('/workspace/')) {
+        const executor = new URL(`https://chatgpt.com/backend-api/conversation/${request.conversationId}/executor/file`);
+        executor.searchParams.set('message_id', asset.messageId);
+        executor.searchParams.set('sandbox_path', asset.sandboxPath);
+        executorDownloadURL = executor.href;
+      }
     }
     // The transient URL comes from the captured attachment, never from a guessed endpoint.
     if (asset.retrievalURL) safeURL(asset.retrievalURL, { blob: true });
@@ -594,6 +650,10 @@ export async function probeChatGPTAsset(request) {
     }
     if (!binary && interpreterDownloadURL) {
       try { binary = await attemptDownload(interpreterDownloadURL, before.token, 'interpreter-download'); }
+      catch (error) { lastError = nextSource(error); }
+    }
+    if (!binary && executorDownloadURL && (lastError?.code === 'HTTP_404' || lastError?.reason === 'protocol_file_not_found')) {
+      try { binary = await attemptDownload(executorDownloadURL, before.token, 'executor-download'); }
       catch (error) { lastError = nextSource(error); }
     }
     if (!binary && fileDownloadURL) {

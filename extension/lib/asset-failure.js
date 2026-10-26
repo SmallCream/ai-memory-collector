@@ -31,6 +31,8 @@ export function externalAssetFailure(result) {
 }
 
 const definitions = [
+  ['ASSET_PROTOCOL', 'protocol_file_not_found', '来源接口返回 file_not_found，当前入口未提供文件；原始来源已保留。',
+    ['来源接口返回 file_not_found，当前入口未提供文件；原始来源已保留。']],
   ...externalDefinitions.map(([, reason, message]) => ['ASSET_LINK_UNKNOWN', reason, message, [message]]),
   ['ASSET_LINK_UNKNOWN', 'external_permission_required', byExternalReason.get('permission-required').message,
     ['请在设置中允许检测外链附件；链接已保留。']],
@@ -49,7 +51,7 @@ const definitions = [
   ['ASSET_FORMAT', 'format_response_unconfirmed', '返回内容为空，或响应类型与来源信息不一致。',
     ['附件类型与来源信息不一致，未保存。']],
   ['ASSET_FORMAT', 'format_content_validation_failed', '附件内容未通过格式校验，未保存。',
-    ['附件类型或文件内容无法确认，未保存。']],
+    ['附件类型或文件内容无法确认，未保存。', '附件内容未通过 gzip 格式校验，未保存。', 'gzip 附件不完整或校验失败，未保存。']],
   ['ASSET_FORMAT', 'format_content_unsupported', '附件类型尚不支持，或内容未通过校验；来源已保留。',
     ['返回内容不是受支持的原始附件，已保留来源等待补采。']],
   ['ASSET_FORMAT', 'format_embedded_encoding_invalid', '内嵌附件编码无效，未保存。',
@@ -82,13 +84,14 @@ export function assetFailureDiagnosticMessage(error) {
   return found && found.code === error.code ? found.message : null;
 }
 
-const routes = new Set(['captured-resource', 'library-download', 'interpreter-download', 'file-download', 'visible-image']);
-const mimeTypes = new Set(['missing', 'unknown', 'image/png', 'image/jpeg', 'image/gif', 'image/webp',
+const routes = new Set(['captured-resource', 'library-download', 'interpreter-download', 'executor-download', 'file-download', 'visible-image']);
+const mimeTypes = new Set(['missing', 'unknown', 'image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp',
   'image/avif', 'image/heif', 'image/heic', 'image/svg+xml', 'image/bmp', 'image/tiff',
   'application/octet-stream', 'binary/octet-stream', 'application/json', 'application/problem+json',
-  'text/html', 'text/plain', 'application/zip', 'application/x-zip-compressed', 'application/pdf']);
+  'text/html', 'text/plain', 'application/zip', 'application/x-zip-compressed', 'application/pdf',
+  'application/gzip', 'application/x-gzip', 'application/x-compressed-tar', 'application/x-tar']);
 const detectedTypes = new Set(['not-read', 'empty', 'unknown', 'png', 'jpeg', 'gif', 'webp',
-  'avif', 'heif', 'bmp', 'tiff', 'svg', 'html', 'json', 'zip', 'pdf']);
+  'avif', 'heif', 'bmp', 'tiff', 'svg', 'html', 'json', 'zip', 'gzip', 'pdf']);
 const diagnosticCodes = new Set(['ASSET_FORMAT', 'ASSET_PROTOCOL', 'ASSET_URL', 'ASSET_REDIRECT',
   'ASSET_NETWORK', 'ASSET_TIMEOUT', 'ASSET_STREAM', 'ASSET_TOO_LARGE', 'ASSET_VARIANT',
   'ASSET_HASH_MISMATCH', 'ASSET_PENDING', 'COLLECTION_PAUSED']);
@@ -115,10 +118,10 @@ export function sanitizeAssetFailureDiagnostics(value) {
 /** Fixed Chinese labels; never display response text, raw headers or URLs. */
 export function assetFailureAttemptSummaries(value) {
   const names = { 'captured-resource': '对话资源', 'library-download': '文件库入口',
-    'interpreter-download': '生成文件入口', 'file-download': '文件下载入口', 'visible-image': '页面原图' };
+    'interpreter-download': '生成文件入口', 'executor-download': '工作区文件入口', 'file-download': '文件下载入口', 'visible-image': '页面原图' };
   const signatures = { 'not-read': '未读取', empty: '空内容', unknown: '未知',
     png: 'PNG', jpeg: 'JPEG', gif: 'GIF', webp: 'WebP', avif: 'AVIF', heif: 'HEIF',
-    bmp: 'BMP', tiff: 'TIFF', svg: 'SVG', html: '网页', json: 'JSON', zip: 'ZIP', pdf: 'PDF' };
+    bmp: 'BMP', tiff: 'TIFF', svg: 'SVG', html: '网页', json: 'JSON', zip: 'ZIP', gzip: 'GZIP', pdf: 'PDF' };
   return sanitizeAssetFailureDiagnostics(value).map(item => [names[item.route],
     item.httpStatus ? `HTTP ${item.httpStatus}` : '', item.code || '',
     item.mimeType ? `声明：${item.mimeType === 'missing' ? '未声明' : item.mimeType === 'unknown' ? '其他类型' : item.mimeType}` : '',

@@ -19,7 +19,7 @@ async function pendingWrite({ directory, account, asset, getSetting = defaultGet
 }
 
 export const MAX_ASSET_BYTES = 16 * 1024 * 1024;
-export const ASSET_EXTENSIONS = 'png|jpg|gif|webp|avif|bin|zip|pdf|docx|xlsx|pptx|txt|md|csv|tsv|json|js|mjs|cjs|ts|tsx|jsx|py|css|yaml|yml|sql|sh|xml|log';
+export const ASSET_EXTENSIONS = 'png|jpg|gif|webp|avif|bin|zip|gz|tgz|pdf|docx|xlsx|pptx|txt|md|csv|tsv|json|js|mjs|cjs|ts|tsx|jsx|py|css|yaml|yml|sql|sh|xml|log';
 export const isSupportedAssetExtension = value => new RegExp(`^(?:${ASSET_EXTENSIONS})$`).test(value);
 export function assetPath(account, oid, extension = 'bin') {
   if (!/^[a-f0-9]{64}$/.test(oid) || !isSupportedAssetExtension(extension)) throw collectorError('ASSET_PATH', '附件路径无效。');
@@ -131,6 +131,10 @@ export function inspectAttachmentBytes(bytes, hint = {}) {
   const ascii = (start, end) => new TextDecoder().decode(bytes.subarray(start, end));
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const u16 = at => view.getUint16(at, true), u32 = at => view.getUint32(at, true);
+  if (bytes.length >= 18 && bytes[0] === 31 && bytes[1] === 139 && bytes[2] === 8 && !(bytes[3] & 224)) {
+    if (extension && !['gz', 'tgz'].includes(extension) || !neutral && !['application/gzip', 'application/x-gzip', 'application/x-compressed-tar'].includes(mime)) return null;
+    return { extension: extension === 'tgz' ? 'tgz' : 'gz', mimeType: 'application/gzip' };
+  }
   if (bytes.length >= 22 && ascii(0, 2) === 'PK' && ((bytes[2] === 3 && bytes[3] === 4) || (bytes[2] === 5 && bytes[3] === 6))) {
     let end = -1;
     for (let at = bytes.length - 22; at >= Math.max(0, bytes.length - 65557); at--) {
