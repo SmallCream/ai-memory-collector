@@ -160,10 +160,18 @@ function validateBundles(bundles) {
   });
 }
 function sourceTime(value) {
-  const candidate = value?.update_time ?? value?.updated_at;
-  if (candidate == null || candidate === '') return null;
-  const time = typeof candidate === 'number' ? candidate * 1000 : Date.parse(candidate);
-  return Number.isFinite(time) && time >= 0 ? time : null;
+  let candidate = value?.update_time ?? value?.updated_at;
+  // Match the local archive's source-time units and millisecond precision.
+  if (typeof candidate === 'string') {
+    candidate = candidate.trim();
+    if (!candidate) return null;
+    if (/^[+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(candidate)) candidate = Number(candidate);
+  }
+  if (typeof candidate !== 'number' && typeof candidate !== 'string') return null;
+  const time = typeof candidate === 'number' ? candidate * (candidate >= 1e12 ? 1 : 1000) : Date.parse(candidate);
+  if (!Number.isFinite(time)) return null;
+  const date = new Date(Math.trunc(time));
+  return date.getUTCFullYear() >= 1970 && date.getUTCFullYear() <= 9999 ? date.getTime() : null;
 }
 function stable(value) {
   if (Array.isArray(value)) return value.map(stable);

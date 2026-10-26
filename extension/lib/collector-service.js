@@ -192,10 +192,15 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
       }));
       await Promise.allSettled([...accountWork.values()]);
       await fileQueue;
-      for (const account of Object.values(config.accounts)) {
-        if (await getSetting(`archiveJournal:${account.platform}:${account.accountKey}`)) {
-          throw collectorError('DIRECTORY_PENDING', '原目录还有未完成的文件写入，请先恢复原目录权限并继续保存，再更换目录。');
+      // Restore can write archives for accounts that have no local binding.
+      // Unknown directory ownership must also keep the pending write recoverable.
+      for (const { value: pending } of await getSettingsByPrefix('archiveJournal:')) {
+        if (!pending) continue;
+        let belongsToOriginal = !pending.directory || pending.directory === original;
+        if (!belongsToOriginal && original) {
+          try { belongsToOriginal = await original.isSameEntry(pending.directory); } catch { belongsToOriginal = true; }
         }
+        if (belongsToOriginal) throw collectorError('DIRECTORY_PENDING', '原目录还有未完成的文件写入，请先恢复原目录权限并继续保存，再更换目录。');
       }
       // Asset journals can exist before their hashes reach a conversation manifest.
       // Inspect the durable journal store, including accounts restored without a binding.
