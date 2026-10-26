@@ -526,6 +526,140 @@ test('verified public external image retains link and never uploads its bytes', 
   assert.ok(![...env.fs.files.keys()].some(path => path.includes('/assets/')));
 });
 
+async function legacyOrdinaryLinks() {
+  const env = setup();
+  const urls = ['https://github.com/example/project/blob/main/README.md',
+    'https://github.com/example/project/blob/main/docs/format.md'];
+  const source = detail([urls.map((url, index) => `[doc ${index}](${url})`).join('\n')]);
+  const assets = await Promise.all(urls.map(async (sourceRef, index) => ({
+    id: await hashBytes(new TextEncoder().encode(`external:${sourceRef}`)), sourceRef, sourceType: 'external',
+    fileName: `doc-${index}.md`, kind: 'attachment', messageId: 'message-one', status: 'pending',
+  })));
+  const saved = await env.store.saveConversation({ directory: env.fs.directory, account, detail: source, assets });
+  const jobKey = `assetJobs:${account.accountKey}`;
+  await env.fs.setSetting(jobKey, { tasks: assets.map(asset => ({ conversationId: 'conversation-one', assetId: asset.id,
+    attempt: 3, retryHeld: 'permission', retryAt: 99_000_000,
+    error: { code: 'ASSET_LINK_UNKNOWN', message: '外链暂时无法匿名验证，链接已保留，未自动上传。' } })) });
+  env.dependencies.refreshConversation = async () => { throw new Error('link retirement must not refresh online'); };
+  env.dependencies.resolveAsset = async () => { throw new Error('link retirement must not download'); };
+  env.restart();
+  return { env, urls, source, assets, saved, jobKey };
+}
+
+test('confirmed ordinary GitHub browse links retire old held tasks while preserving native and rendered links', async () => {
+  const { env, urls, saved, jobKey } = await legacyOrdinaryLinks();
+  const nativeBefore = env.fs.text(saved.entry.jsonPath);
+  assert.equal((await env.tick()).pending, 0);
+  const entry = (await env.manifest()).conversations['conversation-one'];
+  assert.deepEqual(entry.assets, []);
+  assert.equal(env.fs.text(entry.jsonPath), nativeBefore);
+  for (const url of urls) assert.ok(env.fs.text(entry.markdownPath).includes(url));
+  assert.equal((await env.fs.getSetting(jobKey)).tasks.length, 0);
+  assert.equal(env.enqueued.length, 1);
+  assert.equal(env.requests.length, 0); assert.equal(env.captures.length, 0);
+});
+
+test('ordinary-link retirement preserves prior receipts through delivery failure and worker restart', async () => {
+  const { env, saved, jobKey } = await legacyOrdinaryLinks();
+  const state = await env.fs.getSetting(jobKey);
+  state.tasks[0].pendingArchives = [{ ...saved, entry: { ...saved.entry, title: 'first receipt' } }];
+  state.tasks[1].priorArchives = [{ ...saved, entry: { ...saved.entry, title: 'second receipt' } }];
+  await env.fs.setSetting(jobKey, state);
+  env.enqueueFailure(true); await env.tick();
+  assert.equal((await env.fs.getSetting(jobKey)).tasks.length, 1);
+  env.enqueueFailure(false); env.time(200_000_000); env.restart(); await env.tick();
+  assert.deepEqual(env.enqueued.map(item => item.archive.entry.title), ['first receipt', 'second receipt', saved.entry.title]);
+  assert.equal(env.enqueued.at(-1).archive.entry.assets.length, 0);
+  assert.equal((await env.fs.getSetting(jobKey)).tasks.length, 0);
+});
+
+test('ordinary-link retirement recovers a stop after manifest commit before queue checkpoint', async () => {
+  const { env, saved, jobKey } = await legacyOrdinaryLinks();
+  let stop = true;
+  env.dependencies.setSetting = async (key, value) => {
+    if (stop && key === jobKey && value?.tasks.some(task => task.interfaceRetirement === 'deliver')) throw new Error('synthetic worker stop');
+    return env.fs.setSetting(key, value);
+  };
+  env.restart(); await assert.rejects(env.tick(), /synthetic worker stop/);
+  assert.equal((await env.manifest()).conversations['conversation-one'].assets.length, 0);
+  assert.equal((await env.fs.getSetting(jobKey)).tasks[0].interfaceRetirement, 'prepare');
+  stop = false; env.restart(); env.time(200_000_000); await env.tick();
+  assert.equal(env.enqueued.length, 1);
+  assert.equal(env.enqueued[0].archive.entry.contentHash, saved.entry.contentHash);
+  assert.equal((await env.fs.getSetting(jobKey)).tasks.length, 0);
+});
+
+test('ordinary-link retirement protects manually modified JSON and Markdown', async t => {
+  for (const field of ['jsonPath', 'markdownPath']) await t.test(field, async () => {
+    const { env, saved, jobKey } = await legacyOrdinaryLinks();
+    const manifestBefore = JSON.stringify(await env.manifest());
+    const edited = env.fs.text(saved.entry[field]) + '\nmanual edit';
+    env.fs.put(saved.entry[field], edited);
+    await env.tick();
+    assert.equal(JSON.stringify(await env.manifest()), manifestBefore);
+    assert.equal(env.fs.text(saved.entry[field]), edited);
+    const state = await env.fs.getSetting(jobKey);
+    assert.equal(state.tasks[0].error.code, 'LOCAL_CONFLICT');
+    assert.equal(env.enqueued.length, 0);
+  });
+});
+
+test('normal rescan preserves saved bytes and recovery hashes on a formerly collected document link', async t => {
+  for (const local of [true, false]) await t.test(local ? 'saved bytes' : 'recovery hash', async () => {
+    const { env, source, assets } = await legacyOrdinaryLinks();
+    const oid = await hashBytes(PNG);
+    const protectedAsset = local ? { ...assets[0], status: 'downloaded', oid, size: PNG.length,
+      mimeType: 'image/png', localPath: assetPath(account, oid, 'png') } : { ...assets[0], sha256: oid };
+    if (local) env.fs.put(protectedAsset.localPath, PNG);
+    await env.store.saveConversation({ directory: env.fs.directory, account, detail: source, assets: [protectedAsset, assets[1]] });
+    await env.save(source);
+    const [retained] = (await env.manifest()).conversations['conversation-one'].assets;
+    assert.equal(retained.id, protectedAsset.id);
+    if (local) { assert.equal(retained.oid, oid); assert.deepEqual(env.fs.files.get(retained.localPath), PNG); }
+    else assert.equal(retained.sha256, oid);
+    assert.equal((await env.manifest()).conversations['conversation-one'].assets.length, 1);
+  });
+});
+
+test('rescan of a protected document link with missing local bytes retains its hash without claiming download success', async () => {
+  const { env, source, assets } = await legacyOrdinaryLinks(), oid = await hashBytes(PNG);
+  const asset = { ...assets[0], status: 'downloaded', oid, size: PNG.length, localPath: assetPath(account, oid, 'png') };
+  await env.store.saveConversation({ directory: env.fs.directory, account, detail: source, assets: [asset] });
+  await env.save(source);
+  const [retained] = (await env.manifest()).conversations['conversation-one'].assets;
+  assert.equal(retained.status, 'pending'); assert.equal(retained.sha256, oid);
+  assert.equal(retained.oid, undefined); assert.equal(retained.localPath, undefined);
+  assert.ok((await env.fs.getSetting(`assetJobs:${account.accountKey}`)).tasks.some(task => task.assetId === asset.id));
+});
+
+test('external redirects remain explicit external failures and do not become permission failures', async () => {
+  const env = setup();
+  await env.save(detail(['[archive](https://github.com/example/project/archive/refs/heads/main.zip)']));
+  env.dependencies.fetchImpl = async () => new Response(null, { status: 302, headers: { location: 'https://codeload.github.com/example/project/zip/refs/heads/main' } });
+  env.restart();
+  for (let attempt = 0; attempt < 3; attempt++) { env.time(attempt * 1_000_000); await env.tick(); }
+  const task = (await env.fs.getSetting(`assetJobs:${account.accountKey}`)).tasks[0];
+  assert.equal(task.error.code, 'ASSET_LINK_UNKNOWN');
+  assert.equal(task.retryHeld, 'source');
+  const report = await env.service.diagnostics({ directory: env.fs.directory, account });
+  assert.equal(report.failures[0].reason, 'external_redirect_unresolved');
+  assert.equal(report.failures[0].waitingFor, 'source');
+  assert.equal((await env.manifest()).conversations['conversation-one'].assets[0].status, 'pending');
+});
+
+test('external permission and HTML failures expose their actual fixed diagnostic reason', async t => {
+  for (const denied of [true, false]) await t.test(denied ? 'permission' : 'HTML', async () => {
+    const env = setup();
+    env.dependencies.browser = { permissions: { contains: async () => !denied } };
+    env.dependencies.fetchImpl = async () => new Response('<html>sign in</html>', { headers: { 'content-type': 'text/html' } });
+    env.restart(); await env.save(detail(['[file](https://files.example.test/report.pdf)']));
+    await env.tick();
+    const report = await env.service.diagnostics({ directory: env.fs.directory, account });
+    assert.equal(report.failures[0].reason, denied ? 'external_permission_required' : 'external_html_response');
+    assert.equal(env.captures.length, 0);
+  });
+});
+
 test('downloadable ZIP/PDF attachments use capture, Markdown, LFS upload and new-machine restore', async t => {
   const files = [
     { fileName: 'bundle.zip', mimeType: 'application/zip', bytes: new Uint8Array(Buffer.from('UEsDBBQAAAAAAIaLVl2fm+xuBwAAAAcAAAAKAAAAUkVBRE1FLnR4dGV4YW1wbGVQSwECFAMUAAAAAACGi1Zdn5vsbgcAAAAHAAAACgAAAAAAAAAAAAAAgAEAAAAAUkVBRE1FLnR4dFBLBQYAAAAAAQABADgAAAAvAAAAAAA=', 'base64')) },

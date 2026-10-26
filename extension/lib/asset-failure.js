@@ -1,6 +1,41 @@
 // Exact internal error vocabulary only. Never expose raw error messages,
 // response bodies, headers, download URLs or credentials through diagnostics.
+const externalDefinitions = [
+  ['permission-required', 'external_permission_required', '尚未授权检测此外链域名；原链接已保留，文件未保存到本地。'],
+  ['redirect', 'external_redirect_unresolved', '外链返回了跳转，当前验证器未继续访问目标；原链接已保留，文件未保存到本地。'],
+  ['authentication-required', 'external_authentication_required', '外链要求登录或拒绝匿名访问；未转发账号凭据，原链接已保留。'],
+  ['http-not-found', 'external_http_not_found', '外链返回 HTTP 404，当前地址未提供文件；不能据此判断文件已永久失效，原链接已保留。'],
+  ['http-error', 'external_http_error', '外链服务器返回了非成功状态；原链接已保留，文件未保存到本地。'],
+  ['html-response', 'external_html_response', '外链返回了网页内容，未当作附件保存；原链接已保留。'],
+  ['unsupported-content', 'external_content_unsupported', '外链返回的内容类型尚不支持验证；原链接已保留，文件未保存到本地。'],
+  ['content-mismatch', 'external_content_mismatch', '外链返回的内容未通过附件格式校验；原链接已保留，文件未保存到本地。'],
+  ['timeout', 'external_timeout', '外链验证超时；原链接已保留，文件未保存到本地。'],
+  ['network-or-cors', 'external_network_or_cors', '外链请求未完成，可能是网络或跨域访问限制；原链接已保留。'],
+  ['too-large', 'external_too_large', '外链内容超过自动验证的大小上限；原链接已保留，文件未保存到本地。'],
+  ['empty-content', 'external_empty_content', '外链返回了空内容；原链接已保留，文件未保存到本地。'],
+  ['stream-unavailable', 'external_stream_unavailable', '外链响应无法按大小上限读取；原链接已保留，文件未保存到本地。'],
+  ['temporary-url', 'external_temporary_url', '外链包含临时访问参数，未按公开永久链接验证；来源记录已保留。'],
+  ['invalid-url', 'external_invalid_url', '外链地址格式无法识别；来源记录已保留，未发起文件获取。'],
+  ['unsupported-url', 'external_unsupported_url', '外链协议或地址形式不受支持；来源记录已保留，未发起文件获取。'],
+  ['non-public-host', 'external_non_public_host', '外链目标不属于允许自动访问的公网域名；来源记录已保留。'],
+  ['invalid-limit', 'external_invalid_limit', '外链验证的大小上限配置无效；原链接已保留，未发起文件获取。'],
+  ['unknown', 'external_unknown', '外链暂时未完成验证；原链接已保留，尚不能确认是否可以获取文件。'],
+];
+const byExternalReason = new Map(externalDefinitions.map(([source, reason, message]) => [source, { reason, message }]));
+
+/** Translate only verifier enums; raw response fields never become UI text. */
+export function externalAssetFailure(result) {
+  const source = result?.reason === 'http-error' && result?.httpStatus === 404 ? 'http-not-found' : result?.reason;
+  const found = typeof source === 'string' && byExternalReason.get(source) || byExternalReason.get('unknown');
+  return { code: 'ASSET_LINK_UNKNOWN', message: found.message };
+}
+
 const definitions = [
+  ...externalDefinitions.map(([, reason, message]) => ['ASSET_LINK_UNKNOWN', reason, message, [message]]),
+  ['ASSET_LINK_UNKNOWN', 'external_permission_required', byExternalReason.get('permission-required').message,
+    ['请在设置中允许检测外链附件；链接已保留。']],
+  ['ASSET_LINK_UNKNOWN', 'external_unknown', byExternalReason.get('unknown').message,
+    ['外链暂时无法匿名验证，链接已保留，未自动上传。']],
   ['ASSET_FORMAT', 'format_html_response', '下载入口返回了网页内容，未作为附件保存。',
     ['附件请求返回了网页，未作为附件保存。', '附件请求返回了网页，未保存。', '图片请求返回了网页，未作为图片保存。']],
   ['ASSET_FORMAT', 'format_image_unconfirmed', '图片文件头无法识别，或响应类型与文件内容不一致。',

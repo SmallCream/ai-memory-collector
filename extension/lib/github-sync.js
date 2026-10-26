@@ -84,8 +84,10 @@ function validatePointers(bundles, supplied) {
 }
 async function mergeSameNativeAssets(localEntry, remoteEntry, prefix, native) {
   if (localEntry.assets === undefined && remoteEntry?.assets === undefined) return undefined;
-  const result = new Map(assetsOf(localEntry, prefix).map(asset => [asset.id, asset]));
-  for (const remoteAsset of assetsOf(remoteEntry || {}, prefix)) {
+  const localAssets = new Map(assetsOf(localEntry, prefix).map(asset => [asset.id, asset]));
+  const remoteAssets = new Map(assetsOf(remoteEntry || {}, prefix).map(asset => [asset.id, asset]));
+  const result = new Map(localAssets);
+  for (const remoteAsset of remoteAssets.values()) {
     const localAsset = result.get(remoteAsset.id);
     // A stable source resource already saved remotely must not become pending again.
     const preferred = !localAsset || READY_ASSETS.has(remoteAsset.status) || !READY_ASSETS.has(localAsset.status) ? remoteAsset : localAsset;
@@ -105,8 +107,20 @@ async function mergeSameNativeAssets(localEntry, remoteEntry, prefix, native) {
   }
   // The caller has verified account ownership, the local hash and identical
   // native content. Retire only aliases proven by that same conversation.
-  const { assets: extracted, interfaceIconIds } = await analyzeAssets(native);
+  const { assets: extracted, interfaceIconIds, ordinaryLinkIds } = await analyzeAssets(native);
   for (const id of interfaceIconIds) result.delete(id);
+  for (const id of ordinaryLinkIds) {
+    const originals = [localAssets.get(id), remoteAssets.get(id)].filter(Boolean);
+    const protectedLinkRecord = asset => asset && (asset.sourceType !== 'external' || asset.localPath || asset.oid || asset.sha256);
+    const protectedRecord = originals.find(protectedLinkRecord), current = result.get(id);
+    if (protectedRecord) {
+      // An older pending remote record may have won the generic merge. Preserve
+      // either device's existing byte/recovery evidence before applying policy.
+      if (!protectedLinkRecord(current)) result.set(id, { ...protectedRecord,
+        ...(current?.references ? { references: current.references } : {}),
+        ...(current?.occurrences ? { occurrences: current.occurrences } : {}) });
+    } else if (originals.length && originals.every(asset => asset.sourceType === 'external')) result.delete(id);
+  }
   for (const asset of [...result.values()]) {
     if (!result.has(asset.id)) continue;
     const reconciled = await reconcileFileCitation(asset, [...result.values()], extracted);

@@ -70,7 +70,7 @@ function assetFailureMessage(code) {
   // Error strings can originate in network/extension APIs. Only fixed messages
   // reach this diagnostic view; response bodies, signed URLs and tokens do not.
   if (/^(?:HTTP_401|HTTP_403|IDENTITY)$/.test(code)) return '请确认 ChatGPT 已登录，且当前账号可以打开原始附件。';
-  if (code === 'HTTP_404') return '附件下载入口未找到；原始附件可能需要打开后补采，或等待接口适配。';
+  if (code === 'HTTP_404') return '请求的附件入口返回 404。可能是来源已失效或下载入口不匹配，尚不能据此判断文件已删除。';
   if (code === 'HTTP_429') return '附件请求受到限流，请稍后重试。';
   if (/^HTTP_5\d\d$/.test(code)) return '附件服务暂时不可用，请稍后重试。';
   if (code === 'ACCOUNT_CHANGED') return '账号已切换，已停止处理。请回到附件所属账号后重试。';
@@ -80,7 +80,7 @@ function assetFailureMessage(code) {
   if (code === 'INCOMPLETE_DETAIL') return '本次返回的对话详情不完整，未覆盖已保存数据。请稍后重试。';
   if (/^(?:ASSET_URL|ASSET_REDIRECT|ASSET_PROTOCOL)$/.test(code)) return '附件下载地址或跳转尚未支持。可打开原始附件后重试；部分资源仍需适配。';
   if (/^(?:ASSET_NETWORK|ASSET_TIMEOUT)$/.test(code)) return '附件下载未完成，请检查网络后重试。';
-  if (code === 'ASSET_LINK_UNKNOWN') return '外链暂时无法验证。请检查设置中的外链图片权限；原链接已保留。';
+  if (code === 'ASSET_LINK_UNKNOWN') return '外部链接尚未验证；原链接已保留。这不等于 ChatGPT 附件下载失败，请查看具体原因。';
   if (/^(?:ASSET_SIZE|ASSET_TOO_LARGE)$/.test(code)) return '附件数据为空或超过当前处理上限。';
   if (/^(?:ASSET_FORMAT|ASSET_RESPONSE|ASSET_NOT_IMAGE|ASSET_NOT_FILE|ASSET_STREAM)$/.test(code)) return '未取得受支持的完整附件，任务已保留。';
   if (/^(?:ASSET_VARIANT|ASSET_HASH|ASSET_HASH_MISMATCH)$/.test(code)) return '下载内容与原始附件信息不一致，未保存。';

@@ -155,7 +155,8 @@ export async function resolveChatGPTAsset({ browser, allowLibraryDownload = fals
  */
 export async function validateExternalAsset({ url, browser = globalThis.chrome, fetchImpl = globalThis.fetch,
   maxBytes = DEFAULT_ASSET_LIMIT, asset = {} } = {}) {
-  const unknown = reason => ({ status: 'unknown', reason });
+  const unknown = (reason, httpStatus) => ({ status: 'unknown', reason,
+    ...(Number.isSafeInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599 ? { httpStatus } : {}) });
   let source;
   try { source = new URL(url); } catch { return unknown('invalid-url'); }
   if (source.protocol !== 'https:' || source.username || source.password || (source.port && source.port !== '443')) return unknown('unsupported-url');
@@ -175,10 +176,11 @@ export async function validateExternalAsset({ url, browser = globalThis.chrome, 
     const response = await fetchImpl(source.href, { method: 'GET', credentials: 'omit', headers: {},
       referrerPolicy: 'no-referrer', redirect: 'manual', cache: 'no-store', signal: controller.signal });
     if (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 400)) return unknown('redirect');
-    if (!response.ok) return unknown(response.status === 401 || response.status === 403 ? 'authentication-required' : 'http-error');
+    if (!response.ok) return unknown(response.status === 401 || response.status === 403 ? 'authentication-required' : 'http-error', response.status);
     const declaredSize = response.headers.get('content-length');
     if (declaredSize && /^\d+$/.test(declaredSize) && Number(declaredSize) > maxBytes) return unknown('too-large');
     const declaredMime = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    if (declaredMime === 'text/html' || declaredMime === 'application/xhtml+xml') return unknown('html-response');
     if (!['', 'application/octet-stream', 'binary/octet-stream', 'image/png', 'image/jpeg', 'image/gif', 'image/webp', ...Object.values(FILE_MIMES), 'application/x-zip-compressed', 'application/javascript', 'text/x-python', 'application/x-python-code', 'application/yaml', 'application/x-yaml', 'text/yaml', 'text/xml'].includes(declaredMime)) return unknown('unsupported-content');
     reader = response.body?.getReader();
     if (!reader) return unknown('stream-unavailable');

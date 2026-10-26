@@ -595,6 +595,88 @@ test('same-native merge does not resurrect legacy interface icons or erase actua
   }
 });
 
+async function ordinaryLinkBundles({ resource = null } = {}) {
+  const sourceRef = 'https://github.com/example/project/blob/main/README.md';
+  const initial = bundle('ordinary-link'), native = JSON.parse(initial.files[0].content);
+  native.mapping.a.message.content.parts = [`[说明](${sourceRef})`];
+  if (resource === 'image') native.mapping.a.message.content.parts.push(`![image](${sourceRef})`);
+  if (resource === 'download') native.mapping.a.message.content.parts.push(`<a href="${sourceRef}" download>下载</a>`);
+  if (resource === 'metadata') native.mapping.a.message.metadata = {
+    attachments: [{ id: 'file_synthetic_document', url: sourceRef, name: 'README.md', mime_type: 'text/markdown' }],
+  };
+  const legacy = { id: digest(`external:${sourceRef}`), sourceRef, sourceType: 'external',
+    kind: 'attachment', fileName: 'README.md', messageId: 'message-a', status: 'pending' };
+  const build = async assets => {
+    const built = await buildArchive({ conversation: native, identity: { accountKey: ACCOUNT, displayName: 'Demo' },
+      capturedAt: '2026-10-21T00:00:00Z', existingManifest: initial.manifest, productionPrefix: PREFIX, assets });
+    return { accountKey: ACCOUNT, files: built.files, manifest: built.manifest, entry: built.manifest.conversations['ordinary-link'] };
+  };
+  return { native, sourceRef, legacy, build };
+}
+
+test('same-native merge prevents ordinary GitHub links from returning from either older device', async () => {
+  const { sourceRef, legacy, build } = await ordinaryLinkBundles();
+  const corrected = await build([]), old = await build([legacy]);
+  for (const [local, remote] of [[corrected, old], [old, corrected]]) {
+    const server = gitServer({ initial: fileMap(remote) });
+    const result = await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+    assert.deepEqual(JSON.parse(server.files()[MANIFEST]).conversations['ordinary-link'].assets, []);
+    assert.deepEqual(result.remoteWinners[0].entry.assets, []);
+    assert.ok(server.files()[remote.entry.markdownPath].includes(`[说明](${sourceRef})`));
+    assert.equal(server.files()[remote.entry.jsonPath], remote.files[0].content);
+    const replay = await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+    assert.equal(replay.status, 'unchanged');
+  }
+});
+
+test('same-native link-policy cleanup preserves existing bytes and pending recovery evidence from either device', async t => {
+  const { legacy, build } = await ordinaryLinkBundles();
+  const oid = digest('synthetic-markdown'), localPath = `${PREFIX}/assets/${oid}.md`;
+  const changes = [
+    { status: 'downloaded', oid, localPath, size: 10 },
+    { sha256: oid }, { oid }, { localPath },
+  ];
+  for (const change of changes) await t.test(Object.keys(change).join(','), async () => {
+    const protectedRecord = { ...legacy, ...change }, protectedBundle = await build([protectedRecord]), old = await build([legacy]);
+    for (const [local, remote] of [[protectedBundle, old], [old, protectedBundle]]) {
+      const server = gitServer({ initial: fileMap(remote) });
+      const result = await syncArchives({ config: { ...CONFIG, lfsEnabled: false }, bundles: [local], fetchImpl: server.fetchImpl });
+      const [retained] = result.remoteWinners[0].entry.assets;
+      assert.equal(retained.id, legacy.id);
+      for (const [field, value] of Object.entries(change)) assert.equal(retained[field], value, field);
+      const again = await syncArchives({ config: { ...CONFIG, lfsEnabled: false }, bundles: [local], fetchImpl: server.fetchImpl });
+      assert.equal(again.status, 'unchanged');
+    }
+  });
+});
+
+test('same-native link-policy cleanup keeps actual media, explicit downloads and native attachment metadata', async t => {
+  for (const resource of ['image', 'download', 'metadata']) await t.test(resource, async () => {
+    const { native, legacy, build } = await ordinaryLinkBundles({ resource });
+    const extracted = await extractAssets(native);
+    const combined = [...new Map([...extracted, legacy].map(asset => [asset.id, asset])).values()];
+    const current = await build(extracted), old = await build(combined);
+    const server = gitServer({ initial: fileMap(old) });
+    const result = await syncArchives({ config: CONFIG, bundles: [current], fetchImpl: server.fetchImpl });
+    const retained = result.remoteWinners[0].entry.assets;
+    assert.ok(retained.some(asset => asset.id === legacy.id));
+    for (const asset of extracted) assert.ok(retained.some(item => item.id === asset.id));
+  });
+});
+
+test('same-native link-policy cleanup does not discard a descriptor with a different source classification', async () => {
+  const { legacy, build } = await ordinaryLinkBundles();
+  const current = await build([{ ...legacy, sourceType: 'unknown' }]), old = await build([legacy]);
+  for (const [local, remote] of [[current, old], [old, current]]) {
+    const server = gitServer({ initial: fileMap(remote) });
+    const result = await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+    assert.equal(result.remoteWinners[0].entry.assets.length, 1);
+    assert.equal(result.remoteWinners[0].entry.assets[0].sourceType, 'unknown');
+    const replay = await syncArchives({ config: CONFIG, bundles: [local], fetchImpl: server.fetchImpl });
+    assert.equal(replay.status, 'unchanged');
+  }
+});
+
 test('same native merge preserves a suspended internal 404 from either device and stays stable on replay', async () => {
   const { asset, build } = await internalViewerBundles();
   const stale = await build([asset]), suspended = await build([{ ...asset, status: 'unavailable',

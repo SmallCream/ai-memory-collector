@@ -668,17 +668,18 @@ test('external unknowns do not become managed attachments or trigger permission 
   const cases = [
     { name: 'missing site permission', permission: false, reason: 'permission-required' },
     { name: 'CORS or network failure', serve: () => { throw new Error('private error text'); }, reason: 'network-or-cors' },
-    { name: 'authentication page', serve: () => new Response('', { status: 403 }), reason: 'authentication-required' },
+    { name: 'authentication page', serve: () => new Response('', { status: 403 }), reason: 'authentication-required', httpStatus: 403 },
+    { name: 'missing external file', serve: () => new Response('', { status: 404 }), reason: 'http-error', httpStatus: 404 },
     { name: 'opaque redirect', serve: () => ({ type: 'opaqueredirect' }), reason: 'redirect' },
     { name: 'MIME mismatch', serve: () => pngResponse(PNG, { 'content-type': 'image/jpeg' }), reason: 'content-mismatch' },
-    { name: 'HTML response', serve: () => new Response('<html/>', { headers: { 'content-type': 'text/html' } }), reason: 'unsupported-content' },
+    { name: 'HTML response', serve: () => new Response('<html/>', { headers: { 'content-type': 'text/html' } }), reason: 'html-response' },
     { name: 'stream exceeds bound', limit: 32, reason: 'too-large' },
   ];
   for (const value of cases) await t.test(value.name, async () => {
     let calls = 0;
     const result = await validateExternalAsset({ url: 'https://images.example/photo.png', browser: externalBrowser(value.permission ?? true),
       maxBytes: value.limit ?? 1024, fetchImpl: async () => { calls++; return (value.serve ?? pngResponse)(); } });
-    assert.deepEqual(result, { status: 'unknown', reason: value.reason });
+    assert.deepEqual(result, { status: 'unknown', reason: value.reason, ...(value.httpStatus ? { httpStatus: value.httpStatus } : {}) });
     if (value.permission === false) assert.equal(calls, 0);
   });
 });

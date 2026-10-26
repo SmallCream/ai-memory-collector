@@ -75,15 +75,15 @@ export async function extractAssets(conversation) {
   return (await analyzeAssets(conversation)).assets;
 }
 
-/** Also identify legacy descriptors proven to be interface icons by native context. */
+/** Also identify legacy descriptors proven to be interface icons or ordinary file-viewer links by native context. */
 export async function analyzeAssets(conversation) {
   const candidates = [];
   const fileContentReferences = new WeakSet();
   const add = (ref, info) => { if (typeof ref === 'string' && ref.trim()) candidates.push({ ref, ...info }); };
   function text(value, info) {
-    for (const reference of extractRichReferences(value)) add(reference.ref, { ...info, kind: reference.kind,
+    for (const reference of extractRichReferences(value, { includeOrdinaryLinks: true })) add(reference.ref, { ...info, kind: reference.kind,
       ...(reference.kind === 'attachment' ? { fileName: referenceFileName(reference.ref) } : {}),
-      syntax: reference.syntax, attribute: reference.attribute });
+      syntax: reference.syntax, attribute: reference.attribute, ...(reference.ordinaryLink ? { ordinaryLink: true } : {}) });
   }
   function walk(value, info, depth = 0) {
     if (depth > 100 || value == null) return;
@@ -151,7 +151,12 @@ export async function analyzeAssets(conversation) {
       interfaceAppRoot: `messages/${messageId}/metadata/dil_v2_reasoning/appData`,
       internalAttachmentRoot: internalViewer ? `messages/${messageId}/metadata/attachments/` : null });
   }
-  const result = new Map(), internalOnly = new Map(), interfaceIconIds = new Set();
+  const result = new Map(), internalOnly = new Map(), interfaceIconIds = new Set(), ordinaryLinkIds = new Set();
+  // Compare the unhinted URL as well as the eventual asset ID: native metadata
+  // may bind this same URL to a platform ID, giving it a different stable ID.
+  // Any real resource occurrence prevents retiring the old hyperlink descriptor.
+  const resourceReferences = new Set(candidates.filter(candidate => !candidate.ordinaryLink || candidate.fileId || candidate.libraryFileId)
+    .map(candidate => classifyAssetReference(candidate.ref).sourceRef));
   // Visible content wins even if the same reference also decorates a tool card.
   // Do not let icon metadata supply names, IDs or retrieval URLs to real media.
   for (const candidate of candidates.sort((a, b) => Number(Boolean(a.interfaceIcon)) - Number(Boolean(b.interfaceIcon)))) {
@@ -162,6 +167,10 @@ export async function analyzeAssets(conversation) {
     const stable = classified.fileId ? `platform:file:${classified.fileId}` : classified.libraryFileId ? `platform:library:${classified.libraryFileId}` :
       /^sandbox:/i.test(classified.sourceRef) ? JSON.stringify(['sandbox', candidate.messageId, classified.sourceRef]) : `${classified.sourceType}:${classified.sourceRef}`;
     const id = await sha256(stable);
+    if (candidate.ordinaryLink && !classified.fileId && !classified.libraryFileId) {
+      if (!resourceReferences.has(classified.sourceRef)) ordinaryLinkIds.add(id);
+      continue;
+    }
     if (candidate.interfaceIcon) { if (!result.has(id)) interfaceIconIds.add(id); continue; }
     const occurrence = { messageId: candidate.messageId, path: candidate.path, kind: candidate.kind || 'attachment',
       ...(candidate.syntax ? { syntax: candidate.syntax } : {}), ...(candidate.attribute ? { attribute: candidate.attribute } : {}) };
@@ -200,7 +209,7 @@ export async function analyzeAssets(conversation) {
     if (!asset.occurrences.some(item => item.messageId === occurrence.messageId && item.path === occurrence.path && item.kind === occurrence.kind)) asset.occurrences.push(occurrence);
   }
   for (const asset of result.values()) if (internalOnly.get(asset.id)) asset.capturePolicy = 'internal-viewer';
-  return { assets: [...result.values()], interfaceIconIds: [...interfaceIconIds] };
+  return { assets: [...result.values()], interfaceIconIds: [...interfaceIconIds], ordinaryLinkIds: [...ordinaryLinkIds] };
 }
 
 /** Re-derive policy from freshly extracted native data, never persisted labels. */

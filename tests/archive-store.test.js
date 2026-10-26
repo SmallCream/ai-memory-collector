@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildArchive } from '../extension/lib/archive.js';
-import { extractAssets } from '../extension/lib/assets.js';
+import { extractAssets, sha256 } from '../extension/lib/assets.js';
 import { createArchiveStore, readAccountManifest, hasConversationFiles, accountPrefix } from '../extension/lib/archive-store.js';
 
 const account = { platform: 'chatgpt', accountKey: 'acct-0123456789abcdef01234567', alias: 'demo', storageKey: 'demo-01234567' };
@@ -231,6 +231,117 @@ test('restoring an older derivative cannot erase downloaded assets from the iden
   assert.equal(restored.entry.assets[0].status, 'downloaded');
   assert.equal(restored.entry.assets[0].oid, oid);
   assert.equal(restored.entry.markdownHash, local.entry.markdownHash);
+});
+
+async function ordinaryLinkArchive() {
+  const url = 'https://github.com/example/project/blob/main/docs/README.md';
+  const source = detail('ordinary-link', `[read](${url})`);
+  const asset = { id: await sha256(`external:${url}`), sourceRef: url, sourceType: 'external',
+    kind: 'attachment', fileName: 'README.md', messageId: 'r', status: 'pending' };
+  const remote = setup();
+  const saved = await remote.store.saveConversation({ directory: remote.directory, account, detail: source, assets: [asset] });
+  return { url, source, asset, remote, saved };
+}
+
+test('remote import removes only native-proven ordinary file-viewer descriptors on a new machine', async () => {
+  const { url, saved } = await ordinaryLinkArchive();
+  const local = setup();
+  const applied = await local.store.applyRemoteFiles({ directory: local.directory, account, files: saved.files });
+  assert.deepEqual(applied.entry.assets, []);
+  assert.equal(local.files.get(applied.entry.jsonPath), saved.files.find(file => file.path === saved.entry.jsonPath).content);
+  assert.ok(local.files.get(applied.entry.markdownPath).includes(`[read](${url})`));
+  assert.equal(applied.entry.contentHash, saved.entry.contentHash);
+});
+
+test('same-native remote import cannot resurrect an ordinary file-viewer descriptor after local retirement', async () => {
+  const { source, saved } = await ordinaryLinkArchive();
+  const local = setup();
+  await local.store.saveConversation({ directory: local.directory, account, detail: source, assets: [] });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const applied = await local.store.applyRemoteFiles({ directory: local.directory, account, files: saved.files });
+    assert.deepEqual(applied.entry.assets, []);
+    assert.equal(applied.entry.contentHash, saved.entry.contentHash);
+  }
+});
+
+test('ordinary-link import keeps saved bytes and pending recovery evidence from either same-native record', async t => {
+  for (const field of ['localPath', 'oid', 'sha256', 'downloaded']) for (const origin of ['local', 'remote']) {
+    await t.test(`${origin} ${field}`, async () => {
+      const { source, asset, remote, saved } = await ordinaryLinkArchive();
+      const local = setup(), oid = 'a'.repeat(64), localPath = `${accountPrefix(account)}/assets/${oid}.md`;
+      const evidence = field === 'downloaded' ? { status: 'downloaded', oid, size: 9, localPath } :
+        field === 'localPath' ? { localPath } : { [field]: oid };
+      const protectedAsset = { ...asset, ...evidence };
+      const winner = origin === 'remote' ? await remote.store.saveConversation({ directory: remote.directory,
+        account, detail: source, assets: [protectedAsset] }) : saved;
+      await local.store.saveConversation({ directory: local.directory, account, detail: source,
+        assets: origin === 'local' ? [protectedAsset] : [asset] });
+      const applied = await local.store.applyRemoteFiles({ directory: local.directory, account, files: winner.files });
+      assert.equal(applied.entry.assets.length, 1);
+      for (const [key, value] of Object.entries(evidence)) assert.equal(applied.entry.assets[0][key], value);
+    });
+  }
+});
+
+test('ordinary-link import preserves nonexternal records instead of deleting them through a stale external merge', async () => {
+  const { source, asset, saved } = await ordinaryLinkArchive();
+  const local = setup();
+  await local.store.saveConversation({ directory: local.directory, account, detail: source,
+    assets: [{ ...asset, sourceType: 'unknown' }] });
+  const applied = await local.store.applyRemoteFiles({ directory: local.directory, account, files: saved.files });
+  assert.equal(applied.entry.assets.length, 1);
+  assert.equal(applied.entry.assets[0].sourceType, 'unknown');
+});
+
+test('a locally verified external link cannot erase remote pending recovery evidence during import', async t => {
+  for (const field of ['localPath', 'oid', 'sha256']) await t.test(field, async () => {
+    const { source, asset, remote } = await ordinaryLinkArchive();
+    const oid = 'b'.repeat(64), value = field === 'localPath' ? `${accountPrefix(account)}/assets/${oid}.md` : oid;
+    const pending = { ...asset, [field]: value };
+    const winner = await remote.store.saveConversation({ directory: remote.directory, account, detail: source, assets: [pending] });
+    const local = setup();
+    await local.store.saveConversation({ directory: local.directory, account, detail: source,
+      assets: [{ ...asset, status: 'external' }] });
+    const applied = await local.store.applyRemoteFiles({ directory: local.directory, account, files: winner.files });
+    assert.equal(applied.entry.assets.length, 1);
+    assert.equal(applied.entry.assets[0].status, 'pending');
+    assert.equal(applied.entry.assets[0][field], value);
+  });
+});
+
+test('remote import retains a matching true resource and ordinary hyperlink together', async t => {
+  for (const kind of ['image', 'download', 'metadata']) await t.test(kind, async () => {
+    const { url, source, asset, remote } = await ordinaryLinkArchive();
+    if (kind === 'metadata') source.payload.mapping.reply.message.metadata = { attachments: [
+      { id: 'file_synthetic_readme', url, name: 'README.md' },
+    ] };
+    else source.payload.mapping.reply.message.content.parts.push(kind === 'image' ? `![image](${url})` :
+      `<a href="${url}" download>save</a>`);
+    const fresh = await extractAssets(source.payload);
+    const assets = kind === 'metadata' ? [asset, ...fresh] : fresh;
+    const saved = await remote.store.saveConversation({ directory: remote.directory, account, detail: source, assets });
+    const local = setup();
+    const applied = await local.store.applyRemoteFiles({ directory: local.directory, account, files: saved.files });
+    assert.deepEqual(applied.entry.assets.map(item => item.id).sort(), assets.map(item => item.id).sort());
+  });
+});
+
+test('ordinary-link import still protects manual edits and refuses unverified native bytes', async t => {
+  for (const field of ['jsonPath', 'markdownPath']) await t.test(field, async () => {
+    const { source, saved } = await ordinaryLinkArchive();
+    const local = setup();
+    const before = await local.store.saveConversation({ directory: local.directory, account, detail: source, assets: [] });
+    const edited = `${local.files.get(before.entry[field])}\nmanual edit`;
+    local.files.set(before.entry[field], edited);
+    const snapshot = new Map(local.files);
+    await assert.rejects(local.store.applyRemoteFiles({ directory: local.directory, account, files: saved.files }), { code: 'LOCAL_CONFLICT' });
+    assert.deepEqual(local.files, snapshot);
+  });
+  const { saved } = await ordinaryLinkArchive();
+  const local = setup(), files = structuredClone(saved.files);
+  files.find(file => file.path === saved.entry.jsonPath).content += ' ';
+  await assert.rejects(local.store.applyRemoteFiles({ directory: local.directory, account, files }), { code: 'REMOTE_HASH' });
+  assert.equal(local.files.size, 0);
 });
 
 test('restore preserves local internal-viewer 404 suspension against an older same-native derivative', async () => {

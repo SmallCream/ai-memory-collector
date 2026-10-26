@@ -1,5 +1,5 @@
 import { buildArchive, RENDERER_VERSION } from './archive.js';
-import { extractAssets, reconcileAssetCapturePolicy } from './assets.js';
+import { analyzeAssets, reconcileAssetCapturePolicy } from './assets.js';
 import { getSetting, setSetting } from './storage.js';
 import { sanitizeMessageSync, selectMessageSync } from './message-sync-receipt.js';
 import { inspectMessageGeneration } from './message-generation.js';
@@ -539,15 +539,24 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
     const capturedAt = sourceTime(entry.lastChangedAt) || sourceTime(entry.firstCapturedAt) || new Date().toISOString();
     const localManifest = await readAccountManifest(directory, account);
     const localEntry = localManifest?.conversations?.[entry.conversationId];
-    // Only the hash-verified native conversation decides whether an attachment
-    // belongs exclusively to the internal viewer. Remote descriptors are hints.
-    const extracted = new Map((await extractAssets(native)).map(asset => [asset.id, asset]));
+    // Only the hash-verified native conversation decides whether a descriptor
+    // is a real attachment, an ordinary file-viewer link or an internal image.
+    const analysis = await analyzeAssets(native);
+    const extracted = new Map(analysis.assets.map(asset => [asset.id, asset]));
+    const ordinaryLinkIds = new Set(analysis.ordinaryLinkIds);
+    const protectedLinkRecord = asset => asset && (asset.sourceType !== 'external' || asset.localPath || asset.oid || asset.sha256);
     let assets = entry.assets;
     if (localEntry?.contentHash === entry.contentHash && Array.isArray(localEntry.assets)) {
       const merged = new Map((entry.assets || []).map(asset => [asset.id, asset]));
       for (const asset of localEntry.assets) {
         const remote = merged.get(asset.id);
-        if (!remote || (asset.status === 'downloaded' && remote.status !== 'downloaded') ||
+        // The inverse also matters: an older verified external link is not
+        // richer than a remote pending record that still owns recovery evidence.
+        if (ordinaryLinkIds.has(asset.id) && protectedLinkRecord(remote) && !protectedLinkRecord(asset)) continue;
+        // Do not let a stale pending remote record erase local saved/recovery
+        // evidence before the ordinary-link filter below sees it.
+        if (!remote || (ordinaryLinkIds.has(asset.id) && protectedLinkRecord(asset) && !protectedLinkRecord(remote)) ||
+            (asset.status === 'downloaded' && remote.status !== 'downloaded') ||
             (asset.status === 'external' && remote.status === 'pending')) merged.set(asset.id, asset);
         else if (reconcileAssetCapturePolicy(asset, extracted.get(asset.id)).autoRetrySuspended &&
             !['downloaded', 'ready', 'local', 'synced', 'external'].includes(remote.status)) {
@@ -556,7 +565,8 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
       }
       assets = [...merged.values()];
     }
-    if (Array.isArray(assets)) assets = assets.map(asset => reconcileAssetCapturePolicy(asset, extracted.get(asset.id)));
+    if (Array.isArray(assets)) assets = assets.filter(asset => !ordinaryLinkIds.has(asset.id) || protectedLinkRecord(asset))
+      .map(asset => reconcileAssetCapturePolicy(asset, extracted.get(asset.id)));
     const result = await saveConversation({ directory, account, preferredEntry: entry, assets,
       remoteMessageSync: sanitizeMessageSync(entry.messageSync, native), detail: {
       identity: { accountKey: account.accountKey, displayName: account.displayName || remoteAccount.displayName || account.alias },

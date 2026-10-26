@@ -1,7 +1,75 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { assetFailureReason, assetFailureDiagnosticMessage, sanitizeAssetFailureDiagnostics,
-  assetFailureAttemptSummaries } from '../extension/lib/asset-failure.js';
+  assetFailureAttemptSummaries, externalAssetFailure } from '../extension/lib/asset-failure.js';
+
+test('external verification failures retain distinct safe causes through storage and UI lookup', () => {
+  const cases = [
+    ['permission-required', 'external_permission_required'],
+    ['redirect', 'external_redirect_unresolved'],
+    ['authentication-required', 'external_authentication_required'],
+    ['http-error', 'external_http_error'],
+    ['html-response', 'external_html_response'],
+    ['unsupported-content', 'external_content_unsupported'],
+    ['content-mismatch', 'external_content_mismatch'],
+    ['timeout', 'external_timeout'],
+    ['network-or-cors', 'external_network_or_cors'],
+    ['too-large', 'external_too_large'],
+    ['empty-content', 'external_empty_content'],
+    ['stream-unavailable', 'external_stream_unavailable'],
+    ['temporary-url', 'external_temporary_url'],
+    ['invalid-url', 'external_invalid_url'],
+    ['unsupported-url', 'external_unsupported_url'],
+    ['non-public-host', 'external_non_public_host'],
+    ['invalid-limit', 'external_invalid_limit'],
+  ];
+  const messages = new Set();
+  for (const [sourceReason, reason] of cases) {
+    const failure = externalAssetFailure({ status: 'unknown', reason: sourceReason });
+    assert.equal(failure.code, 'ASSET_LINK_UNKNOWN');
+    assert.deepEqual(assetFailureReason(failure), { reason, message: failure.message });
+    assert.equal(assetFailureDiagnosticMessage({ code: failure.code, reason }), failure.message);
+    assert.equal(assetFailureDiagnosticMessage({ code: 'HTTP_404', reason }), null);
+    messages.add(failure.message);
+  }
+  assert.equal(messages.size, cases.length);
+});
+
+test('external HTTP 404 is reported only from an exact observed numeric status', () => {
+  const notFound = externalAssetFailure({ reason: 'http-error', httpStatus: 404 });
+  assert.equal(assetFailureReason(notFound).reason, 'external_http_not_found');
+  assert.match(notFound.message, /不能据此判断/);
+  for (const value of ['404', -404, 404.5, Infinity, NaN, {}, 999, undefined]) {
+    const failure = externalAssetFailure({ reason: 'http-error', httpStatus: value });
+    assert.equal(assetFailureReason(failure).reason, 'external_http_error');
+  }
+  assert.equal(assetFailureReason(externalAssetFailure({ reason: 'redirect', httpStatus: 404 })).reason,
+    'external_redirect_unresolved');
+});
+
+test('external failure conversion never copies URL, raw response text or unrecognized reason values', () => {
+  const secret = 'https://example.test/private?token=synthetic-secret Bearer synthetic-secret <html>private</html>';
+  const baseline = externalAssetFailure({ reason: 'unknown' });
+  for (const result of [null, undefined, {}, secret,
+    { reason: secret, message: secret, body: secret, url: secret, httpStatus: secret },
+    { reason: '__proto__' }, { reason: 'constructor' }, { reason: { toString: () => 'permission-required' } },
+  ]) assert.deepEqual(externalAssetFailure(result), baseline);
+  for (const reason of ['redirect', 'permission-required', 'authentication-required', 'http-error']) {
+    const failure = externalAssetFailure({ reason, message: secret, body: secret, url: secret,
+      headers: { authorization: secret }, httpStatus: 404 });
+    assert.doesNotMatch(JSON.stringify(failure), /synthetic-secret|https:|Bearer|<html>|headers|authorization/);
+    assert.equal(assetFailureReason({ ...failure, message: failure.message + secret }), null);
+  }
+  baseline.message = secret;
+  assert.doesNotMatch(externalAssetFailure({ reason: 'unknown' }).message, /synthetic-secret/);
+});
+
+test('legacy external errors retain only the facts the older verifier recorded', () => {
+  assert.equal(assetFailureReason({ code: 'ASSET_LINK_UNKNOWN', message: '请在设置中允许检测外链附件；链接已保留。' }).reason,
+    'external_permission_required');
+  assert.equal(assetFailureReason({ code: 'ASSET_LINK_UNKNOWN', message: '外链暂时无法匿名验证，链接已保留，未自动上传。' }).reason,
+    'external_unknown');
+});
 
 test('known format failures retain distinct bounded explanations, including both HTML rejection paths', () => {
   const cases = [

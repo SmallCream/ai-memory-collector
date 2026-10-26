@@ -6,7 +6,7 @@ import { assetPath, readLocalBytes, verifiedLocalAsset, writeLocalAsset, assetEx
 import { createLfsClient, hashBytes, formatLfsPointer, parseLfsPointer } from './lfs.js';
 import { collectorError, safeError } from './config.js';
 import { createActivityLog } from './activity-log.js';
-import { assetFailureReason, sanitizeAssetFailureDiagnostics } from './asset-failure.js';
+import { assetFailureReason, externalAssetFailure, sanitizeAssetFailureDiagnostics } from './asset-failure.js';
 
 const ready = asset => asset.status === 'downloaded' && asset.oid && asset.localPath;
 const key = account => `assetJobs:${account.accountKey}`;
@@ -20,13 +20,17 @@ const suspended = asset => asset?.autoRetrySuspended === true;
 const deliveryPending = task => task.pendingArchives?.length || task.priorArchives?.length;
 const activeTask = task => !suspended(task) || deliveryPending(task);
 
-function heldReason(code, streak) {
+function heldReason(code, streak, error) {
   if (['LOCAL_CONFLICT', 'ASSET_LOCAL_CONFLICT', 'ASSET_HASH', 'ACCOUNT_CHANGED', 'DIRECTORY_CHANGED'].includes(code)) return 'conflict';
   if (['ASSET_SIZE', 'ASSET_INPUT'].includes(code)) return 'unsupported';
   // Invalid bytes may be an expired link or login response, not proof that
   // the original file's format is unsupported.
   if (streak >= 3 && ['ASSET_FORMAT', 'ASSET_PROTOCOL', 'ASSET_URL', 'ASSET_REDIRECT'].includes(code)) return 'source';
-  if (streak >= 3 && ['HTTP_401', 'HTTP_403', 'DIRECTORY_PERMISSION', 'ASSET_PERMISSION', 'ASSET_LINK_UNKNOWN'].includes(code)) return 'permission';
+  if (streak >= 3 && code === 'ASSET_LINK_UNKNOWN') {
+    const reason = assetFailureReason(error)?.reason;
+    return ['external_permission_required', 'external_authentication_required'].includes(reason) ? 'permission' : 'source';
+  }
+  if (streak >= 3 && ['HTTP_401', 'HTTP_403', 'DIRECTORY_PERMISSION', 'ASSET_PERMISSION'].includes(code)) return 'permission';
   if (streak >= 3 && ['HTTP_404', 'ASSET_SOURCE_MISSING'].includes(code)) return 'source';
   return null;
 }
@@ -68,7 +72,7 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
     const responseDiagnostics = sanitizeAssetFailureDiagnostics(error?.diagnostics);
     if (responseDiagnostics.length) task.error.diagnostics = responseDiagnostics;
     if (sourceHash) task.retrySourceHash = sourceHash;
-    const hold = heldReason(task.error.code, task.failureStreak);
+    const hold = heldReason(task.error.code, task.failureStreak, task.error);
     if (hold) task.retryHeld = hold; else delete task.retryHeld;
     const backoff = task.failureStreak >= 6 ? 6 * 60 * 60_000 : Math.min(60, 2 ** Math.min(task.failureStreak, 6)) * 60000;
     const supplied = Number(error?.retryAfterMs);
@@ -204,7 +208,14 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
     const manifest = await readAccountManifest(directory, account);
     const id = nativeId(detail.payload), old = manifest?.conversations?.[id]?.assets || [];
     const oldMap = new Map(old.map(a => [a.id, a]));
-    const extracted = await extractAssets(detail.payload);
+    const analysis = await analyzeAssets(detail.payload);
+    const extracted = [...analysis.assets];
+    const ordinaryLinks = new Set(analysis.ordinaryLinkIds);
+    for (const previous of old) {
+      if (ordinaryLinks.has(previous.id) &&
+          (previous.sourceType !== 'external' || previous.localPath || previous.oid || previous.sha256) &&
+          !extracted.some(asset => asset.id === previous.id)) extracted.push(previous);
+    }
     const assets = [];
     for (const asset of extracted) {
       if (asset.retrieval) ephemeral.set(`${account.accountKey}:${id}:${asset.id}`, asset.retrieval);
@@ -215,7 +226,12 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
         const present = await verifiedLocalAsset({ directory, account, asset: previous, getSetting });
         const existing = { ...asset, ...previous, references: asset.references, occurrences: asset.occurrences };
         if (present) delete existing.cloudStatus;
-        assets.push(present ? reconcileAssetCapturePolicy(existing, asset) : { ...asset, sha256: previous.oid });
+        if (present) assets.push(reconcileAssetCapturePolicy(existing, asset));
+        else {
+          const missing = { ...asset, status: 'pending', sha256: previous.oid };
+          delete missing.oid; delete missing.localPath; delete missing.size;
+          assets.push(missing);
+        }
       } else assets.push(previous?.status === 'external' || suspended(previous) ?
         reconcileAssetCapturePolicy({ ...asset, ...previous, references: asset.references, occurrences: asset.occurrences }, asset) : asset);
     }
@@ -242,7 +258,7 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
         // A new user/visible assistant reference makes capture required again.
         delete task.autoRetrySuspended; delete task.error; task.retryAt = 0;
       }
-      delete task.policyCheckedHash; delete task.interfacePolicyCheckedHash;
+      delete task.policyCheckedHash; delete task.interfacePolicyCheckedHash; delete task.ordinaryLinkPolicyCheckedHash;
     }
     await setSetting(key(account), state);
     await status(account, saved.manifest);
@@ -250,8 +266,10 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
   }
   async function external(asset) {
     const result = await validateExternalAsset({ url: asset.sourceRef, asset, browser, fetchImpl, maxBytes: MAX_ASSET_BYTES });
-    if (result.status !== 'external') throw collectorError('ASSET_LINK_UNKNOWN',
-      result.reason === 'permission-required' ? '请在设置中允许检测外链附件；链接已保留。' : '外链暂时无法匿名验证，链接已保留，未自动上传。');
+    if (result.status !== 'external') {
+      const failure = externalAssetFailure(result);
+      throw collectorError(failure.code, failure.message);
+    }
     return { ...asset, status: 'external', mimeType: result.mimeType };
   }
   async function capture(asset, request) {
@@ -290,7 +308,9 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
       (activeTask(task) || task.manualRetry === true) && (task.retryAt || 0) <= now();
     const unreviewedInterfaceInput = task => !task.interfacePolicyCheckedHash &&
       task.error?.code === 'ASSET_INPUT' && (!task.errorStage || task.errorStage === 'capture');
-    const needsInterfaceCheck = task => !manualOnly && unreviewedInterfaceInput(task);
+    const unreviewedOrdinaryLink = task => !task.ordinaryLinkPolicyCheckedHash &&
+      task.error?.code === 'ASSET_LINK_UNKNOWN' && (!task.errorStage || task.errorStage === 'capture');
+    const needsInterfaceCheck = task => !manualOnly && (unreviewedInterfaceInput(task) || unreviewedOrdinaryLink(task));
     const needsPolicyCheck = task => !manualOnly && !suspended(task) && !task.policyCheckedHash &&
       task.error?.code === 'HTTP_404' && (!task.errorStage || task.errorStage === 'capture') && !deliveryPending(task);
     // Normal GitHub synchronization can apply a winning archive directly,
@@ -334,25 +354,34 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
       finalManifest = manifest;
       let asset = entry?.assets?.find(a => a.id === task.assetId);
       if (entry && (asset || task.interfaceRetirement) &&
-          (!task.pendingArchives?.length || task.interfaceRetirement === 'prepare' || unreviewedInterfaceInput(task))) {
+          (!task.pendingArchives?.length || task.interfaceRetirement === 'prepare' || unreviewedInterfaceInput(task) || unreviewedOrdinaryLink(task))) {
         const nativeBytes = await readLocalBytes(directory, entry.jsonPath, 24 * 1024 * 1024);
         if (!nativeBytes || await hashBytes(nativeBytes) !== entry.contentHash) throw collectorError('LOCAL_CONFLICT', '对话原始文件已变化，附件任务暂停以保护原文件。');
         const native = JSON.parse(text(nativeBytes));
         if (nativeId(native) !== task.conversationId) throw collectorError('INCOMPLETE_DETAIL', '附件来源对话不匹配，保留已有记录等待检查。');
         const analysis = await analyzeAssets(native);
         task.interfacePolicyCheckedHash = entry.contentHash;
-        if (analysis.interfaceIconIds.includes(task.assetId)) {
-          // Native metadata, not a URL/filename or an ASSET_INPUT failure,
-          // proves that these references belong only to application UI icons.
+        task.ordinaryLinkPolicyCheckedHash = entry.contentHash;
+        const ordinaryLinks = (analysis.ordinaryLinkIds || []).filter(id => {
+          const record = entry.assets?.find(item => item.id === id);
+          // Existing managed bytes are never discarded by a link-policy change.
+          return !record || (record.sourceType === 'external' && !record.localPath && !record.oid && !record.sha256);
+        });
+        const retired = new Set([...analysis.interfaceIconIds, ...ordinaryLinks]);
+        if (retired.has(task.assetId)) {
+          // Native context proves UI icons or ordinary file-viewer hyperlinks;
+          // an error code or basename alone is never retirement evidence.
           // Keep one durable carrier until all older receipts and the corrected
           // archive have reached the outbox. The marker survives a worker stop
           // between removing the descriptor and checkpointing that archive.
-          const retired = new Set(analysis.interfaceIconIds);
           const duplicates = state.tasks.filter(other => other !== task && other.conversationId === task.conversationId && retired.has(other.assetId));
           task.priorArchives = [...(task.priorArchives || []), ...(task.pendingArchives || []),
             ...duplicates.flatMap(other => [...(other.priorArchives || []), ...(other.pendingArchives || [])])];
           delete task.pendingArchives;
           task.interfaceRetirement = 'prepare';
+          // The old source/permission hold must not block replay of this local
+          // correction after its manifest commits but before delivery checkpoints.
+          delete task.retryHeld; task.retryAt = 0;
           state.tasks = state.tasks.filter(other => !duplicates.includes(other));
           await setSetting(key(account), state);
           const saved = await saveConversation({ directory, account,

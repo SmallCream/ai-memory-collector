@@ -12,6 +12,23 @@ const markdownLabel = value => String(value || '').replace(/[\r\n]/g, ' ').repla
 const normalizedLabel = value => value.trim().replace(/\s+/g, ' ').toLowerCase();
 const DOWNLOAD_EXTENSION = /\.(?:zip|pdf|docx?|xlsx?|pptx?|odt|ods|odp|rtf|txt|csv|tsv|md|jsonl?|ya?ml|xml|py|[cm]?js|tsx?|jsx|css|html?|sql|sh|r)$/i;
 
+// GitHub's blob route is a file-viewing web page. Only this observed page shape
+// is excluded; raw/download query variants and other hosts retain their existing
+// handling. Explicit download attributes and native attachment metadata remain
+// resource evidence even when they use the same URL.
+function isOrdinaryGitHubFilePage(value) {
+  try {
+    if (typeof value !== 'string') return false;
+    const reference = decodeHTMLEntities(value).trim();
+    if (!reference || /[\u0000-\u001f\u007f]/.test(reference)) return false;
+    const url = new URL(reference);
+    return url.protocol === 'https:' && url.hostname === 'github.com' && !url.port && !url.username && !url.password &&
+      /^\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/blob\/[^/]+\/.+/.test(url.pathname) &&
+      DOWNLOAD_EXTENSION.test(decodeURIComponent(url.pathname)) &&
+      [...url.searchParams].every(([key, entry]) => key === 'plain' && entry === '1');
+  } catch { return false; }
+}
+
 // Ordinary hyperlinks remain hyperlinks. Platform file pointers and explicit
 // document downloads are also archive resources; a filename never implies a
 // platform file ID or authorizes matching another resource by basename.
@@ -24,7 +41,7 @@ export function isDownloadReference(value, explicitDownload = false) {
   try {
     const url = new URL(ref);
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) return false;
-    return explicitDownload || DOWNLOAD_EXTENSION.test(decodeURIComponent(url.pathname));
+    return explicitDownload || (!isOrdinaryGitHubFilePage(ref) && DOWNLOAD_EXTENSION.test(decodeURIComponent(url.pathname)));
   } catch { return false; }
 }
 
@@ -272,7 +289,7 @@ export function tokenizeRichText(value) {
   return tokens;
 }
 
-function htmlReferences(token, parentTags = []) {
+function htmlReferences(token, parentTags = [], includeOrdinaryLinks = false) {
   if (token.type !== 'html' || token.closing || !SAFE_TAGS.has(token.tag)) return [];
   const result = [];
   const mime = token.attributes.find(attribute => attribute.name === 'type')?.value || '';
@@ -281,9 +298,11 @@ function htmlReferences(token, parentTags = []) {
       mime.startsWith('video/') || parentTags.includes('video') ? 'video' :
         mime.startsWith('audio/') || parentTags.includes('audio') ? 'audio' : 'attachment' : token.tag;
   for (const attr of token.attributes) {
-    if (attr.name === 'href' && token.tag === 'a' && isDownloadReference(attr.value,
-      token.attributes.some(attribute => attribute.name === 'download'))) {
-      result.push({ ref: attr.value, kind: 'attachment', attribute: attr.name });
+    if (attr.name === 'href' && token.tag === 'a') {
+      const download = isDownloadReference(attr.value, token.attributes.some(attribute => attribute.name === 'download'));
+      if (download || includeOrdinaryLinks && isOrdinaryGitHubFilePage(attr.value)) {
+        result.push({ ref: attr.value, kind: 'attachment', attribute: attr.name, ...(!download ? { ordinaryLink: true } : {}) });
+      }
     }
     if (attr.name === 'src' && ['img', 'audio', 'video', 'source'].includes(token.tag)) result.push({ ref: attr.value, kind, attribute: attr.name });
     if (attr.name === 'poster' && token.tag === 'video') result.push({ ref: attr.value, kind: 'image', attribute: 'poster' });
@@ -294,16 +313,19 @@ function htmlReferences(token, parentTags = []) {
   return result;
 }
 
-export function extractRichReferences(text) {
+export function extractRichReferences(text, { includeOrdinaryLinks = false } = {}) {
   const result = [], stack = [];
   for (const token of tokenizeRichText(text)) {
     if (token.type === 'image' && token.ref) result.push({ ref: token.ref, kind: 'image', syntax: 'markdown' });
     else if (token.type === 'link') {
-      if (isDownloadReference(token.ref)) result.push({ ref: token.ref, kind: 'attachment', syntax: 'markdown' });
-      result.push(...extractRichReferences(token.alt));
+      const download = isDownloadReference(token.ref);
+      if (download || includeOrdinaryLinks && isOrdinaryGitHubFilePage(token.ref)) {
+        result.push({ ref: token.ref, kind: 'attachment', syntax: 'markdown', ...(!download ? { ordinaryLink: true } : {}) });
+      }
+      result.push(...extractRichReferences(token.alt, { includeOrdinaryLinks }));
     }
     else if (token.type === 'html') {
-      result.push(...htmlReferences(token, stack).map(item => ({ ...item, syntax: 'html' })));
+      result.push(...htmlReferences(token, stack, includeOrdinaryLinks).map(item => ({ ...item, syntax: 'html' })));
       if (token.closing) { const at = stack.lastIndexOf(token.tag); if (at >= 0) stack.splice(at); }
       else if (!token.selfClosing) stack.push(token.tag);
     }
