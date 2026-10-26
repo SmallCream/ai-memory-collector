@@ -221,6 +221,8 @@ find "$target_dir" -type f -print0 > "$file_list" || fail '无法完整读取原
 while IFS= read -r -d '' existing_file; do
   relative_file=${existing_file#"$target_dir/"}
   case "$relative_file" in
+    # Removed in 0.3.24; the complete old directory remains in the backup.
+    lib/lfs.js) continue ;;
     manifest.json|background.js|panel.html|panel.js|bootstrap.js|panel.css|lib/archive.js|lib/chatgpt.js|lib/github.js|lib/storage.js|.DS_Store|*/.DS_Store) continue ;;
   esac
   [ -f "$stage_dir/$relative_file" ] || fail '原插件目录包含不属于此更新包的文件。为保护个人数据已停止，请将额外文件移到独立目录后重试。'

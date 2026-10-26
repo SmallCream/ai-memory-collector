@@ -1,7 +1,6 @@
 /** Durable, commit-pinned archive restoration. It never creates capture bindings. */
 import { accountPrefix, readAccountManifest } from './archive-store.js';
-import { readLocalBytes } from './asset-store.js';
-import { hashBytes } from './lfs.js';
+import { readLocalBytes, hashBytes } from './asset-store.js';
 import { createActivityLog } from './activity-log.js';
 
 export const RESTORE_SETTING_KEY = 'repositoryRestore:v1';
@@ -113,9 +112,9 @@ function summarize(job) {
 
 /** A tick processes one account's metadata or one conversation/asset batch.
  * Directory handles are stored only in IndexedDB; credentials are never saved in jobs.
- * hydrateAssets may return {pending:true} to bound its own work across ticks. */
+ * reconcileRestoredAssets may return {pending:true} to bound its own work across ticks. */
 export function createRestoreService({ getSetting, setSetting, fetchRepositorySnapshot, downloadRepositoryFile,
-  applyRemoteFiles, hydrateAssets, enqueueRecovered, readLocalManifest = readAccountManifest, readLocalFile = readLocalBytes, now = Date.now } = {}) {
+  applyRemoteFiles, reconcileRestoredAssets, enqueueRecovered, readLocalManifest = readAccountManifest, readLocalFile = readLocalBytes, now = Date.now } = {}) {
   for (const dependency of [getSetting, setSetting, fetchRepositorySnapshot, downloadRepositoryFile, applyRemoteFiles, readLocalManifest, readLocalFile]) {
     if (typeof dependency !== 'function') throw new TypeError('Missing restore service dependency');
   }
@@ -289,11 +288,10 @@ export function createRestoreService({ getSetting, setSetting, fetchRepositorySn
             item.phase = 'assets'; item.status = 'hydrating'; item.attempts = 0; item.nextRetryAt = null;
             await publish(job);
           }
-          if (hydrateAssets) {
+          if (reconcileRestoredAssets) {
             const result = await activity.run('repository', 'restore', { stage: 'restore-assets',
-              title: item.entry.title, conversationId: item.entry.conversationId }, () => hydrateAssets({ directory, account: item.account, entry: item.restoredEntry,
-              remoteEntry: item.entry, config, snapshot: { repository: job.repository, branch: job.branch,
-                commitSha: job.commitSha, treeSha: job.treeSha, entries: job.entries, empty: job.empty } }));
+              title: item.entry.title, conversationId: item.entry.conversationId }, () => reconcileRestoredAssets({ directory, account: item.account, entry: item.restoredEntry,
+              remoteEntry: item.entry }));
             item.cloudMissing = Number.isSafeInteger(result?.cloudMissing) && result.cloudMissing > 0 ? result.cloudMissing : 0;
             if (result?.failed) throw fail('ASSET_RESTORE_FAILED');
             if (result?.pending) { item.status = 'hydrating'; finish(job); return publish(job); }

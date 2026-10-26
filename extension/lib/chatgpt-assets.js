@@ -150,7 +150,7 @@ export async function resolveChatGPTAsset({ browser, allowLibraryDownload = fals
 /**
  * A successful anonymous GET establishes availability now, not permanence.
  * Missing permission, CORS failures, unrecognized redirects and content stay unknown;
- * callers must not silently turn those results into managed/LFS attachments.
+ * callers must not silently turn those results into managed attachments.
  * This helper does not request permissions or retain a copy of the image.
  */
 export async function validateExternalAsset({ url, browser = globalThis.chrome, fetchImpl = globalThis.fetch,
@@ -191,7 +191,9 @@ export async function validateExternalAsset({ url, browser = globalThis.chrome, 
     if (!response.ok) return unknown(response.status === 401 || response.status === 403 ? 'authentication-required' : 'http-error', response.status);
     const declaredSize = response.headers.get('content-length');
     if (declaredSize && /^\d+$/.test(declaredSize) && Number(declaredSize) > maxBytes) return unknown('too-large');
-    const declaredMime = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase().replace(/^image\/jpg$/, 'image/jpeg');
+    let declaredMime = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase().replace(/^image\/jpg$/, 'image/jpeg');
+    if (['application/x-gzip', 'application/x-compressed-tar'].includes(declaredMime) ||
+        declaredMime === 'application/x-tar' && /\.(?:tar\.gz|tgz)$/i.test(asset.fileName || '')) declaredMime = 'application/gzip';
     if (declaredMime === 'text/html' || declaredMime === 'application/xhtml+xml') return unknown('html-response');
     if (!['', 'application/octet-stream', 'binary/octet-stream', 'image/png', 'image/jpeg', 'image/gif', 'image/webp', ...Object.values(FILE_MIMES), 'application/x-zip-compressed', 'application/javascript', 'text/x-python', 'application/x-python-code', 'application/yaml', 'application/x-yaml', 'text/yaml', 'text/xml'].includes(declaredMime)) return unknown('unsupported-content');
     reader = response.body?.getReader();
@@ -220,6 +222,19 @@ export async function validateExternalAsset({ url, browser = globalThis.chrome, 
         const inspected = inspectAttachmentBytes(bytes, { ...asset, mimeType: declaredMime || asset.mimeType });
         if (!inspected) return unknown('content-mismatch');
         mimeType = inspected.mimeType;
+        if (mimeType === 'application/gzip') {
+          const expanded = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip')).getReader();
+          let expandedSize = 0;
+          try {
+            while (true) {
+              const { done, value } = await expanded.read();
+              if (done) break;
+              expandedSize += value.byteLength;
+              if (expandedSize > maxBytes) return unknown('too-large');
+              if (controller.signal.aborted) return unknown('timeout');
+            }
+          } finally { try { await expanded.cancel(); } catch {} expanded.releaseLock(); }
+        }
       } catch { return unknown('content-mismatch'); }
     }
     if (!mimeType || (mimeType.startsWith('image/') && declaredMime && !['application/octet-stream', 'binary/octet-stream', mimeType].includes(declaredMime))) return unknown('content-mismatch');

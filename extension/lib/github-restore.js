@@ -202,7 +202,7 @@ function decodeBlob(data, entry, maxBytes) {
   return bytes;
 }
 
-/** Downloads an ordinary Git blob by immutable SHA; LFS hydration is a separate step. */
+/** Downloads an ordinary Git blob by immutable SHA; attachment bytes are kept locally. */
 export async function downloadRepositoryFile({ config, entry, fetchImpl = globalThis.fetch, maxBytes = DEFAULT_MAX_BYTES }) {
   const file = validateTreeEntry(entry);
   if (file.type !== 'blob') fail('REMOTE_PATH_TYPE', '只能下载普通文件。');

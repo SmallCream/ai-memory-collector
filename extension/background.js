@@ -1,4 +1,4 @@
-import { getSetting, setSetting } from './lib/storage.js';
+import { getSetting, setSetting, getSettingsByPrefix } from './lib/storage.js';
 import { getAdapter } from './adapters/index.js';
 import { createCollectorEngine } from './lib/collector-engine.js';
 import { readAccountManifest, hasConversationFiles, readConversationBaseline, readConversationArchive,
@@ -18,18 +18,18 @@ const adapter = getAdapter('chatgpt');
 const lockedSave = input => service.withFileLock(() => saveConversation(input));
 const lockedApply = input => service.withFileLock(() => applyRemoteFiles(input));
 const assets = createAssetService({ getSetting, setSetting, readAccountManifest, saveConversation: lockedSave,
-  resolveAsset: resolver.resolve, downloadRepositoryFile,
+  resolveAsset: resolver.resolve,
   refreshConversation: ({ tabId, ...request }) => adapter.detail(tabId, request),
   enqueueArchive: input => service.engine.enqueueArchive(input) });
 const restore = createRestoreService({ getSetting, setSetting, fetchRepositorySnapshot, downloadRepositoryFile,
-  applyRemoteFiles: lockedApply, readLocalManifest: readAccountManifest, hydrateAssets: assets.hydrateAssets,
+  applyRemoteFiles: lockedApply, readLocalManifest: readAccountManifest, reconcileRestoredAssets: assets.reconcileRestoredAssets,
   // Replayed local capture journals already carry authorized account ownership.
   // Queue them without creating a binding; only enabled configured accounts upload.
   enqueueRecovered: ({ account, archive }) => service.engine.enqueueArchive({ account: { ...account, enabled: true }, archive }) });
 const maintenance = createLocalMaintenance({ getSetting, setSetting, readAccountManifest, readConversationArchive,
   repairMissingMarkdown: input => service.withFileLock(() => repairMissingMarkdown(input)),
   enqueueArchive: input => service.engine.enqueueArchive(input), requeueMissing: input => assets.requeueMissing(input) });
-const service = createCollectorService({ browser: chrome, getSetting, setSetting,
+const service = createCollectorService({ browser: chrome, getSetting, setSetting, getSettingsByPrefix,
   adapter, createEngine: createCollectorEngine,
   readAccountManifest, hasConversationFiles, readConversationBaseline, readConversationArchive,
   saveConversation: assets.save, applyRemoteFiles: lockedApply, syncArchives, probeRepository,

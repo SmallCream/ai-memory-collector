@@ -2,17 +2,14 @@
 import { analyzeAssets, extractAssets, sanitizeAssetRecords, reconcileAssetCapturePolicy } from './assets.js';
 import { reconcileFileCitation } from './asset-reconciliation.js';
 import { validateExternalAsset } from './chatgpt-assets.js';
-import { assetPath, readLocalBytes, verifiedLocalAsset, writeLocalAsset, assetExtension, canCaptureAsset, MAX_ASSET_BYTES } from './asset-store.js';
-import { createLfsClient, hashBytes, formatLfsPointer, parseLfsPointer } from './lfs.js';
+import { assetPath, readLocalBytes, verifiedLocalAsset, writeLocalAsset, assetExtension, canCaptureAsset, MAX_ASSET_BYTES, hashBytes } from './asset-store.js';
 import { collectorError, safeError } from './config.js';
 import { createActivityLog } from './activity-log.js';
 import { assetFailureReason, externalAssetFailure, sanitizeAssetFailureDiagnostics } from './asset-failure.js';
 
 const ready = asset => asset.status === 'downloaded' && asset.oid && asset.localPath;
 const key = account => `assetJobs:${account.accountKey}`;
-const uploadKey = account => `assetUploads:${account.accountKey}`;
-const receiptKey = account => `assetReceipts:${account.accountKey}`;
-const uploadIdentity = asset => `${asset.localPath}:${asset.oid}:${asset.size}`;
+const assetIdentity = asset => `${asset.localPath}:${asset.oid}:${asset.size}`;
 const enc = new TextDecoder('utf-8', { fatal: true });
 const text = bytes => enc.decode(bytes);
 const nativeId = native => native.conversation_id ?? native.id;
@@ -59,8 +56,7 @@ function conversationSummaries(manifest, state, captureEnabled, label) {
 
 
 export function createAssetService({ getSetting, setSetting, readAccountManifest, saveConversation,
-  resolveAsset, refreshConversation, enqueueArchive, browser = globalThis.chrome, fetchImpl = globalThis.fetch, downloadRepositoryFile,
-  lfsFactory = createLfsClient, now = Date.now }) {
+  resolveAsset, refreshConversation, enqueueArchive, browser = globalThis.chrome, fetchImpl = globalThis.fetch, now = Date.now }) {
   const ephemeral = new Map();
   const activity = createActivityLog({ getSetting, setSetting, now });
   async function jobs(account) { return await getSetting(key(account)) || { tasks: [] }; }
@@ -84,7 +80,7 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
   const label = value => String(value || '').replace(/(?:https?:\/\/|blob:|data:)[^\s<>"']+/gi, '[链接已隐藏]')
     .replace(/(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]+/g, '[已隐藏]').replace(/Bearer\s+[^\s,;]+/gi, '[已隐藏]')
     .replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, '').slice(0, 200);
-  async function diagnostics({ directory, account, github, captureEnabled = true }) {
+  async function diagnostics({ directory, account, captureEnabled = true }) {
     const state = await jobs(account);
     let manifest;
     if (directory) { try { manifest = await readAccountManifest(directory, account); } catch { /* queue remains readable without directory access */ } }
@@ -112,34 +108,13 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
           task.error ? (task.retryAt > now() ? 'retry' : 'failed') : 'pending',
         attempt: item.attempt, nextRetryAt: item.retryAt, code: task.error ? item.code : null };
     });
-    const receipts = await getSetting(receiptKey(account));
-    let receiptDirectory = Boolean(directory) && directory === receipts?.directory;
-    if (!receiptDirectory && directory && receipts?.directory) {
-      try { receiptDirectory = Boolean(await directory.isSameEntry(receipts.directory)); } catch { /* stale directory handle */ }
-    }
-    const receiptTarget = !github || (typeof github.repository === 'string' &&
-      receipts?.repository === github.repository.toLowerCase() && receipts?.branch === (github.branch || ''));
-    const uploaded = new Set(receiptDirectory && receiptTarget && Array.isArray(receipts?.uploaded) ? receipts.uploaded : []);
-    const uploadRecords = new Map();
-    for (const [conversationId, entry] of Object.entries(manifest?.conversations || {})) {
-      for (const asset of entry.assets || []) if (canCaptureAsset(asset) && ready(asset)) {
-        const id = uploadIdentity(asset);
-        if (!uploadRecords.has(id)) uploadRecords.set(id, {
-          conversationId: label(conversationId), title: label(entry.title),
-          fileName: label(asset.fileName || asset.localPath?.split('/').at(-1)),
-          size: Number.isSafeInteger(asset.size) && asset.size >= 0 ? asset.size : 0,
-          status: uploaded.has(id) ? 'uploaded' : github?.lfsEnabled === false ? 'local-only' : 'pending',
-        });
-      }
-    }
-    const uploadItems = [...uploadRecords.values()].sort((a, b) => Number(a.status === 'uploaded') - Number(b.status === 'uploaded')).slice(0, 50);
     const conversations = conversationSummaries(manifest, state, captureEnabled, label);
     return { total: state.tasks.length, pending: state.tasks.filter(activeTask).length, failed: failures.length,
       captureEnabled, cooldownUntil: state.cooldownUntil || 0,
       conversations: conversations.slice(0, 200), conversationTotal: conversations.length,
       unsupported: conversations.reduce((sum, item) => sum + item.unsupported, 0),
       paused: conversations.reduce((sum, item) => sum + item.paused, 0),
-      captureTotal: state.tasks.length, captureItems, uploadTotal: uploadRecords.size, uploadItems,
+      captureTotal: state.tasks.length, captureItems,
       failures: failures.slice(0, 200).map(describe), internalMissing: internal.length,
       internalFailures: internal.slice(0, 200).map(task => ({ ...describe(task), code: 'HTTP_404',
         message: '内部附件未下载，自动重试已停止；原始来源和失败记录已保留。', retryAt: 0 })) };
@@ -185,10 +160,10 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
     const missing = new Set(state.tasks.filter(task => task.localMissing).map(task => task.assetId));
     const unique = new Map();
     for (const entry of Object.values(manifest?.conversations || {})) for (const asset of entry.assets || []) unique.set(asset.id, asset);
-    const result = { external: 0, pendingCapture: 0, local: 0, uploaded: 0, pendingUpload: 0, failed: 0, internalMissing: 0, unsupported: 0 };
+    const result = { external: 0, pendingCapture: 0, local: 0, failed: 0, internalMissing: 0, unsupported: 0 };
     const managed = new Map();
     for (const asset of unique.values()) {
-      if (ready(asset) && !missing.has(asset.id)) managed.set(uploadIdentity(asset), asset);
+      if (ready(asset) && !missing.has(asset.id)) managed.set(assetIdentity(asset), asset);
       else if (!canCaptureAsset(asset)) result.unsupported++;
       else if (asset.sourceType === 'external' || asset.status === 'external') result.external++;
       else if (suspended(asset)) result.internalMissing++;
@@ -196,12 +171,7 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
     }
     result.local = managed.size;
     result.failed = state.tasks.filter(t => activeTask(t) && t.error).length;
-    const receipts = await getSetting(receiptKey(account));
-    const uploaded = new Set(receipts?.uploaded || []);
-    result.uploaded = [...managed.keys()].filter(identity => uploaded.has(identity)).length;
-    result.pendingUpload = result.local - result.uploaded;
-    const previous = await getSetting(`assetStatus:${account.accountKey}`);
-    await setSetting(`assetStatus:${account.accountKey}`, { ...previous, ...result });
+    await setSetting(`assetStatus:${account.accountKey}`, result);
   }
   async function save(input) {
     const { directory, account, detail } = input;
@@ -314,7 +284,7 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
     const needsPolicyCheck = task => !manualOnly && !suspended(task) && !task.policyCheckedHash &&
       task.error?.code === 'HTTP_404' && (!task.errorStage || task.errorStage === 'capture') && !deliveryPending(task);
     // Normal GitHub synchronization can apply a winning archive directly,
-    // without hydrateAssets/save. Recheck only changed suspended descriptors
+    // without reconcileRestoredAssets/save. Recheck only changed suspended descriptors
     // before excluding them from the scheduler. Pending receipts drain first.
     if (state.tasks.some(task => suspended(task) && !deliveryPending(task))) {
       let manifest;
@@ -548,103 +518,7 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
     }
     return { pending: state.tasks.filter(activeTask).length, runnable: state.tasks.some(t => runnable(t) || needsPolicyCheck(t) || needsInterfaceCheck(t)) };
   }
-  async function prepareUploads({ directory, account, config, bundles, isCurrent = async () => true,
-    withCurrent = async operation => { await operation(); return true; } }) {
-    const changedTarget = () => collectorError('GITHUB_TARGET_CHANGED', '备份设置已更新，旧上传任务已停止。');
-    async function requireCurrent() { if (!await isCurrent()) throw changedTarget(); }
-    async function writeCurrent(operation) {
-      await requireCurrent();
-      if (!await withCurrent(operation)) throw changedTarget();
-    }
-    // Activity is observational but must not overwrite the new target's status
-    // when an old upload finishes. No network request runs under this lock.
-    const uploadActivity = createActivityLog({ getSetting, now,
-      setSetting: (key, value) => writeCurrent(() => setSetting(key, value)) });
-    await requireCurrent();
-    const records = new Map(), sourceLabels = new Map();
-    for (const bundle of bundles) for (const file of bundle.files) if (file.path.endsWith('/archive/manifest.json')) {
-      const manifest = JSON.parse(file.content);
-      for (const [conversationId, entry] of Object.entries(manifest.conversations || {})) for (const asset of entry.assets || []) if (ready(asset)) {
-        records.set(asset.localPath, asset); sourceLabels.set(asset.localPath, { conversationId, title: entry.title });
-      }
-    }
-    if (records.size && config.lfsEnabled === false) throw collectorError('LFS_DISABLED', '附件已保存在本地；请启用 LFS 后同步带附件的对话。');
-    const target = { repository: config.repository.toLowerCase(), branch: config.branch || '' };
-    const signature = await hashBytes(new TextEncoder().encode(JSON.stringify({ ...target,
-      records: [...records.values()].map(uploadIdentity).sort() })));
-    const sameDirectory = async other => {
-      if (directory === other) return true;
-      try { return typeof directory?.isSameEntry === 'function' && await directory.isSameEntry(other); } catch { return false; }
-    };
-    let checkpoint = await getSetting(uploadKey(account));
-    if (!checkpoint || checkpoint.signature !== signature || checkpoint.repository !== target.repository ||
-        checkpoint.branch !== target.branch || !Array.isArray(checkpoint.uploaded) ||
-        !await sameDirectory(checkpoint.directory) || now() - checkpoint.startedAt > 60 * 60_000) {
-      checkpoint = { schemaVersion: 1, ...target, signature, directory, startedAt: now(), uploaded: [] };
-      await writeCurrent(() => setSetting(uploadKey(account), checkpoint));
-    }
-    let receipts = await getSetting(receiptKey(account));
-    if (!receipts || receipts.repository !== target.repository || receipts.branch !== target.branch ||
-        !Array.isArray(receipts.uploaded) || !await sameDirectory(receipts.directory)) {
-      receipts = { schemaVersion: 1, ...target, directory, uploaded: [] };
-      await writeCurrent(() => setSetting(receiptKey(account), receipts));
-    }
-    const uploaded = new Set(checkpoint.uploaded), receiptSet = new Set(receipts.uploaded);
-    // LFS performs multiple HTTP requests per file (batch, PUT, verify). A
-    // changed setting must prevent the next request even inside one upload().
-    const currentFetch = async (...args) => {
-      await requireCurrent();
-      return fetchImpl.call(globalThis, ...args);
-    };
-    const client = records.size ? lfsFactory({ repository: config.repository, token: config.token, branch: config.branch,
-      fetchImpl: currentFetch, maxBytes: MAX_ASSET_BYTES }) : null;
-    const pointers = [];
-    let transferred = 0;
-    async function progress() {
-      await writeCurrent(async () => {
-        const previous = await getSetting(`assetStatus:${account.accountKey}`) || {};
-        const count = [...records.values()].filter(asset => uploaded.has(uploadIdentity(asset))).length;
-        await setSetting(`assetStatus:${account.accountKey}`, { ...previous, local: records.size, uploaded: count, pendingUpload: records.size - count });
-      });
-    }
-    for (const asset of records.values()) {
-      await requireCurrent();
-      const bytes = await verifiedLocalAsset({ directory, account, asset, getSetting });
-      if (!bytes) throw collectorError('ASSET_MISSING', '待上传附件尚未在本地补齐。请先从 GitHub 恢复或补采附件。');
-      const identity = uploadIdentity(asset);
-      if (!uploaded.has(identity)) {
-        if (transferred >= 2) { await progress(); throw collectorError('LFS_UPLOAD_PENDING', '附件正在分批上传，进度已保存。'); }
-        await uploadActivity.run(account.accountKey, 'upload', { ...sourceLabels.get(asset.localPath), stage: 'upload-image',
-          fileName: asset.fileName || asset.localPath.split('/').at(-1), size: asset.size,
-          completed: [...records.values()].filter(item => uploaded.has(uploadIdentity(item))).length, total: records.size },
-        async () => {
-          await requireCurrent();
-          try { await client.upload({ bytes, oid: asset.oid, size: asset.size, mimeType: asset.mimeType }); }
-          catch (error) {
-            // The transport redacts arbitrary thrown errors. Recover our own
-            // cancellation classification before reporting a network failure.
-            await requireCurrent(); throw error;
-          }
-          await requireCurrent();
-        });
-        await requireCurrent();
-        transferred++; uploaded.add(identity); receiptSet.add(identity);
-        checkpoint.uploaded = [...uploaded]; receipts.uploaded = [...receiptSet];
-        await writeCurrent(async () => {
-          await setSetting(receiptKey(account), receipts);
-          await setSetting(uploadKey(account), checkpoint);
-        });
-        await progress();
-      }
-      pointers.push({ accountKey: account.accountKey, path: asset.localPath, oid: asset.oid, size: asset.size,
-        content: formatLfsPointer({ oid: asset.oid, size: asset.size }) });
-    }
-    await progress();
-    await requireCurrent();
-    return pointers;
-  }
-  async function acknowledgeUploads(account) { await setSetting(uploadKey(account), null); }
-  async function hydrateAssets({ directory, account, entry, remoteEntry, config, snapshot }) {
+  async function reconcileRestoredAssets({ directory, account, entry, remoteEntry }) {
     if (remoteEntry && entry.conversationId && remoteEntry.conversationId !== entry.conversationId) {
       throw collectorError('ASSET_POINTER_MISMATCH', '恢复附件的远端对话归属不匹配。');
     }
@@ -680,14 +554,8 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
         await setSetting(key(account), restoredJobs); await status(account, manifest);
       }
     }
-    const cloudRecords = remoteEntry ? new Map((remoteEntry.assets || []).map(asset => [asset.id, asset])) : null;
-    const backedUp = asset => {
-      if (!cloudRecords) return asset.cloudStatus !== 'local-only';
-      const remote = cloudRecords.get(asset.id);
-      return Boolean(remote && ready(remote) && remote.cloudStatus !== 'local-only' && uploadIdentity(remote) === uploadIdentity(asset));
-    };
     let cloudMissing = 0;
-    for (const asset of (entry.assets || []).filter(asset => ready(asset) && !backedUp(asset))) {
+    for (const asset of (entry.assets || []).filter(ready)) {
       if (!await verifiedLocalAsset({ directory, account, asset, getSetting })) {
         cloudMissing++;
         // Text-only backup is not a promise that GitHub has these bytes. Keep
@@ -695,61 +563,7 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
         if (entry.conversationId) await requeueMissing({ directory, account, conversationId: entry.conversationId, assetId: asset.id });
       }
     }
-    const assets = [...new Map((entry.assets || []).filter(asset => ready(asset) && backedUp(asset)).map(asset => [uploadIdentity(asset), asset])).values()];
-    const checkpointKey = `assetHydration:${await hashBytes(new TextEncoder().encode(`${account.accountKey}:${entry.conversationId || assets.map(uploadIdentity).join('|')}`))}`;
-    const signature = await hashBytes(new TextEncoder().encode(JSON.stringify({ repository: config.repository.toLowerCase(),
-      branch: config.branch || snapshot.branch || '', commit: snapshot.commitSha || snapshot.treeSha || null,
-      assets: assets.map(uploadIdentity).sort() })));
-    let checkpoint = await getSetting(checkpointKey);
-    let sameDirectory = checkpoint?.directory === directory;
-    if (checkpoint && !sameDirectory) { try { sameDirectory = await directory.isSameEntry(checkpoint.directory); } catch { sameDirectory = false; } }
-    if (!checkpoint || checkpoint.signature !== signature || !sameDirectory || !checkpoint.failures || typeof checkpoint.failures !== 'object') {
-      checkpoint = { schemaVersion: 1, signature, directory, failures: {} };
-    }
-    const currentIds = new Set(assets.map(uploadIdentity));
-    for (const id of Object.keys(checkpoint.failures)) if (!currentIds.has(id)) delete checkpoint.failures[id];
-    let downloaded = 0, remaining = 0, attempted = 0;
-    const client = lfsFactory({ repository: config.repository, token: config.token, fetchImpl, maxBytes: MAX_ASSET_BYTES });
-    async function failed(id, error) {
-      const attempt = (checkpoint.failures[id]?.attempt || 0) + 1;
-      checkpoint.failures[id] = { attempt, retryAt: now() + Math.min(15, 2 ** Math.min(attempt - 1, 4)) * 60_000, error: safeError(error) };
-      await setSetting(checkpointKey, checkpoint);
-    }
-    for (const asset of assets) {
-      const id = uploadIdentity(asset), previous = checkpoint.failures[id];
-      if (previous && previous.retryAt > now()) continue;
-      let present;
-      try { present = await verifiedLocalAsset({ directory, account, asset, getSetting }); }
-      catch (error) {
-        if (attempted >= 2) { remaining++; continue; }
-        attempted++; await failed(id, error); continue;
-      }
-      if (present) { delete checkpoint.failures[id]; continue; }
-      if (attempted >= 2) { remaining++; continue; }
-      attempted++;
-      try {
-        const remote = snapshot.entries.find(e => e.path === asset.localPath);
-        if (!remote) throw collectorError('ASSET_POINTER_MISSING', '远端附件指针缺失，已保留待补齐任务。');
-        const info = { stage: 'restore-image', title: entry.title, conversationId: entry.conversationId,
-          fileName: asset.fileName || asset.localPath.split('/').at(-1), size: asset.size };
-        const bytes = await activity.run(account.accountKey, 'restore-images', info, async () => {
-          const pointer = parseLfsPointer(text(await downloadRepositoryFile({ config, entry: remote, fetchImpl, maxBytes: 2048 })));
-          if (!pointer || pointer.oid !== asset.oid || pointer.size !== asset.size) throw collectorError('ASSET_POINTER_MISMATCH', '附件指针与对话清单不一致。');
-          return client.download({ oid: asset.oid, size: asset.size });
-        });
-        await activity.run(account.accountKey, 'restore-images', { ...info, stage: 'save-image' },
-          () => writeLocalAsset({ directory, account, asset, bytes, getSetting, setSetting })); downloaded++;
-        delete checkpoint.failures[id];
-        await setSetting(checkpointKey, checkpoint);
-      } catch (error) { await failed(id, error); }
-    }
-    await setSetting(checkpointKey, checkpoint);
-    // Do not spend the conversation's retry budget while other images can
-    // still make progress. Failed files keep their own persisted backoff.
-    if (remaining) return { downloaded, pending: remaining, failed: 0, ...(cloudMissing ? { cloudMissing } : {}) };
-    const unresolved = Object.values(checkpoint.failures);
-    if (unresolved.length) throw collectorError(unresolved[0].error.code, unresolved[0].error.message);
-    return { downloaded, pending: remaining, failed: 0, ...(cloudMissing ? { cloudMissing } : {}) };
+    return { cloudMissing };
   }
-  return { save, tick, diagnostics, retryFailed, requestMissing, requeueMissing, getCooldown, prepareUploads, acknowledgeUploads, hydrateAssets };
+  return { save, tick, diagnostics, retryFailed, requestMissing, requeueMissing, getCooldown, reconcileRestoredAssets };
 }

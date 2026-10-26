@@ -1,7 +1,11 @@
 import { accountPrefix } from './archive-store.js';
-import { hashBytes } from './lfs.js';
 import { collectorError } from './config.js';
 import { getSetting as defaultGet, setSetting as defaultSet } from './storage.js';
+
+export async function hashBytes(bytes) {
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
 
 const locks = new WeakMap();
 const journalKey = async (account, asset) => `assetWrite:${await hashBytes(new TextEncoder().encode(`${account.accountKey}:${asset.localPath}`))}`;

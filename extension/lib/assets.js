@@ -242,7 +242,7 @@ export function sanitizeAssetRecords(records) {
     }
     if (asset.capturePolicy === 'internal-viewer') item.capturePolicy = 'internal-viewer';
     // A text-only cloud backup may describe a file that exists only on its
-    // source computer. This marker never proves local bytes or an LFS object.
+    // source computer. This marker never proves local bytes or a remote binary.
     if (asset.cloudStatus === 'local-only') item.cloudStatus = 'local-only';
     if (item.capturePolicy === 'internal-viewer' && item.errorCode === 'HTTP_404' && asset.autoRetrySuspended === true &&
         !READY.has(item.status) && item.status !== 'external') item.autoRetrySuspended = true;

@@ -4,7 +4,6 @@ import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
 import { createCollectorService } from '../extension/lib/collector-service.js';
 import { safeError } from '../extension/lib/config.js';
-import { GITHUB_LFS_HOSTS } from '../extension/lib/lfs.js';
 
 const raw = await readFile(new URL('../extension/background.js', import.meta.url), 'utf8');
 const source = raw.replace(/^import[\s\S]*?;\s*$/gm, '');
@@ -47,9 +46,9 @@ function background({ command, open } = {}) {
   const noop = () => {};
   vm.runInNewContext(source, { chrome, URL, Promise, console,
     createCollectorService: () => service, getAdapter: () => ({}), safeError, ALARM_NAME: 'collector-work',
-    getSetting: noop, setSetting: noop, createCollectorEngine: noop,
+    getSetting: noop, setSetting: noop, getSettingsByPrefix: noop, createCollectorEngine: noop,
     createChatGPTAssetResolver: () => ({ resolve: noop }),
-    createAssetService: () => ({ save: noop, hydrateAssets: noop }), createRestoreService: () => ({}),
+    createAssetService: () => ({ save: noop, reconcileRestoredAssets: noop }), createRestoreService: () => ({}),
     createLocalMaintenance: () => ({}), readConversationArchive: noop, repairMissingMarkdown: noop,
     fetchRepositorySnapshot: noop, downloadRepositoryFile: noop,
     readAccountManifest: noop, hasConversationFiles: noop, readConversationBaseline: noop,
@@ -204,7 +203,7 @@ test('manifest exposes no external messages, executable remote code or web-acces
   assert.equal(manifest.web_accessible_resources, undefined);
   assert.deepEqual([...manifest.optional_host_permissions].sort(), [
     'https://chatgpt.com/*', 'https://*.oaiusercontent.com/*', 'https://*/*',
-    ...GITHUB_LFS_HOSTS.map(host => `https://${host}/*`),
+    'https://api.github.com/*',
   ].sort());
   assert.equal(manifest.host_permissions, undefined, 'All site access remains optional and gesture-authorized');
   assert.equal(manifest.content_scripts, undefined);

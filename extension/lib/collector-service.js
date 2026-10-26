@@ -6,7 +6,7 @@ const ORIGIN = 'https://chatgpt.com/*';
 const SCRIPT_ID = 'collector-chatgpt-entry';
 const matches = value => { try { return new URL(value).origin === 'https://chatgpt.com'; } catch { return false; } };
 
-export function createCollectorService({ browser, getSetting, setSetting, adapter, createEngine,
+export function createCollectorService({ browser, getSetting, setSetting, getSettingsByPrefix, adapter, createEngine,
   readAccountManifest, hasConversationFiles, readConversationBaseline, saveConversation, applyRemoteFiles, syncArchives, probeRepository,
   assetService, restoreService, maintenanceService, readConversationArchive, cancelAssets,
   now = Date.now, later = setTimeout }) {
@@ -133,12 +133,12 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
       githubStatus: account ? await getSetting(`githubStatus:${account.accountKey}`) || { status: 'idle' } : { status: 'idle' },
       assetStatus: account ? await getSetting(`assetStatus:${account.accountKey}`) || null : null,
       assetDiagnostics: account && assetService?.diagnostics ? await assetService.diagnostics({ account,
-        directory: directory.granted ? await getSetting('directory') : null, github: config.github,
+        directory: directory.granted ? await getSetting('directory') : null,
         captureEnabled: config.localAssetsEnabled !== false }) : null,
       maintenanceStatus: account && maintenanceService ? await maintenanceService.state(account) : null,
       outboxSummary: account && engine.getOutboxSummary ? await engine.getOutboxSummary(account.accountKey) : null,
       activity: Object.fromEntries(await Promise.all(Object.entries({ collection: 'collection', download: 'download',
-        upload: 'upload', github: 'github', restoreImages: 'restore-images', restore: 'restore' }).map(async ([name, channel]) =>
+        github: 'github', restore: 'restore' }).map(async ([name, channel]) =>
         [name, name === 'restore' ? await activity.read('repository', channel) : account ? await activity.read(account.accountKey, channel) : null]))),
       restoreStatus: restoreService ? await restoreService.state() : null,
       legacyPending: Boolean(await getSetting('pendingArchive')), error, tabId: current?.tab.id ?? null };
@@ -197,6 +197,16 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
           throw collectorError('DIRECTORY_PENDING', '原目录还有未完成的文件写入，请先恢复原目录权限并继续保存，再更换目录。');
         }
       }
+      // Asset journals can exist before their hashes reach a conversation manifest.
+      // Inspect the durable journal store, including accounts restored without a binding.
+      for (const { value: pending } of await getSettingsByPrefix('assetWrite:')) {
+        if (!pending) continue;
+        let belongsToOriginal = pending.directory === original;
+        if (!belongsToOriginal && original) {
+          try { belongsToOriginal = await original.isSameEntry(pending.directory); } catch { belongsToOriginal = true; }
+        }
+        if (belongsToOriginal) throw collectorError('DIRECTORY_PENDING', '原目录还有未完成的附件写入，请先在原目录重试附件，再更换目录。');
+      }
       for (const account of Object.values(config.accounts)) await engine.reset(account.accountKey);
       await settings.change(current => {
         for (const account of Object.values(current.accounts)) { account.initialized = false; account.lastResult = null; account.nextRunAt = now(); }
@@ -214,26 +224,18 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
       if (repository && !/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository)) throw collectorError('INVALID_REPOSITORY', '请输入 owner/repository 格式的仓库。');
       const token = typeof message.token === 'string' ? message.token.trim() : previous.token;
       config.github = { ...previous, repository, branch: String(message.branch ?? previous.branch).trim(), token,
-        lfsEnabled: typeof message.lfsEnabled === 'boolean' ? message.lfsEnabled : previous.lfsEnabled === true,
         autoRestore: typeof message.autoRestore === 'boolean' ? message.autoRestore : previous.autoRestore === true,
         enabled: typeof message.enabled === 'boolean' ? message.enabled : previous.enabled,
         revision: Number.isSafeInteger(previous.revision) && previous.revision >= 0 && previous.revision < Number.MAX_SAFE_INTEGER
           ? previous.revision + 1 : 1 };
       if ((config.github.enabled || config.github.autoRestore) && (!repository || !token)) throw collectorError('GITHUB_CONFIG', '启用 GitHub 备份或恢复需要仓库和 Token。');
       const changedTarget = previous.repository !== config.github.repository || previous.branch !== config.github.branch;
-      const needsLocalScan = changedTarget || (!previous.enabled && config.github.enabled) ||
-        (!previous.lfsEnabled && config.github.lfsEnabled);
+      const needsLocalScan = changedTarget || (!previous.enabled && config.github.enabled);
       // Keep settings and their task intent under the same short config lock.
       // An older network operation cannot restore a cancelled manual request or
       // erase this new target's backfill when its response arrives later.
       for (const account of Object.values(config.accounts)) {
         const key = `githubStatus:${account.accountKey}`, status = await getSetting(key) || {};
-        if (changedTarget) {
-          await setSetting(`assetReceipts:${account.accountKey}`, null);
-          await setSetting(`assetUploads:${account.accountKey}`, null);
-          const assetStatus = await getSetting(`assetStatus:${account.accountKey}`);
-          if (assetStatus) await setSetting(`assetStatus:${account.accountKey}`, { ...assetStatus, uploaded: 0, pendingUpload: assetStatus.local || 0 });
-        }
         await setSetting(key, { ...status, revision: config.github.revision, error: null, nextRetryAt: 0,
           ...(status.status === 'syncing' ? { status: 'pending', message: '备份设置已更新，待处理数据已保留。' } : {}),
           ...(changedTarget ? { status: 'pending', pending: (await engine.getOutbox(account.accountKey)).length,
@@ -267,7 +269,7 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
       const { github } = await settings.read();
       if (changingDirectory || expectedRevision !== null && github.revision !== expectedRevision) return;
       const key = `githubStatus:${account.accountKey}`;
-      const sameSettings = value => ['repository', 'branch', 'token', 'enabled', 'lfsEnabled', 'autoRestore', 'revision']
+      const sameSettings = value => ['repository', 'branch', 'token', 'enabled', 'autoRestore', 'revision']
         .every(field => value?.[field] === github[field]);
       const stillCurrent = async () => sameSettings((await settings.read()).github);
       async function whileCurrent(operation) {
@@ -309,17 +311,9 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
       }
       const pending = await engine.getOutbox(account.accountKey), outbox = [];
       let bytes = 0;
-      const pointerPaths = new Set();
       for (const bundle of pending) {
         const size = new TextEncoder().encode(JSON.stringify(bundle.files)).byteLength;
-        const assets = new Set(pointerPaths);
-        for (const file of bundle.files) if (file.path.endsWith('/archive/manifest.json')) {
-          try { for (const entry of Object.values(JSON.parse(file.content).conversations || {})) {
-            for (const asset of entry.assets || []) if (asset.status === 'downloaded' && asset.localPath) assets.add(asset.localPath);
-          } } catch { /* Sync validation reports malformed bundles without discarding them. */ }
-        }
-        if (outbox.length && (outbox.length >= 10 || bytes + size > 24 * 1024 * 1024 || assets.size + (outbox.length + 1) * 4 > 480)) break;
-        for (const path of assets) pointerPaths.add(path);
+        if (outbox.length && (outbox.length >= 10 || bytes + size > 24 * 1024 * 1024)) break;
         outbox.push(bundle); bytes += size;
       }
       if (!outbox.length) {
@@ -338,11 +332,9 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
       if (!await writeStatus({ ...previous, status: 'syncing', pending: pending.length,
         message: '', error: null, nextRetryAt: 0 })) return;
       try {
-        const assetPointers = assetService && github.lfsEnabled ? await assetService.prepareUploads({ directory: await getSetting('directory'),
-          account, config: github, bundles: outbox, isCurrent: stillCurrent, withCurrent: whileCurrent }) : [];
         if (!await stillCurrent()) return;
         const result = await activity.run(account.accountKey, 'github', { stage: 'commit', total: outbox.length },
-          () => syncArchives({ config: github, bundles: outbox, assetPointers, isCurrent: stillCurrent }));
+          () => syncArchives({ config: github, bundles: outbox, isCurrent: stillCurrent }));
         await whileCurrent(async () => {
           for (const winner of result.remoteWinners || []) {
             const directory = await getSetting('directory');
@@ -352,7 +344,6 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
             if (saved?.recovered) await engine.enqueueArchive({ account, archive: saved.recovered, forceUpload: manual });
           }
           await engine.acknowledgeOutbox(account.accountKey, outbox.map(x => x.id));
-          if (github.lfsEnabled && assetService?.acknowledgeUploads) await assetService.acknowledgeUploads(account);
           const remaining = (await engine.getOutbox(account.accountKey)).length;
           const needsBackfill = Boolean(previous.needsBackfill);
           await setSetting(key, { ...previous, revision: github.revision || 0,
@@ -363,15 +354,10 @@ export function createCollectorService({ browser, getSetting, setSetting, adapte
             message: previous.backfill?.status === 'waiting' ? '已备份可读取的文件，剩余本地归档等待自动重试。' :
               needsBackfill ? '正在从本地归档建立备份任务；缺失或冲突文件需先处理。' :
               result.conflicts?.length ? '不同版本已保留到冲突副本，原文没有丢弃。' :
-                github.lfsEnabled ? '' : '对话文件已备份；未上传的图片和附件仍仅在本机。' });
+                '对话文件已备份；图片和附件保存在本地。' });
           if (remaining) continueSoon();
         });
       } catch (error) {
-        if (error.code === 'LFS_UPLOAD_PENDING') {
-          if (!await writeStatus({ ...previous, status: 'pending', pending: pending.length, error: null,
-            message: '附件正在分批上传，完成后自动提交对话。', nextRetryAt: 0 })) return;
-          continueSoon(); return;
-        }
         const attempt = (previous?.attempt || 0) + 1;
         if (!await writeStatus({ ...previous, status: 'pending', pending: pending.length, message: '', error: safeError(error), attempt,
           nextRetryAt: now() + Math.min(60, 2 ** Math.min(attempt, 6)) * 60000 })) return;

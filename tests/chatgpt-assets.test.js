@@ -912,3 +912,27 @@ test('an unrelated image at a public ZIP URL does not verify the requested attac
     asset: { kind: 'attachment', fileName: 'archive.zip' }, fetchImpl: async () => pngResponse() });
   assert.deepEqual(value, { status: 'unknown', reason: 'content-mismatch' });
 });
+
+test('public gzip downloads accept MIME aliases and reject truncated, corrupt or oversized expanded data', async () => {
+  const { gzipSync } = await import('node:zlib');
+  const good = gzipSync('synthetic archive bytes');
+  const browser = { permissions: { contains: async () => true } };
+  const check = (bytes, mimeType, fileName = 'archive.tar.gz', maxBytes) => validateExternalAsset({
+    url: 'https://downloads.example.org/archive.tar.gz', browser, ...(maxBytes ? { maxBytes } : {}),
+    asset: { kind: 'attachment', fileName },
+    fetchImpl: async (_url, options) => {
+      assert.equal(options.credentials, 'omit'); assert.deepEqual(options.headers, {});
+      return new Response(bytes, { headers: { 'content-type': mimeType } });
+    },
+  });
+  for (const mime of ['application/gzip', 'application/x-gzip', 'application/x-compressed-tar', 'application/x-tar', 'application/octet-stream']) {
+    assert.equal((await check(good, mime)).status, 'external');
+  }
+  assert.equal((await check(good, 'application/x-tar', 'archive.gz')).status, 'unknown');
+  assert.equal((await check(good, 'application/x-tar', 'archive.tgz')).status, 'external');
+  assert.equal((await check(good.subarray(0, good.length - 1), 'application/gzip')).reason, 'content-mismatch');
+  const corrupt = new Uint8Array(good); corrupt[corrupt.length - 8] ^= 1;
+  assert.equal((await check(corrupt, 'application/gzip')).reason, 'content-mismatch');
+  assert.equal((await check(gzipSync('x'.repeat(4096)), 'application/gzip', 'archive.gz', 128)).reason, 'too-large');
+  assert.equal((await check('<html>login</html>', 'text/html')).reason, 'html-response');
+});

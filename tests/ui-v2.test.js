@@ -213,7 +213,7 @@ test('top GitHub detail exposes persisted failure code instead of stale LFS prog
   state.githubStatus = { status: 'syncing', pending: 1, error: null, message: '' };
   app.setState(state); app.poll(); await new Promise(resolve => setImmediate(resolve));
   assert.equal(app.elements.get('github-state').textContent, '同步中');
-  assert.equal(detail.hidden, true); assert.equal(detail.classList.contains('warning-text'), false);
+  assert.equal(detail.hidden, false); assert.equal(detail.classList.contains('warning-text'), false);
 
   state.githubStatus = { status: 'pending', pending: 1, error: { code: 'Bearer unsafe', message: '' } };
   app.setState(state); app.poll(); await new Promise(resolve => setImmediate(resolve));
@@ -273,7 +273,7 @@ test('a new device can restore without ChatGPT identity, completed setup or auto
   assert(app.messages.some(message => message.type === 'collector:restore'));
   assert(!app.messages.some(message => ['collector:bind', 'collector:configure', 'collector:start'].includes(message.type)));
   assert.equal(app.permissionRequests[0].includes('https://*/*'), false);
-  assert(app.permissionRequests[0].includes('https://github-cloud.s3.amazonaws.com/*'));
+  assert.deepEqual(app.permissionRequests[0], ['https://api.github.com/*']);
   await app.click('back-home'); assert.equal(app.elements.get('wizard').hidden, false);
 });
 
@@ -310,9 +310,9 @@ test('restore shows cloud-only attachment gaps separately from transfer failures
   assert.equal(app.elements.get('restore-retry').hidden, false);
   for (const id of ['restore-detail', 'transfer-restore-detail']) {
     const detail = app.elements.get(id).textContent;
-    assert.match(detail, /云端未备份 4 个附件（涉及 2 条对话）/);
-    assert.match(detail, /原电脑上传这些附件后再次恢复.*原始对话补采/);
-    assert.match(detail, /仅重试无法恢复尚未上传的附件/);
+    assert.match(detail, /本地缺少 4 个附件（涉及 2 条对话）/);
+    assert.match(detail, /原电脑复制本地附件目录.*原始对话补采/);
+    assert.match(detail, /GitHub 仅恢复对话文件/);
   }
   assert.match(app.elements.get('transfer-restore-detail').textContent, /失败 0/);
   assert.doesNotMatch(app.elements.get('restore-detail').textContent, /4 项未完成/);
@@ -322,7 +322,7 @@ test('restore shows cloud-only attachment gaps separately from transfer failures
   assert.equal(app.elements.get('restore-phase').textContent, '恢复完成');
   assert.equal(app.elements.get('restore-retry').hidden, true);
   assert.equal(app.elements.get('restore-detail').textContent, '');
-  assert.doesNotMatch(app.elements.get('transfer-restore-detail').textContent, /云端未备份/);
+  assert.doesNotMatch(app.elements.get('transfer-restore-detail').textContent, /本地缺少/);
 });
 
 test('restore retains network error guidance alongside cloud gaps and never labels known gaps complete', async () => {
@@ -332,8 +332,8 @@ test('restore retains network error guidance alongside cloud gaps and never labe
     error: { code: 'GITHUB_NETWORK', message: '请检查网络后重试。' } };
   const app = await setup({ state });
   assert.equal(app.elements.get('restore-phase').textContent, '部分恢复完成');
-  assert.match(app.elements.get('restore-detail').textContent, /请检查网络后重试。.*云端未备份 3 个附件/);
-  assert.match(app.elements.get('transfer-restore-detail').textContent, /失败 1.*GITHUB_NETWORK.*云端未备份 3 个附件/);
+  assert.match(app.elements.get('restore-detail').textContent, /请检查网络后重试。.*本地缺少 3 个附件/);
+  assert.match(app.elements.get('transfer-restore-detail').textContent, /失败 1.*GITHUB_NETWORK.*本地缺少 3 个附件/);
 });
 
 test('restore cloud gap counts reject invalid metadata and support nested progress', async () => {
@@ -341,24 +341,24 @@ test('restore cloud gap counts reject invalid metadata and support nested progre
   state.restoreStatus = { status: 'completed', cloudMissing: -1, missingCloudConversations: '<b>bad</b>' };
   const app = await setup({ state });
   assert.equal(app.elements.get('restore-phase').textContent, '恢复完成');
-  assert.doesNotMatch(app.elements.get('restore-detail').textContent, /云端未备份|bad/);
+  assert.doesNotMatch(app.elements.get('restore-detail').textContent, /本地缺少|bad/);
   state.restoreStatus = { status: 'running', progress: { total: 2, completed: 1, failed: 0,
     cloudMissing: 2, missingCloudConversations: 1 } };
   app.setState(state); await app.poll();
-  assert.equal(app.elements.get('restore-phase').textContent, '正在恢复对话与附件');
+  assert.equal(app.elements.get('restore-phase').textContent, '正在恢复对话');
   assert.equal(app.elements.get('restore-retry').hidden, true);
-  assert.match(app.elements.get('restore-detail').textContent, /收起面板不会主动暂停恢复。.*云端未备份 2 个附件（涉及 1 条对话）/);
+  assert.match(app.elements.get('restore-detail').textContent, /收起面板不会主动暂停恢复。.*本地缺少 2 个附件（涉及 1 条对话）/);
 });
 
-test('LFS default is preserved on save and restoring-only configuration is verified without enabling uploads', async () => {
+test('legacy LFS option is dropped on save and restoring-only configuration is verified without enabling uploads', async () => {
   const state = initialState(); state.config.github.hasToken = true;
   state.config.github.lfsEnabled = true; state.config.github.autoRestore = true;
   const app = await setup({ state }); await app.click('open-settings'); await app.click('save-github');
   const message = app.messages.find(item => item.type === 'collector:github-config');
-  assert.equal(message.enabled, false); assert.equal(message.lfsEnabled, true);
+  assert.equal(message.enabled, false); assert.equal(message.lfsEnabled, undefined);
   assert.equal(message.autoRestore, true);
   assert(app.messages.some(item => item.type === 'collector:github-test'));
-  assert(app.permissionRequests[0].includes('https://lfs.github.com/*'));
+  assert.deepEqual(app.permissionRequests[0], ['https://api.github.com/*']);
   assert.equal(app.permissionRequests.flat().includes('https://*/*'), false);
 });
 
@@ -371,12 +371,12 @@ test('broad HTTPS access is requested only by the optional external-image action
   assert.match(app.elements.get('external-images-status').textContent, /已允许匿名检测/);
 });
 
-test('asset summary distinguishes pending images from successful uploads', async () => {
+test('asset summary ignores obsolete cloud binary counters', async () => {
   const state = initialState(); state.assetStatus = { local: 5, uploaded: 3, pendingUpload: 2, pendingCapture: 1, failed: 1 };
   state.config.github.enabled = true; state.config.github.lfsEnabled = true;
   const app = await setup({ state });
   assert.equal(app.elements.get('asset-summary').hidden, false);
-  assert.match(app.elements.get('asset-summary-text').textContent, /本地附件 5.*已上传 3.*待采集 1（其中失败 1）.*待上传 2/);
+  assert.match(app.elements.get('asset-summary-text').textContent, /本地附件 5.*待采集 1（其中失败 1）/);
 });
 
 test('image failures are a subset of pending tasks and use queue diagnostics over stale counts', async () => {
@@ -719,7 +719,7 @@ test('invalid script replies show a fixed reason while old collection and GitHub
   assert.doesNotMatch(visibleText(app.elements.get('collection-queue')), /secret.invalid|token=private/);
 });
 
-test('transfer details distinguish file upload from conversation commit and expose downloads and restore scope', async () => {
+test('transfer details distinguish local downloads from conversation commit and expose downloads and restore scope', async () => {
   const state = initialState(); state.config.github.enabled = true;
   state.githubStatus = { status: 'pending', pending: 1 };
   state.assetDiagnostics = { pending: 1, failed: 1, internalMissing: 0, captureTotal: 1, captureItems: [
@@ -729,11 +729,11 @@ test('transfer details distinguish file upload from conversation commit and expo
   state.activity = { upload: { current: logItem({ status: 'success', stage: 'upload-image', fileName: '结果.png', finishedAt: Date.now(), completed: 1, total: 1 }), recent: [] } };
   state.restoreStatus = { total: 5, processed: 3, pending: 2, failed: 0 };
   const app = await setup({ state });
-  assert.match(visibleText(app.elements.get('transfer-current')), /附件上传 · 本步骤完成/);
-  assert.match(visibleText(app.elements.get('upload-queue')), /结果.png · 已上传/);
+  assert.doesNotMatch(visibleText(app.elements.get('transfer-current')), /附件上传/);
+  assert.equal(app.elements.has('upload-queue'), false);
   assert.match(visibleText(app.elements.get('download-queue')), /HTTP_403/);
   assert.match(visibleText(app.elements.get('outbox-queue')), /待提交对话 · 等待提交/);
-  assert.match(app.elements.get('transfer-wait').textContent, /还需要提交 JSON、Markdown 与清单/);
+  assert.match(app.elements.get('transfer-wait').textContent, /对话和附件各自保留进度/);
   assert.match(app.elements.get('transfer-restore-detail').textContent, /已处理 3 \/ 5 条/);
   assert.match(html, /仓库恢复（全部账号）/);
   app.elements.get('transfer-details').open = true;
@@ -781,9 +781,9 @@ test('read-only progress polling continues during a long command without reenabl
   } });
   const command = app.click('retry-github');
   await new Promise(resolve => setImmediate(resolve));
-  state.activity = { upload: { current: logItem({ stage: 'upload-image', fileName: 'current.png' }) } };
+  state.activity = { github: { current: logItem({ stage: 'commit', title: 'current conversation' }) } };
   app.setState(state); await app.poll();
-  assert.match(visibleText(app.elements.get('transfer-current')), /current.png/);
+  assert.match(visibleText(app.elements.get('transfer-current')), /current conversation/);
   assert.equal(app.elements.get('retry-github').disabled, true);
   release(); await command;
   assert.equal(app.elements.get('retry-github').disabled, false);
@@ -873,7 +873,7 @@ test('local-only home hides stale cloud queues and errors while showing local pr
   state.assetStatus = { local: 5, uploaded: 3, pendingUpload: 2, pendingCapture: 1 };
   state.activity = { upload: { current: logItem({ status: 'failed', stage: 'upload-image', title: 'old upload' }) } };
   const app = await setup({ state });
-  for (const id of ['github-destination', 'github-detail', 'retry-github', 'upload-queue-section', 'outbox-queue-section', 'restore-queue-section', 'open-restore']) {
+  for (const id of ['github-destination', 'github-detail', 'retry-github', 'outbox-queue-section', 'restore-queue-section', 'open-restore']) {
     assert.equal(app.elements.get(id).hidden, true, id);
   }
   assert.equal(app.elements.get('transfer-heading').textContent, '附件下载详情');
@@ -891,7 +891,7 @@ test('connecting GitHub in the wizard does not implicitly enable upload or attac
   app.elements.get('wizard-token').value = 'synthetic-token';
   await app.click('wizard-connect-github');
   const saved = app.messages.find(x => x.type === 'collector:github-config');
-  assert.equal(saved.enabled, false); assert.equal(saved.lfsEnabled, false); assert.equal(saved.autoRestore, false);
+  assert.equal(saved.enabled, false); assert.equal(saved.lfsEnabled, undefined); assert.equal(saved.autoRestore, false);
   assert.deepEqual(app.permissionRequests, [['https://api.github.com/*']]);
   await app.click('wizard-next-2'); await app.click('wizard-finish');
   assert.equal(app.messages.filter(x => x.type === 'collector:configure').at(-1).localAssetsEnabled, true);
@@ -908,8 +908,8 @@ test('manual GitHub backup works with automatic uploads off and follows saved at
   state.githubStatus = { status: 'pending', manual: true, pending: 2 };
   app.setState(state); await app.poll();
   assert.equal(app.elements.get('github-destination').hidden, false);
-  assert.equal(app.elements.get('upload-queue-section').hidden, true);
-  assert.match(app.elements.get('github-detail').textContent, /仅在原电脑/);
+  assert.equal(app.elements.has('upload-queue-section'), false);
+  assert.match(app.elements.get('github-detail').textContent, /保存在本地/);
 });
 
 test('upload and automatic restore can be disabled without requesting revoked permissions', async () => {
@@ -919,7 +919,7 @@ test('upload and automatic restore can be disabled without requesting revoked pe
   app.elements.get('github-enabled').checked = false; app.elements.get('github-auto-restore').checked = false;
   await app.click('save-github');
   const saved = app.messages.filter(x => x.type === 'collector:github-config').at(-1);
-  assert.equal(saved.enabled, false); assert.equal(saved.autoRestore, false); assert.equal(saved.lfsEnabled, true);
+  assert.equal(saved.enabled, false); assert.equal(saved.autoRestore, false); assert.equal(saved.lfsEnabled, undefined);
   assert.deepEqual(app.permissionRequests, []);
   assert.equal(app.elements.get('global-status').textContent, '');
 });
@@ -983,11 +983,11 @@ test('maintenance displays conversation counts separately from filesystem checks
   assert.doesNotMatch(app.elements.get('maintenance-status').textContent, /已检查 17/);
 });
 
-test('manual backup waits for attachment scope edits to be saved', async () => {
+test('manual backup waits for repository edits to be saved', async () => {
   const state = initialState(); state.config.github.hasToken = true; state.config.github.lfsEnabled = true;
   const app = await setup({ state }); await app.click('open-settings');
-  app.elements.get('lfs-enabled').checked = false;
-  await app.elements.get('lfs-enabled').listeners.get('input')();
+  app.elements.get('repository').value = 'example/new-archive';
+  await app.elements.get('repository').listeners.get('input')();
   assert.equal(app.elements.get('backup-github-now').disabled, true);
   await app.click('backup-github-now');
   assert(!app.messages.some(x => x.type === 'collector:retry-github'));

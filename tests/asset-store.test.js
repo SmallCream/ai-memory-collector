@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { assetPath, validateAssetPath, readLocalBytes, verifiedLocalAsset, writeLocalAsset, imageExtension, assetExtension, inspectAttachmentBytes, canCaptureAsset, MAX_ASSET_BYTES } from '../extension/lib/asset-store.js';
-import { hashBytes } from '../extension/lib/lfs.js';
+import { hashBytes } from '../extension/lib/asset-store.js';
 import { memoryBinaryFs } from './helpers/binary-fs.js';
 
 const account = { platform: 'chatgpt', accountKey: 'acct-test', storageKey: 'demo' };

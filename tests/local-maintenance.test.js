@@ -4,7 +4,7 @@ import { createArchiveStore, accountPrefix, needsMarkdownRefresh } from '../exte
 import { createLocalMaintenance } from '../extension/lib/local-maintenance.js';
 import { RENDERER_VERSION } from '../extension/lib/archive.js';
 import { extractAssets } from '../extension/lib/assets.js';
-import { hashBytes } from '../extension/lib/lfs.js';
+import { hashBytes } from '../extension/lib/asset-store.js';
 import { memoryBinaryFs } from './helpers/binary-fs.js';
 
 const account = { platform: 'chatgpt', accountKey: 'acct-0123456789abcdef01234567', storageKey: 'demo-01234567', alias: 'Demo' };

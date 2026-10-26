@@ -8,7 +8,8 @@ import { createActivityLog } from '../extension/lib/activity-log.js';
 import { extractAssets } from '../extension/lib/assets.js';
 import { createArchiveStore, readAccountManifest } from '../extension/lib/archive-store.js';
 import { assetPath } from '../extension/lib/asset-store.js';
-import { createLfsClient, hashBytes, formatLfsPointer, parseLfsPointer } from '../extension/lib/lfs.js';
+import { hashBytes } from '../extension/lib/asset-store.js';
+import { formatLfsPointer } from './helpers/legacy-lfs.js';
 import { memoryBinaryFs } from './helpers/binary-fs.js';
 
 const PNG = new Uint8Array(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9WQAAAAASUVORK5CYII=', 'base64'));
@@ -259,7 +260,7 @@ test('capture persists exact image, regenerates Markdown and enqueues archive wh
   assert.ok(!JSON.stringify(await env.fs.getSetting(`assetJobs:${account.accountKey}`)).includes('retrieval'));
 });
 
-test('bare generated pointer reaches authenticated file download, local image, Markdown and LFS preparation after restart', async t => {
+test('bare generated pointer reaches authenticated file download, local image, Markdown after restart', async t => {
   for (const mode of ['json-link', 'opaque-follow']) await t.test(mode, async () => {
     const fs = memoryBinaryFs(), store = createArchiveStore({ get: fs.getSetting, set: fs.setSetting });
     const user = 'synthetic-generated-user';
@@ -321,13 +322,6 @@ test('bare generated pointer reaches authenticated file download, local image, M
     assert.equal(fs.text(entry.jsonPath), original);
     assert.match(fs.text(entry.markdownPath), /assets\/[a-f0-9]{64}\.png/);
     assert.equal(enqueued.length, 1);
-    const pointers = await service.prepareUploads({ directory: fs.directory, account: owner, config, bundles: [enqueued[0].archive] });
-    assert.equal(uploaded.length, 1); assert.deepEqual(uploaded[0].bytes, PNG);
-    assert.equal(parseLfsPointer(pointers[0].content).oid, entry.assets[0].oid);
-    const persisted = [...fs.files.values()].map(bytes => new TextDecoder().decode(bytes)).join('\n') +
-      JSON.stringify([...fs.settings.entries()]) + JSON.stringify(enqueued);
-    assert.ok(!persisted.includes('synthetic-generated-signature'));
-    assert.ok(!persisted.includes('synthetic-session-secret'));
   });
 });
 
@@ -521,9 +515,6 @@ test('verified public external image retains link and never uploads its bytes', 
   const entry = (await env.manifest()).conversations['conversation-one'];
   assert.equal(entry.assets[0].status, 'external'); assert.equal(env.captures.length, 0);
   assert.equal(env.requests[0].options.credentials, 'omit');
-  const pointers = await env.service.prepareUploads({ directory: env.fs.directory, account, config, bundles: bundle(entry.assets) });
-  assert.deepEqual(pointers, []); assert.equal(env.uploads.length, 0);
-  assert.ok(![...env.fs.files.keys()].some(path => path.includes('/assets/')));
 });
 
 async function legacyOrdinaryLinks() {
@@ -660,7 +651,7 @@ test('external permission and HTML failures expose their actual fixed diagnostic
   });
 });
 
-test('downloadable ZIP/PDF attachments use capture, Markdown, LFS upload and new-machine restore', async t => {
+test('downloadable ZIP/PDF attachments use capture and local Markdown without cloud binary transfer', async t => {
   const files = [
     { fileName: 'bundle.zip', mimeType: 'application/zip', bytes: new Uint8Array(Buffer.from('UEsDBBQAAAAAAIaLVl2fm+xuBwAAAAcAAAAKAAAAUkVBRE1FLnR4dGV4YW1wbGVQSwECFAMUAAAAAACGi1Zdn5vsbgcAAAAHAAAACgAAAAAAAAAAAAAAgAEAAAAAUkVBRE1FLnR4dFBLBQYAAAAAAQABADgAAAAvAAAAAAA=', 'base64')) },
     { fileName: 'manual.pdf', mimeType: 'application/pdf', bytes: new TextEncoder().encode('%PDF-1.7\n1 0 obj <<>> endobj\n%%EOF\n') },
@@ -677,17 +668,12 @@ test('downloadable ZIP/PDF attachments use capture, Markdown, LFS upload and new
     assert.deepEqual(env.fs.files.get(asset.localPath), file.bytes);
     assert.equal(env.fs.text(entry.jsonPath), native);
     assert.ok(env.fs.text(entry.markdownPath).includes(asset.localPath.split('/').at(-1)));
-    const pointers = await env.service.prepareUploads({ directory: env.fs.directory, account, config, bundles: bundle(entry.assets) });
-    assert.equal(pointers.length, 1); assert.equal(env.uploads.length, 1); assert.deepEqual(env.uploads[0].bytes, file.bytes);
-    const other = memoryBinaryFs();
-    assert.equal((await env.service.hydrateAssets({ directory: other.directory, account, entry, config, snapshot: snapshot(entry.assets) })).downloaded, 1);
-    assert.deepEqual(other.files.get(asset.localPath), file.bytes);
-    const report = await env.service.diagnostics({ directory: env.fs.directory, account, github: config });
-    assert.equal(report.uploadTotal, 1); assert.equal(report.uploadItems[0].fileName, file.fileName);
+    assert.equal(env.service.prepareUploads, undefined);
+    assert.equal(env.service.acknowledgeUploads, undefined);
   });
 });
 
-test('an HTML login response for a ZIP remains a retryable attachment and never enters LFS', async () => {
+test('an HTML login response for a ZIP remains a retryable attachment and never becomes a saved attachment', async () => {
   const env = setup();
   env.dependencies.resolveAsset = async () => ({ bytes: new TextEncoder().encode('<html>Sign in</html>'), mimeType: 'application/zip' }); env.restart();
   const saved = await env.save(detail([{ content_type: 'file', file_id: 'file_document', mime_type: 'application/zip', name: 'bundle.zip' }]));
@@ -696,7 +682,6 @@ test('an HTML login response for a ZIP remains a retryable attachment and never 
   assert.equal((await env.fs.getSetting(`assetJobs:${account.accountKey}`)).tasks[0].error.code, 'ASSET_FORMAT');
   assert.equal(env.fs.text(saved.entry.jsonPath), native);
   assert.ok(![...env.fs.files.keys()].some(path => path.includes('/assets/')));
-  assert.deepEqual(await env.service.prepareUploads({ directory: env.fs.directory, account, config, bundles: bundle((await env.manifest()).conversations['conversation-one'].assets) }), []);
 });
 
 test('manual native JSON changes stop image processing before resolver or outbox changes', async () => {
@@ -717,97 +702,12 @@ test('image tasks make bounded progress and retry failures without losing other 
   env.time(121_001); assert.equal((await env.tick()).pending, 0); assert.equal(env.enqueued.length, 2);
 });
 
-test('LFS preparation is capped at two new objects, persists per-object progress, and resumes after restart', async () => {
-  const env = setup(), assets = await managed(env, 5), input = { directory: env.fs.directory, account, config, bundles: bundle(assets) };
-  await assert.rejects(env.service.prepareUploads(input), { code: 'LFS_UPLOAD_PENDING' });
-  assert.equal(env.uploads.length, 2);
-  assert.equal((await env.fs.getSetting(`assetStatus:${account.accountKey}`)).pendingUpload, 3);
-  env.restart(); await assert.rejects(env.service.prepareUploads(input), { code: 'LFS_UPLOAD_PENDING' });
-  assert.equal(env.uploads.length, 4);
-  const pointers = await env.service.prepareUploads(input);
-  assert.equal(env.uploads.length, 5); assert.equal(pointers.length, 5);
-  assert.ok(pointers.every(pointer => parseLfsPointer(pointer.content).oid === pointer.oid));
-  await env.service.acknowledgeUploads(account);
-  assert.equal(await env.fs.getSetting(`assetUploads:${account.accountKey}`), null);
-  assert.equal((await env.fs.getSetting(`assetReceipts:${account.accountKey}`)).uploaded.length, 5);
-});
 
-test('upload checkpoint cannot skip transfers into another repository, branch or directory', async () => {
-  const env = setup(), assets = await managed(env, 3);
-  const input = { directory: env.fs.directory, account, config, bundles: bundle(assets) };
-  await assert.rejects(env.service.prepareUploads(input), { code: 'LFS_UPLOAD_PENDING' });
-  await assert.rejects(env.service.prepareUploads({ ...input, config: { ...config, repository: 'example/other-data' } }), { code: 'LFS_UPLOAD_PENDING' });
-  assert.equal(env.uploads.length, 4);
-  await assert.rejects(env.service.prepareUploads({ ...input, config: { ...config, branch: 'backup' } }), { code: 'LFS_UPLOAD_PENDING' });
-  assert.equal(env.uploads.length, 6);
-  const other = memoryBinaryFs(); for (const asset of assets) other.put(asset.localPath, env.objects.get(asset.oid));
-  await assert.rejects(env.service.prepareUploads({ ...input, directory: other.directory }), { code: 'LFS_UPLOAD_PENDING' });
-  assert.equal(env.uploads.length, 8);
-});
 
-test('capture status preserves uploaded receipts after a later identical source scan', async () => {
-  const env = setup(); await env.save(detail()); await env.tick();
-  const entry = (await env.manifest()).conversations['conversation-one'];
-  await env.service.prepareUploads({ directory: env.fs.directory, account, config, bundles: bundle(entry.assets) });
-  await env.service.acknowledgeUploads(account); await env.save(detail());
-  const state = await env.fs.getSetting(`assetStatus:${account.accountKey}`);
-  assert.equal(state.local, 1); assert.equal(state.uploaded, 1); assert.equal(state.pendingUpload, 0);
-});
 
-test('LFS restore verifies pointer identity and file content before writing binary', async () => {
-  const env = setup(), assets = await managed(env, 1, { local: false });
-  const result = await env.service.hydrateAssets({ directory: env.fs.directory, account, entry: { assets }, config, snapshot: snapshot(assets) });
-  assert.equal(result.downloaded, 1); assert.equal(result.pending, 0);
-  assert.deepEqual(env.fs.files.get(assets[0].localPath), env.objects.get(assets[0].oid));
-  const again = await env.service.hydrateAssets({ directory: env.fs.directory, account, entry: { assets }, config, snapshot: snapshot(assets) });
-  assert.equal(again.downloaded, 0); assert.equal(env.downloads.length, 1);
-});
 
-test('wrong or missing pointers and corrupt LFS objects do not create local image files', async () => {
-  const env = setup(), assets = await managed(env, 1, { local: false });
-  const input = { directory: env.fs.directory, account, entry: { assets }, config, snapshot: snapshot(assets) };
-  await assert.rejects(env.service.hydrateAssets({ ...input, snapshot: { entries: [] } }), { code: 'ASSET_POINTER_MISSING' });
-  env.time(61_001);
-  env.pointer(formatLfsPointer({ oid: 'a'.repeat(64), size: assets[0].size }));
-  await assert.rejects(env.service.hydrateAssets(input), { code: 'ASSET_POINTER_MISMATCH' });
-  assert.equal(env.downloads.length, 0);
-  env.pointer(null); env.corrupt(true); env.time(181_001);
-  await assert.rejects(env.service.hydrateAssets(input), { code: 'ASSET_HASH' });
-  assert.equal(env.fs.files.size, 0);
-});
 
-test('restore hydrates at most two images per call and preserves manual edits', async () => {
-  const env = setup(), assets = await managed(env, 3, { local: false });
-  const input = { directory: env.fs.directory, account, entry: { assets }, config, snapshot: snapshot(assets) };
-  assert.deepEqual(await env.service.hydrateAssets(input), { downloaded: 2, pending: 1, failed: 0 });
-  env.restart(); assert.deepEqual(await env.service.hydrateAssets(input), { downloaded: 1, pending: 0, failed: 0 });
-  env.fs.put(assets[0].localPath, new Uint8Array());
-  await assert.rejects(env.service.hydrateAssets(input), { code: 'ASSET_LOCAL_CONFLICT' });
-  assert.equal(env.fs.files.get(assets[0].localPath).length, 0); assert.equal(env.downloads.length, 3);
-});
 
-test('one missing pointer cannot starve later good images and failures retain per-file backoff after restart', async () => {
-  const env = setup(), assets = await managed(env, 5, { local: false });
-  const input = { directory: env.fs.directory, account, entry: { conversationId: 'synthetic-many', assets }, config,
-    snapshot: { ...snapshot(assets.slice(1)), commitSha: 'a'.repeat(40) } };
-  assert.deepEqual(await env.service.hydrateAssets(input), { downloaded: 1, pending: 3, failed: 0 });
-  assert.equal(env.downloads.length, 1); // failed first pointer also consumed the attempt budget
-  env.restart();
-  assert.deepEqual(await env.service.hydrateAssets(input), { downloaded: 2, pending: 1, failed: 0 });
-  await assert.rejects(env.service.hydrateAssets(input), { code: 'ASSET_POINTER_MISSING' });
-  assert.equal(env.downloads.length, 4);
-  assert.ok(assets.slice(1).every(asset => env.fs.files.has(asset.localPath)));
-  assert.equal(env.fs.files.has(assets[0].localPath), false);
-  const saved = [...env.fs.settings.entries()].find(([key]) => key.startsWith('assetHydration:'))[1];
-  assert.equal(Object.values(saved.failures)[0].attempt, 1);
-  env.time(61_001);
-  await assert.rejects(env.service.hydrateAssets(input), { code: 'ASSET_POINTER_MISSING' });
-  const retried = [...env.fs.settings.entries()].find(([key]) => key.startsWith('assetHydration:'))[1];
-  assert.equal(Object.values(retried.failures)[0].attempt, 2);
-  // A new immutable snapshot may supply the missing pointer without inheriting its backoff.
-  assert.deepEqual(await env.service.hydrateAssets({ ...input, snapshot: { ...snapshot(assets), commitSha: 'b'.repeat(40) } }),
-    { downloaded: 1, pending: 0, failed: 0 });
-});
 
 function internalDetail() {
   const value = detail(['Text is archived normally.']);
@@ -847,7 +747,7 @@ test('internal viewer capture 404 preserves source, records missing bytes, and s
   assert.equal(env.captures.length, 1); assert.equal((await env.service.diagnostics({ account })).internalMissing, 1);
 });
 
-test('ordinary retries leave suspended internal attachments alone and explicit internal retry can download and upload real bytes', async () => {
+test('ordinary retries leave suspended internal attachments alone and explicit internal retry can download real bytes locally', async () => {
   const env = setup(); await env.save(internalDetail()); failCapture(env, 'HTTP_404'); await env.tick();
   await env.service.retryFailed({ account }); await env.tick(); assert.equal(env.captures.length, 1);
   await env.service.retryFailed({ account, includeInternal: true });
@@ -859,8 +759,6 @@ test('ordinary retries leave suspended internal attachments alone and explicit i
   assert.equal(asset.status, 'downloaded'); assert.equal(asset.autoRetrySuspended, undefined); assert.equal(asset.errorCode, undefined);
   assert.deepEqual(env.fs.files.get(asset.localPath), PNG);
   assert.equal((await env.fs.getSetting(`assetJobs:${account.accountKey}`)).tasks.length, 0);
-  const pointers = await env.service.prepareUploads({ directory: env.fs.directory, account, config, bundles: [env.enqueued.at(-1).archive] });
-  assert.equal(pointers.length, 1); assert.equal(env.uploads.length, 1); assert.deepEqual(env.uploads[0].bytes, PNG);
 });
 
 test('visible user or assistant images and unknown tool attachments never suspend capture after HTTP 404', async t => {
@@ -960,7 +858,7 @@ test('restore hydration recreates suspended manual retry jobs from verified nati
   const entry = (await env.manifest()).conversations['conversation-one'];
   await env.fs.setSetting(`assetJobs:${account.accountKey}`, null); env.restart();
   const input = { directory: env.fs.directory, account, entry, config, snapshot: { entries: [] } };
-  await env.service.hydrateAssets(input); await env.service.hydrateAssets(input);
+  await env.service.reconcileRestoredAssets(input); await env.service.reconcileRestoredAssets(input);
   assert.equal((await env.fs.getSetting(`assetJobs:${account.accountKey}`)).tasks.length, 1);
   assert.equal((await env.service.diagnostics({ directory: env.fs.directory, account })).internalMissing, 1);
   await env.tick(); assert.equal(env.captures.length, 1);
@@ -1011,7 +909,7 @@ test('restore releases old suspended jobs when remote native makes the attachmen
   const env = setup(); await env.save(internalDetail()); failCapture(env, 'HTTP_404'); await env.tick();
   const source = internalDetail(); source.payload.mapping.viewer.message.author = { role: 'user' };
   const saved = await env.store.saveConversation({ directory: env.fs.directory, account, detail: source, assets: await extractAssets(source.payload) });
-  await env.service.hydrateAssets({ directory: env.fs.directory, account, entry: saved.entry, config, snapshot: { entries: [] } });
+  await env.service.reconcileRestoredAssets({ directory: env.fs.directory, account, entry: saved.entry, config, snapshot: { entries: [] } });
   assert.equal((await env.service.diagnostics({ account })).internalMissing, 0);
   await env.tick(); assert.equal(env.captures.length, 2);
   assert.equal((await env.service.diagnostics({ account })).failed, 1);
@@ -1024,7 +922,7 @@ test('ready winners clear stale internal jobs during restore and rescan without 
     const asset = { ...old, status: 'downloaded', oid, size: PNG.length, localPath: assetPath(account, oid, 'png') };
     delete asset.autoRetrySuspended; delete asset.errorCode; env.fs.put(asset.localPath, PNG);
     const saved = await env.store.saveConversation({ directory: env.fs.directory, account, detail: source, assets: [asset] });
-    if (method === 'restore') await env.service.hydrateAssets({ directory: env.fs.directory, account, entry: saved.entry, config, snapshot: { entries: [] } });
+    if (method === 'restore') await env.service.reconcileRestoredAssets({ directory: env.fs.directory, account, entry: saved.entry, config, snapshot: { entries: [] } });
     else await env.save(source);
     assert.equal((await env.service.diagnostics({ account })).internalMissing, 0);
     await env.tick(); assert.equal(env.captures.length, 1);
@@ -1141,61 +1039,8 @@ test('source refresh waits are visible during explicit image retry', async () =>
   assert.equal((await env.service.diagnostics({ account })).failed, 0);
 });
 
-test('upload diagnostics remain pending in flight and use scoped durable receipts only after upload', async () => {
-  const env = setup(), gate = transferGate(); await env.save(detail()); await env.tick();
-  env.dependencies.lfsFactory = () => ({ upload: async () => { gate.entered(); await gate.waiting; } }); env.restart();
-  const bundles = [env.enqueued.at(-1).archive];
-  const pending = env.service.prepareUploads({ directory: env.fs.directory, account, config, bundles });
-  await gate.started;
-  const activity = await transferActivity(env, 'upload');
-  assert.equal(activity.current.status, 'running'); assert.equal(activity.current.stage, 'upload-image');
-  assert.equal(activity.current.title, 'Synthetic image conversation');
-  assert.equal(activity.current.total, 1); assert.equal(activity.current.completed, 0);
-  const before = await env.service.diagnostics({ directory: env.fs.directory, account, github: config });
-  assert.equal(before.uploadTotal, 1); assert.equal(before.uploadItems[0].status, 'pending');
-  gate.release(); await pending;
-  const after = await env.service.diagnostics({ directory: env.fs.directory, account, github: config });
-  assert.equal(after.uploadItems[0].status, 'uploaded');
-  for (const github of [{ ...config, repository: 'example/other' }, { ...config, branch: 'other' }]) {
-    assert.equal((await env.service.diagnostics({ directory: env.fs.directory, account, github })).uploadItems[0].status, 'pending');
-  }
-  const old = await env.fs.getSetting(`assetReceipts:${account.accountKey}`);
-  await env.fs.setSetting(`assetReceipts:${account.accountKey}`, { ...old, directory: memoryBinaryFs().directory });
-  assert.equal((await env.service.diagnostics({ directory: env.fs.directory, account, github: config })).uploadItems[0].status, 'pending');
-  assert.equal((await transferActivity(env, 'upload')).current.status, 'success');
-});
 
-test('upload failures keep pending receipt state and expose only sanitized labels and an error code', async () => {
-  const env = setup(), source = detail();
-  source.payload.title = 'Synthetic https://example.invalid/?sig=private ghp_private Bearer private';
-  await env.save(source); await env.tick();
-  env.dependencies.lfsFactory = () => ({ upload: async () => { throw Object.assign(new Error('https://example.invalid/?sig=private'), { code: 'HTTP_403' }); } });
-  env.restart();
-  await assert.rejects(env.service.prepareUploads({ directory: env.fs.directory, account, config, bundles: [env.enqueued.at(-1).archive] }), { code: 'HTTP_403' });
-  const activity = await transferActivity(env, 'upload');
-  assert.equal(activity.current.status, 'failed'); assert.equal(activity.current.code, 'HTTP_403');
-  assert.doesNotMatch(JSON.stringify(activity), /private|https:\/\//);
-  const diagnostics = await env.service.diagnostics({ directory: env.fs.directory, account, github: config });
-  assert.equal(diagnostics.uploadItems[0].status, 'pending');
-  assert.doesNotMatch(JSON.stringify(diagnostics), /private|https:\/\//);
-});
 
-test('LFS restoration exposes the actual pending network download and then local save without fake byte progress', async () => {
-  const env = setup(), gate = transferGate(), assets = await managed(env, 1, { local: false });
-  env.dependencies.lfsFactory = () => ({ download: async input => { gate.entered(); await gate.waiting; return env.objects.get(input.oid); } });
-  env.restart();
-  const pending = env.service.hydrateAssets({ directory: env.fs.directory, account,
-    entry: { conversationId: 'synthetic-restore', title: 'Restore image', assets }, config, snapshot: snapshot(assets) });
-  await gate.started;
-  const activity = await transferActivity(env, 'restore-images');
-  assert.equal(activity.current.stage, 'restore-image'); assert.equal(activity.current.status, 'running');
-  assert.equal(activity.current.completed, undefined); assert.equal(activity.current.conversationId, 'synthetic-restore');
-  assert.equal(env.fs.files.has(assets[0].localPath), false);
-  gate.release(); await pending;
-  assert.equal((await transferActivity(env, 'restore-images')).current.stage, 'save-image');
-  assert.equal((await transferActivity(env, 'restore-images')).current.status, 'success');
-  assert.deepEqual(env.fs.files.get(assets[0].localPath), env.objects.get(assets[0].oid));
-});
 
 test('diagnostic task lists are bounded and explicitly preserve waiting, delivery and internal missing states', async () => {
   const env = setup();
@@ -1499,13 +1344,13 @@ test('text-only cloud attachments are reported missing without requesting nonexi
   const saved = await env.store.saveConversation({ directory: env.fs.directory, account, detail: source, assets });
   assert.equal(saved.entry.assets[0].cloudStatus, 'local-only');
   env.fs.files.delete(assets[0].localPath);
-  const restored = await env.service.hydrateAssets({ directory: env.fs.directory, account, entry: saved.entry, config, snapshot: { entries: [] } });
-  assert.deepEqual(restored, { downloaded: 0, pending: 0, failed: 0, cloudMissing: 1 });
+  const restored = await env.service.reconcileRestoredAssets({ directory: env.fs.directory, account, entry: saved.entry, config, snapshot: { entries: [] } });
+  assert.deepEqual(restored, { cloudMissing: 1 });
   assert.equal(env.downloads.length, 0); assert.equal((await env.service.diagnostics({ directory: env.fs.directory, account })).conversations[0].local, 0);
   await env.tick(); assert.deepEqual(env.fs.files.get(assets[0].localPath), PNG);
   assert.equal((await env.manifest()).conversations['conversation-one'].assets[0].cloudStatus, undefined);
-  const present = await env.service.hydrateAssets({ directory: env.fs.directory, account, entry: saved.entry, config, snapshot: { entries: [] } });
-  assert.deepEqual(present, { downloaded: 0, pending: 0, failed: 0 }); assert.equal(env.downloads.length, 0);
+  const present = await env.service.reconcileRestoredAssets({ directory: env.fs.directory, account, entry: saved.entry, config, snapshot: { entries: [] } });
+  assert.deepEqual(present, { cloudMissing: 0 }); assert.equal(env.downloads.length, 0);
 });
 
 test('shared source cooldown blocks manual attachment network work but permits durable archive delivery', async () => {
@@ -1519,91 +1364,14 @@ test('shared source cooldown blocks manual attachment network work but permits d
   assert.equal(env.captures.length, 1); assert.equal(env.enqueued.length, 1);
 });
 
-test('changing GitHub settings during upload prevents subsequent files and stale receipt or progress writes', async () => {
-  const env = setup(), assets = await managed(env, 3);
-  let current = true, writeLock = false, signalStarted, finishUpload;
-  const started = new Promise(resolve => { signalStarted = resolve; });
-  const heldUpload = new Promise(resolve => { finishUpload = resolve; });
-  env.dependencies.lfsFactory = () => ({ upload: async input => {
-    assert.equal(writeLock, false, 'network upload must not hold the settings write lock');
-    env.uploads.push(input); signalStarted(); await heldUpload;
-  } }); env.restart();
-  const pending = env.service.prepareUploads({ directory: env.fs.directory, account, config, bundles: bundle(assets),
-    isCurrent: async () => current,
-    withCurrent: async operation => {
-      if (!current) return false;
-      assert.equal(writeLock, false); writeLock = true;
-      try { await operation(); return true; } finally { writeLock = false; }
-    } });
-  await started; current = false;
-  const keys = [`assetReceipts:${account.accountKey}`, `assetUploads:${account.accountKey}`,
-    `assetStatus:${account.accountKey}`, `activity:v1:${account.accountKey}:upload`];
-  for (const key of keys) await env.fs.setSetting(key, { target: 'new-target', sentinel: true });
-  finishUpload(); await assert.rejects(pending, { code: 'GITHUB_TARGET_CHANGED' });
-  assert.equal(env.uploads.length, 1);
-  for (const key of keys) assert.deepEqual(await env.fs.getSetting(key), { target: 'new-target', sentinel: true });
-});
 
-test('the atomic GitHub settings fence can reject checkpoint initialization before any upload', async () => {
-  const env = setup(), assets = await managed(env, 1);
-  await assert.rejects(env.service.prepareUploads({ directory: env.fs.directory, account, config, bundles: bundle(assets),
-    isCurrent: async () => true, withCurrent: async () => false }), { code: 'GITHUB_TARGET_CHANGED' });
-  assert.equal(env.uploads.length, 0); assert.equal(await env.fs.getSetting(`assetUploads:${account.accountKey}`), undefined);
-});
 
-test('changing GitHub settings while LFS batch waits prevents its subsequent binary PUT', async () => {
-  const env = setup(), assets = await managed(env, 1);
-  let current = true, signalBatch, finishBatch;
-  const batchStarted = new Promise(resolve => { signalBatch = resolve; });
-  const batchResponse = new Promise(resolve => { finishBatch = resolve; });
-  const requests = [];
-  env.dependencies.lfsFactory = createLfsClient;
-  env.dependencies.fetchImpl = async function (url, options) {
-    assert.equal(this, globalThis);
-    requests.push({ url, method: options.method });
-    assert.ok(url.endsWith('/objects/batch'), 'no binary PUT or verify may follow the disabled batch');
-    signalBatch(); await batchResponse;
-    return new Response(JSON.stringify({ transfer: 'basic', objects: [{ oid: assets[0].oid, size: assets[0].size,
-      actions: { upload: { href: 'https://github-cloud.s3.amazonaws.com/example/object' } } }] }));
-  }; env.restart();
-  const pending = env.service.prepareUploads({ directory: env.fs.directory, account, config, bundles: bundle(assets),
-    isCurrent: async () => current,
-    withCurrent: async operation => { if (!current) return false; await operation(); return true; } });
-  await batchStarted; current = false; finishBatch();
-  await assert.rejects(pending, { code: 'GITHUB_TARGET_CHANGED' });
-  assert.equal(requests.length, 1); assert.equal(requests[0].method, 'POST');
-  assert.deepEqual((await env.fs.getSetting(`assetReceipts:${account.accountKey}`)).uploaded, []);
-});
 
-test('an older restore snapshot does not misclassify newer local attachments as corrupt cloud objects', async () => {
+test('old cloud metadata never causes binary requests and all absent local files remain missing', async () => {
   const env = setup(), assets = await managed(env, 2, { local: false });
-  const result = await env.service.hydrateAssets({ directory: env.fs.directory, account,
+  const result = await env.service.reconcileRestoredAssets({ directory: env.fs.directory, account,
     entry: { assets }, remoteEntry: { assets: [assets[0]] }, config, snapshot: snapshot([assets[0]]) });
-  assert.deepEqual(result, { downloaded: 1, pending: 0, failed: 0, cloudMissing: 1 });
-  assert.equal(env.downloads.length, 1); assert.equal(env.downloads[0].oid, assets[0].oid);
+  assert.deepEqual(result, { cloudMissing: 2 });
+  assert.equal(env.downloads.length, 0);
   assert.equal(env.fs.files.has(assets[1].localPath), false);
-});
-
-test('restore availability follows the pinned remote descriptor, not a stale local cloud marker', async t => {
-  await t.test('remote text-only descriptor', async () => {
-    const env = setup(), assets = await managed(env, 1, { local: false });
-    const result = await env.service.hydrateAssets({ directory: env.fs.directory, account,
-      entry: { assets }, remoteEntry: { assets: assets.map(asset => ({ ...asset, cloudStatus: 'local-only' })) },
-      config, snapshot: { entries: [] } });
-    assert.deepEqual(result, { downloaded: 0, pending: 0, failed: 0, cloudMissing: 1 });
-    assert.equal(env.downloads.length, 0);
-  });
-  await t.test('remote has the exact object', async () => {
-    const env = setup(), assets = await managed(env, 1, { local: false });
-    const result = await env.service.hydrateAssets({ directory: env.fs.directory, account,
-      entry: { assets: assets.map(asset => ({ ...asset, cloudStatus: 'local-only' })) }, remoteEntry: { assets },
-      config, snapshot: snapshot(assets) });
-    assert.deepEqual(result, { downloaded: 1, pending: 0, failed: 0 }); assert.equal(env.downloads.length, 1);
-  });
-});
-
-test('a remote descriptor that claims uploaded bytes still reports an actually missing pointer', async () => {
-  const env = setup(), assets = await managed(env, 1, { local: false });
-  await assert.rejects(env.service.hydrateAssets({ directory: env.fs.directory, account,
-    entry: { assets }, remoteEntry: { assets }, config, snapshot: { entries: [] } }), { code: 'ASSET_POINTER_MISSING' });
 });

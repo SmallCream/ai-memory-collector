@@ -499,3 +499,20 @@ test('a repeated sandbox path keeps each generating message version separate in 
   assert.ok(incomplete.files[1].content.includes(`[first](../../../assets/${'1'.repeat(64)}.zip)`));
   assert.match(incomplete.files[1].content, /second〔附件待补采〕/);
 });
+
+test('gzip download links are recognized across Markdown, references and HTML without collecting code or GitHub viewer pages', async () => {
+  for (const suffix of ['gz', 'tar.gz', 'tgz', 'TGZ']) {
+    const url = `https://downloads.example.org/archive.${suffix}`;
+    const native = { conversation_id: 'gzip-links', mapping: { one: { message: { id: 'one', author: { role: 'assistant' },
+      content: { content_type: 'text', parts: [`[download](${url})\n[reference][file]\n\n[file]: ${url}\n<a href="${url}">download</a>`] } } } } };
+    const assets = await extractAssets(native);
+    assert.equal(assets.length, 1); assert.equal(assets[0].kind, 'attachment');
+    assert.equal(assets[0].fileName, `archive.${suffix}`); assert.equal(assets[0].occurrences.length, 1);
+    for (const markup of [`[download](${url})`, `[reference][file]\n\n[file]: ${url}`, `<a href="${url}">download</a>`]) {
+      native.mapping.one.message.content.parts = [markup];
+      assert.equal((await extractAssets(native)).length, 1);
+    }
+    native.mapping.one.message.content.parts = [`\`[sample](${url})\`\n[view](https://github.com/demo/repo/blob/main/archive.${suffix})`];
+    assert.equal((await extractAssets(native)).length, 0);
+  }
+});

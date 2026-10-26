@@ -2,13 +2,13 @@ const CONFIG_KEY = 'collectorConfigV2';
 export const INTERVALS = [15, 30, 60];
 export const DEFAULT_CONFIG = Object.freeze({ schemaVersion: 3, setupComplete: false,
   autoEnabled: true, localAssetsEnabled: true, intervalMinutes: 30, accounts: {},
-  github: { enabled: false, autoRestore: false, repository: '', branch: '', token: '', lfsEnabled: false } });
+  github: { enabled: false, autoRestore: false, repository: '', branch: '', token: '' } });
 
 export function publicConfig(config) {
   return { setupComplete: config.setupComplete, autoEnabled: config.autoEnabled, localAssetsEnabled: config.localAssetsEnabled !== false,
     intervalMinutes: config.intervalMinutes, github: {
       enabled: config.github.enabled, repository: config.github.repository,
-      branch: config.github.branch, hasToken: Boolean(config.github.token), lfsEnabled: config.github.lfsEnabled === true,
+      branch: config.github.branch, hasToken: Boolean(config.github.token),
       autoRestore: config.github.autoRestore === true,
     } };
 }
@@ -19,14 +19,15 @@ export function createConfigStore({ getSetting, setSetting }) {
     const saved = await getSetting(CONFIG_KEY);
     if (saved?.schemaVersion === 2 || saved?.schemaVersion === 3) {
       const legacy = saved.schemaVersion === 2;
+      const github = { ...saved.github };
+      delete github.lfsEnabled;
       return {
         ...structuredClone(DEFAULT_CONFIG), ...saved, schemaVersion: 3,
         localAssetsEnabled: saved.localAssetsEnabled !== false,
-        github: { ...DEFAULT_CONFIG.github, ...saved.github,
+        github: { ...DEFAULT_CONFIG.github, ...github,
           // Before v3 one switch enabled uploads and repository restoration.
           // Preserve that behavior on upgrade, while new installs stay local.
-          autoRestore: legacy ? saved.github?.enabled === true : saved.github?.autoRestore === true,
-          lfsEnabled: legacy ? saved.github?.lfsEnabled !== false : saved.github?.lfsEnabled === true },
+          autoRestore: legacy ? saved.github?.enabled === true : saved.github?.autoRestore === true },
       };
     }
     const previous = await getSetting('formPreferences') || await getSetting('githubTarget') || {};

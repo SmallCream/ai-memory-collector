@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { syncArchives } from '../extension/lib/github-sync.js';
 import { PROBE_CONTENT, PROBE_PATH } from '../extension/lib/github.js';
 import { buildArchive } from '../extension/lib/archive.js';
-import { formatLfsPointer } from '../extension/lib/lfs.js';
+import { formatLfsPointer } from './helpers/legacy-lfs.js';
 import { extractAssets } from '../extension/lib/assets.js';
 const ACCOUNT = 'acct-' + '1'.repeat(24);
 const PREFIX = 'data/web/chatgpt/demo-' + '1'.repeat(8);
@@ -439,34 +439,19 @@ test('text-only cloud backup saves conversations without LFS pointers or changin
   assert.equal(replay.remoteWinners[0].entry.assets[0].cloudStatus, 'local-only');
 });
 
-test('text-only upload preserves verified remote attachments and rejects mismatched pointers', async () => {
+test('text-only upload preserves all historical asset files without inspecting or rewriting them', async () => {
   const b = await pictureBundle();
   const server = gitServer({ initial: { ...fileMap(b), [IMAGE.localPath]: formatLfsPointer(IMAGE), [ATTRIBUTES]: RULE } });
   const result = await syncArchives({ config: { ...CONFIG, lfsEnabled: false }, bundles: [b], fetchImpl: server.fetchImpl });
-  assert.equal(result.status, 'unchanged');
+  assert.equal(result.status, 'synced');
   assert.equal(server.files()[IMAGE.localPath], formatLfsPointer(IMAGE));
-  assert.equal(JSON.parse(server.files()[MANIFEST]).conversations.picture.assets[0].cloudStatus, undefined);
+  assert.equal(JSON.parse(server.files()[MANIFEST]).conversations.picture.assets[0].cloudStatus, 'local-only');
   const bad = gitServer({ initial: { [IMAGE.localPath]: 'unrelated user-owned file' } });
-  await assert.rejects(syncArchives({ config: { ...CONFIG, lfsEnabled: false }, bundles: [b], fetchImpl: bad.fetchImpl }),
-    { code: 'ASSET_IMMUTABLE_CONFLICT' });
-  assert.ok(bad.calls.every(call => call.method === 'GET'));
+  await syncArchives({ config: CONFIG, bundles: [b], fetchImpl: bad.fetchImpl });
+  assert.equal(bad.files()[IMAGE.localPath], 'unrelated user-owned file');
 });
 
-test('enabling attachment backup upgrades an earlier text-only manifest without changing native history', async () => {
-  const b = await pictureBundle(), server = gitServer();
-  await syncArchives({ config: { ...CONFIG, lfsEnabled: false }, bundles: [b], fetchImpl: server.fetchImpl });
-  await syncArchives({ config: { ...CONFIG, lfsEnabled: true }, bundles: [b], assetPointers: [pointer(IMAGE)], fetchImpl: server.fetchImpl });
-  assert.equal(server.files()[IMAGE.localPath], formatLfsPointer(IMAGE));
-  assert.equal(server.files()[b.entry.jsonPath], b.files[0].content);
-  assert.equal(JSON.parse(server.files()[MANIFEST]).conversations.picture.assets[0].cloudStatus, undefined);
-});
 
-test('a disabled attachment scope cannot submit supplied pointers', async () => {
-  const b = await pictureBundle(), server = gitServer();
-  await assert.rejects(syncArchives({ config: { ...CONFIG, lfsEnabled: false }, bundles: [b], assetPointers: [pointer(IMAGE)], fetchImpl: server.fetchImpl }),
-    { code: 'ASSET_UPLOAD_DISABLED' });
-  assert.equal(server.calls.length, 0);
-});
 
 async function downloadableBundle(extension = 'zip', downloaded = true) {
   const initial = bundle('downloadable'), native = JSON.parse(initial.files[0].content);
@@ -481,16 +466,16 @@ async function downloadableBundle(extension = 'zip', downloaded = true) {
   return { accountKey: ACCOUNT, files: built.files, manifest: built.manifest, entry: built.manifest.conversations.downloadable, asset };
 }
 
-test('downloadable ZIP, PDF, Office and text assets commit references and LFS pointers together', async () => {
+test('downloadable attachments commit metadata and text without binary files or pointers', async () => {
   for (const extension of ['zip', 'pdf', 'docx', 'xlsx', 'pptx', 'txt', 'md', 'csv', 'json', 'py']) {
     const b = await downloadableBundle(extension), server = gitServer();
     const result = await syncArchives({ config: CONFIG, bundles: [b], assetPointers: [pointer(b.asset)], fetchImpl: server.fetchImpl });
     assert.equal(result.status, 'synced');
-    assert.equal(server.files()[b.asset.localPath], formatLfsPointer(b.asset));
+    assert.equal(server.files()[b.asset.localPath], undefined);
     assert.equal(server.files()[b.entry.jsonPath], b.files[0].content);
     assert.ok(server.files()[b.entry.markdownPath].includes(`[report\\.${extension}](../../../assets/${b.asset.oid}.${extension})`));
     assert.equal(JSON.parse(server.files()[MANIFEST]).conversations.downloadable.assets[0].status, 'downloaded');
-    assert.equal(server.files()[ATTRIBUTES], RULE);
+    assert.equal(server.files()[ATTRIBUTES], undefined);
     assert.equal(server.calls.filter(call => call.method === 'PATCH').length, 1);
   }
 });
@@ -505,7 +490,7 @@ test('same native downloadable attachment merges preserve ready remote files and
     } : {}) } });
     const result = await syncArchives({ config: CONFIG, bundles: [local],
       ...(localReady ? { assetPointers: [pointer(ready.asset)] } : {}), fetchImpl: server.fetchImpl });
-    assert.equal(result.status, localReady ? 'synced' : 'unchanged');
+    assert.equal(result.status, 'synced');
     const merged = JSON.parse(server.files()[MANIFEST]).conversations.downloadable.assets[0];
     assert.equal(merged.status, 'downloaded');
     assert.equal(merged.localPath, ready.asset.localPath);
@@ -758,16 +743,16 @@ test('same native sync does not retire a legacy citation that already owns saved
   assert.equal(assets.find(asset => asset.id === alias.id).oid, alias.oid);
 });
 
-test('LFS pointer, scoped attributes, native JSON, Markdown and metadata commit atomically', async () => {
+test('text commits remain atomic without creating pointers or editing existing attributes', async () => {
   const b = await pictureBundle(), server = gitServer({ initial: { [ATTRIBUTES]: '*.md text eol=lf\n', 'notes.txt': 'keep' } });
   const result = await syncArchives({ config: CONFIG, bundles: [b], assetPointers: [pointer(IMAGE)], fetchImpl: server.fetchImpl });
   assert.equal(result.status, 'synced');
-  assert.equal(result.filesChanged, 6);
+  assert.equal(result.filesChanged, 4);
   assert.equal(server.calls.filter(call => call.method === 'PATCH').length, 1);
   const commitFiles = server.calls.find(call => call.path === '/git/trees' && call.method === 'POST').body.tree;
-  assert.equal(commitFiles.length, 6);
-  assert.equal(server.files()[IMAGE.localPath], formatLfsPointer(IMAGE));
-  assert.equal(server.files()[ATTRIBUTES], '*.md text eol=lf\n' + RULE);
+  assert.equal(commitFiles.length, 4);
+  assert.equal(server.files()[IMAGE.localPath], undefined);
+  assert.equal(server.files()[ATTRIBUTES], '*.md text eol=lf\n');
   assert.equal(server.files()[b.entry.jsonPath], b.files[0].content);
   assert.match(server.files()[b.entry.markdownPath], new RegExp(`\\.\\./\\.\\./\\.\\./assets/${IMAGE.oid}\\.png`));
   assert.equal(server.files()['notes.txt'], 'keep');
@@ -776,12 +761,6 @@ test('LFS pointer, scoped attributes, native JSON, Markdown and metadata commit 
   assert.equal(replay.status, 'unchanged');
 });
 
-test('ready image metadata cannot be committed before a corresponding uploaded pointer exists', async () => {
-  const b = await pictureBundle(), server = gitServer();
-  await assert.rejects(syncArchives({ config: CONFIG, bundles: [b], fetchImpl: server.fetchImpl }), { code: 'LFS_ASSET_MISSING' });
-  assert.ok(server.calls.every(call => call.method === 'GET'));
-  assert.deepEqual(server.files(), {});
-});
 
 test('an identical existing pointer permits new references without another descriptor', async () => {
   const b = await pictureBundle(), server = gitServer({ initial: { [IMAGE.localPath]: formatLfsPointer(IMAGE), [ATTRIBUTES]: RULE } });
@@ -791,34 +770,7 @@ test('an identical existing pointer permits new references without another descr
   assert.ok(!files.some(file => file.path === IMAGE.localPath));
 });
 
-test('unreferenced, cross-account and mismatched pointers are rejected before network requests', async () => {
-  const b = await pictureBundle();
-  for (const descriptor of [
-    { ...pointer(IMAGE), accountKey: 'acct-' + '2'.repeat(24) },
-    { ...pointer(IMAGE), path: IMAGE.localPath.replace('demo-', 'other-') },
-    { ...pointer(IMAGE), oid: 'f'.repeat(64) },
-    { ...pointer(IMAGE), content: 'not a pointer' },
-    { ...pointer(IMAGE), size: 999 },
-  ]) {
-    const server = gitServer();
-    await assert.rejects(syncArchives({ config: CONFIG, bundles: [b], assetPointers: [descriptor], fetchImpl: server.fetchImpl }), { code: 'ACCOUNT_OWNERSHIP' });
-    assert.equal(server.calls.length, 0);
-  }
-  const pending = await pictureBundle({ assets: [{ id: IMAGE.id, sourceRef: IMAGE.sourceRef, status: 'pending' }] });
-  const server = gitServer();
-  await assert.rejects(syncArchives({ config: CONFIG, bundles: [pending], assetPointers: [pointer(IMAGE)], fetchImpl: server.fetchImpl }), { code: 'ACCOUNT_OWNERSHIP' });
-  assert.equal(server.calls.length, 0);
-});
 
-test('hash-addressed image paths cannot overwrite a different remote pointer or text', async () => {
-  const b = await pictureBundle();
-  for (const existing of ['manual image data', formatLfsPointer({ oid: 'f'.repeat(64), size: IMAGE.size })]) {
-    const server = gitServer({ initial: { [IMAGE.localPath]: existing } });
-    await assert.rejects(syncArchives({ config: CONFIG, bundles: [b], assetPointers: [pointer(IMAGE)], fetchImpl: server.fetchImpl }), { code: 'ASSET_IMMUTABLE_CONFLICT' });
-    assert.equal(server.files()[IMAGE.localPath], existing);
-    assert.ok(server.calls.every(call => call.method === 'GET'));
-  }
-});
 
 test('cross-account and non-hash image paths inside a manifest fail before any request', async () => {
   for (const localPath of [`data/web/chatgpt/other/assets/${IMAGE.oid}.png`, `${PREFIX}/assets/not-the-hash.png`, `${PREFIX}/assets/../image.png`]) {
@@ -837,11 +789,12 @@ test('same native JSON preserves richer remote asset status and image Markdown o
   assert.equal(ready.files[0].content, pending.files[0].content);
   const server = gitServer({ initial: { ...fileMap(ready), [IMAGE.localPath]: formatLfsPointer(IMAGE), [ATTRIBUTES]: RULE } });
   const result = await syncArchives({ config: CONFIG, bundles: [pending], fetchImpl: server.fetchImpl });
-  assert.equal(result.status, 'unchanged');
+  assert.equal(result.status, 'synced');
   assert.equal(server.files()[ready.entry.markdownPath], ready.files[1].content);
   assert.equal(result.remoteWinners[0].entry.assets[0].status, 'downloaded');
   assert.equal(result.remoteWinners[0].entry.assets[0].oid, IMAGE.oid);
-  assert.ok(server.calls.every(call => call.method === 'GET'));
+  assert.equal(JSON.parse(server.files()[MANIFEST]).conversations.picture.assets[0].cloudStatus, 'local-only');
+  assert.equal(server.files()[IMAGE.localPath], formatLfsPointer(IMAGE));
 });
 
 test('same native JSON can upgrade pending remote image with newly uploaded local asset', async () => {
@@ -867,14 +820,6 @@ test('regenerating a missing newer remote Markdown retains its saved image refer
   assert.equal(result.remoteWinners[0].entry.assets[0].oid, IMAGE.oid);
 });
 
-test('nested attributes rules that can override account LFS tracking are preserved and block writes', async () => {
-  const b = await pictureBundle();
-  const nested = `${PREFIX}/assets/.gitattributes`;
-  const server = gitServer({ initial: { [nested]: '*.png -filter\n' } });
-  await assert.rejects(syncArchives({ config: CONFIG, bundles: [b], assetPointers: [pointer(IMAGE)], fetchImpl: server.fetchImpl }), { code: 'LFS_ATTRIBUTES_CONFLICT' });
-  assert.equal(server.files()[nested], '*.png -filter\n');
-  assert.ok(server.calls.every(call => call.method === 'GET'));
-});
 
 test('turning off or changing the sync target during remote reads stops every later write', async () => {
   const b = bundle(), server = gitServer(); let current = true;
@@ -957,4 +902,22 @@ test('missing current authorization and config-read errors fail closed without r
     });
     assert.equal(server.calls.length, 0);
   }
+});
+
+test('a conversation with 600 local attachments commits only four text files and never exceeds the pointer limit', async () => {
+  const b = bundle(), server = gitServer();
+  b.entry.assets = Array.from({ length: 600 }, (_, i) => {
+    const oid = digest(`attachment-${i}`);
+    return { id: oid, oid, size: 1, status: 'downloaded', kind: 'attachment', sourceType: 'platform', localPath: `${PREFIX}/assets/${oid}.txt` };
+  });
+  const built = await buildArchive({ conversation: JSON.parse(b.files[0].content), identity: { accountKey: ACCOUNT, displayName: 'Demo' },
+    capturedAt: '2026-10-21T00:00:00Z', existingManifest: b.manifest, productionPrefix: PREFIX, assets: b.entry.assets });
+  b.files = built.files;
+  const before = structuredClone(b);
+  const result = await syncArchives({ config: { ...CONFIG, lfsEnabled: true }, bundles: [b], fetchImpl: server.fetchImpl });
+  assert.equal(result.status, 'synced'); assert.equal(result.filesChanged, 4);
+  assert.deepEqual(b, before);
+  assert.ok(!Object.keys(server.files()).some(path => path.includes('/assets/') || path.endsWith('/.gitattributes')));
+  assert.ok(JSON.parse(server.files()[MANIFEST]).conversations['conversation-one'].assets.every(a => a.cloudStatus === 'local-only'));
+  assert.equal((await syncArchives({ config: CONFIG, bundles: [b], fetchImpl: server.fetchImpl })).status, 'unchanged');
 });

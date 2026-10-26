@@ -59,7 +59,8 @@ function fixture(options = {}) {
       { path: `${prefix}/account.json`, content: JSON.stringify({ accountKey }) },
     ] };
   }
-  const dependencies = { browser, getSetting, setSetting, adapter, createEngine: createCollectorEngine,
+  const dependencies = { browser, getSetting, setSetting,
+    getSettingsByPrefix: async prefix => [...store].filter(([key]) => key.startsWith(prefix)).map(([key, value]) => ({ key, value })), adapter, createEngine: createCollectorEngine,
     readAccountManifest: async dir => ({ conversations: Object.fromEntries(dir.entries) }),
     readConversationArchive: async (dir, _account, id) => {
       if (!dir.entries.has(id)) throw issue('LOCAL_VERIFY');
@@ -196,37 +197,28 @@ test('scheduled remote checks run without pending uploads or ChatGPT tabs and re
   f.advance(30 * 60000); await f.service.pump(); assert.equal(starts, 2);
 });
 
-test('pending LFS work retains text outbox and only commits after upload preparation', async () => {
+test('legacy LFS settings and pending uploads cannot block text backup', async () => {
   const f = fixture({ github: { repository: 'owner/data', token: 'secret', enabled: true, lfsEnabled: true } });
-  let prepared = false, acknowledged = 0;
-  f.dependencies.assetService = {
-    tick: async () => ({ pending: 0 }),
-    prepareUploads: async () => { if (!prepared) throw issue('LFS_UPLOAD_PENDING'); return [{ path: 'verified-pointer' }]; },
-    acknowledgeUploads: async () => { acknowledged++; },
-  };
+  f.dependencies.assetService = { tick: async () => ({ runnable: false }),
+    prepareUploads: async () => { throw new Error('LFS must never run'); },
+    acknowledgeUploads: async () => { throw new Error('LFS must never run'); } };
   f.service = createCollectorService(f.dependencies);
-  await complete(f);
-  assert.equal(f.calls.uploads.length, 0); assert.equal((await f.service.engine.getOutbox(accountKey)).length, 1);
-  assert.equal(f.store.get(`githubStatus:${accountKey}`).nextRetryAt, 0);
-  prepared = true; await f.service.pump();
-  assert.equal(f.calls.uploads.length, 1); assert.equal(f.calls.uploads[0].assetPointers[0].path, 'verified-pointer');
-  assert.equal(acknowledged, 1); assert.equal((await f.service.engine.getOutbox(accountKey)).length, 0);
+  f.store.set(`assetUploads:${accountKey}`, { signature: 'old-upload' });
+  await f.service.engine.enqueueArchive({ account, archive: f.saved(f.root, 'one') });
+  await f.service.command({ type: 'collector:retry-github' }, 1);
+  assert.equal(f.calls.uploads.length, 1);
+  assert.equal(f.calls.uploads[0].assetPointers, undefined);
+  assert.equal((await f.service.engine.getOutbox(accountKey)).length, 0);
+  assert.equal(f.store.get(`githubStatus:${accountKey}`).status, 'synced');
 });
 
 test('GitHub retry replaces stale LFS progress with its failure and preserves backoff and delivery checkpoints', async () => {
   const options = { config: { autoEnabled: false }, syncError: 'GITHUB_NETWORK',
     github: { repository: 'owner/data', token: 'secret', enabled: true, lfsEnabled: true } };
   const f = fixture(options), key = `githubStatus:${accountKey}`, running = [];
-  let prepared = false, acknowledged = 0;
-  f.dependencies.assetService = {
-    tick: async () => ({ runnable: false }),
-    prepareUploads: async () => {
-      running.push(structuredClone(f.store.get(key)));
-      if (!prepared) throw issue('LFS_UPLOAD_PENDING');
-      return [];
-    },
-    acknowledgeUploads: async () => { acknowledged++; },
-  };
+  let acknowledged = 0;
+  const sync = f.dependencies.syncArchives;
+  f.dependencies.syncArchives = input => { running.push(structuredClone(f.store.get(key))); return sync(input); };
   f.service = createCollectorService(f.dependencies);
   await f.service.engine.enqueueArchive({ account, archive: f.saved(f.root, 'one') });
   f.store.set(key, { status: 'pending', pending: 1, message: 'old upload progress',
@@ -236,14 +228,6 @@ test('GitHub retry replaces stale LFS progress with its failure and preserves ba
   await f.service.pump();
   assert.equal(running.length, 0);
   assert.equal(f.store.get(key).error.code, 'GITHUB_PERMISSION');
-  await f.service.command({ type: 'collector:retry-github' }, 1);
-  const uploading = f.store.get(key);
-  assert.equal(uploading.status, 'pending'); assert.equal(uploading.error, null);
-  assert.match(uploading.message, /分批上传/); assert.equal(uploading.nextRetryAt, 0);
-  assert.equal(uploading.attempt, 4); assert.equal(uploading.commitSha, 'old-commit');
-  assert.equal(acknowledged, 0); assert.equal((await f.service.engine.getOutbox(accountKey)).length, 1);
-
-  prepared = true;
   await assert.rejects(f.service.command({ type: 'collector:retry-github' }, 1), error => error.code === 'GITHUB_NETWORK');
   const failed = structuredClone(f.store.get(key));
   assert.equal(failed.status, 'pending'); assert.equal(failed.message, '');
@@ -252,7 +236,7 @@ test('GitHub retry replaces stale LFS progress with its failure and preserves ba
   assert.equal(failed.lastSyncedAt, 1000); assert.equal(failed.commitSha, 'old-commit');
   assert.equal(acknowledged, 0); assert.equal((await f.service.engine.getOutbox(accountKey)).length, 1);
   await f.service.pump();
-  assert.deepEqual(f.store.get(key), failed); assert.equal(running.length, 2);
+  assert.deepEqual(f.store.get(key), failed); assert.equal(running.length, 1);
 
   options.syncError = null;
   await f.service.command({ type: 'collector:retry-github' }, 1);
@@ -260,7 +244,7 @@ test('GitHub retry replaces stale LFS progress with its failure and preserves ba
     assert.equal(state.status, 'syncing'); assert.equal(state.error, null);
     assert.equal(state.message, ''); assert.equal(state.nextRetryAt, 0);
   }
-  assert.equal(acknowledged, 1); assert.equal((await f.service.engine.getOutbox(accountKey)).length, 0);
+  assert.equal(acknowledged, 0); assert.equal((await f.service.engine.getOutbox(accountKey)).length, 0);
   assert.equal(f.store.get(key).status, 'synced'); assert.equal(f.store.get(key).error, null);
   assert.equal(f.calls.lists, 0); assert.equal(f.calls.details, 0);
 });
@@ -540,7 +524,7 @@ test('text-only GitHub backup never prepares or acknowledges LFS uploads', async
   f.service = createCollectorService(f.dependencies);
   await complete(f);
   assert.equal(f.calls.uploads.length, 1);
-  assert.deepEqual(f.calls.uploads[0].assetPointers, []);
+  assert.equal(f.calls.uploads[0].assetPointers, undefined);
   assert.equal((await f.service.state(1)).githubStatus.status, 'synced');
 });
 
@@ -726,4 +710,41 @@ test('a slow account does not block another account from advancing its collectio
   for (let n = 0; n < 20 && !otherDetails; n++) await turn();
   assert.equal(otherDetails, 1);
   release.resolve(); await running;
+});
+
+test('unfinished asset writes block directory replacement even without an archive journal or bound owner', async () => {
+  const f = fixture(), candidate = directory('replacement');
+  const journal = { schemaVersion: 1, accountKey: 'unbound-restored-account', directory: f.root, phase: 'writing', path: 'pending-image' };
+  f.store.set('assetWrite:synthetic-hash', journal);
+  f.store.set('directoryCandidate', candidate);
+  const config = structuredClone(f.store.get('collectorConfigV2'));
+  await assert.rejects(f.service.command({ type: 'collector:directory-changed' }, 1), { code: 'DIRECTORY_PENDING' });
+  assert.equal(f.store.get('directory'), f.root);
+  assert.equal(f.store.get('directoryCandidate'), candidate);
+  assert.deepEqual(f.store.get('collectorConfigV2'), config);
+  assert.equal(f.store.get('assetWrite:synthetic-hash'), journal);
+  // Completing the original write clears its journal and permits the switch.
+  f.store.set('assetWrite:synthetic-hash', null);
+  await f.service.command({ type: 'collector:directory-changed' }, 1);
+  assert.equal(f.store.get('directory'), candidate);
+});
+
+test('directory replacement checks verified-but-not-cleared journals and fails closed on storage errors', async () => {
+  const f = fixture();
+  f.store.set('directoryCandidate', directory('replacement'));
+  f.store.set('assetWrite:verified', { directory: directory('original'), phase: 'verified' });
+  await assert.rejects(f.service.command({ type: 'collector:directory-changed' }, 1), { code: 'DIRECTORY_PENDING' });
+  f.store.delete('assetWrite:verified');
+  f.dependencies.getSettingsByPrefix = async () => { throw issue('STORAGE'); };
+  f.service = createCollectorService(f.dependencies);
+  await assert.rejects(f.service.command({ type: 'collector:directory-changed' }, 1), { code: 'STORAGE' });
+  assert.equal(f.store.get('directory'), f.root);
+});
+
+test('journals belonging to another directory do not block a clean directory switch', async () => {
+  const f = fixture(), candidate = directory('replacement');
+  f.store.set('assetWrite:other', { directory: directory('unrelated'), phase: 'writing' });
+  f.store.set('directoryCandidate', candidate);
+  await f.service.command({ type: 'collector:directory-changed' }, 1);
+  assert.equal(f.store.get('directory'), candidate);
 });

@@ -30,7 +30,7 @@ test('new installations default to local attachment capture with every cloud dir
   assert.equal(config.localAssetsEnabled, true);
   assert.equal(config.github.enabled, false);
   assert.equal(config.github.autoRestore, false);
-  assert.equal(config.github.lfsEnabled, false);
+  assert.equal(config.github.lfsEnabled, undefined);
   assert.equal(publicConfig(config).localAssetsEnabled, true);
   assert.equal(publicConfig(config).github.autoRestore, false);
 });
@@ -41,22 +41,22 @@ test('v0.2 config retains account bindings and token while adding the LFS defaul
   const store = fixture([['collectorConfigV2', previous]]);
   const config = await store.read();
   assert.deepEqual(config.accounts, previous.accounts);
-  assert.equal(config.github.token, 'saved-secret'); assert.equal(config.github.lfsEnabled, true);
+  assert.equal(config.github.token, 'saved-secret'); assert.equal(config.github.lfsEnabled, undefined);
   assert.equal(config.schemaVersion, 3); assert.equal(config.github.autoRestore, true);
   assert.equal(config.autoEnabled, false); assert.equal(config.setupComplete, true);
-  assert.equal(publicConfig(config).github.lfsEnabled, true);
+  assert.equal(publicConfig(config).github.lfsEnabled, undefined);
   assert.equal(JSON.stringify(publicConfig(config)).includes('saved-secret'), false);
   await store.change(current => { current.github.lfsEnabled = false; return current; });
-  assert.equal((await store.read()).github.lfsEnabled, false);
+  assert.equal((await store.read()).github.lfsEnabled, undefined);
 });
 test('v2 explicit opt-outs survive migration and v3 push and restore remain independent', async () => {
   const store = fixture([['collectorConfigV2', { schemaVersion: 2, accounts: {},
     github: { enabled: false, lfsEnabled: false, repository: 'owner/data', token: 'saved' } }]]);
   const migrated = await store.read();
   assert.equal(migrated.github.enabled, false); assert.equal(migrated.github.autoRestore, false);
-  assert.equal(migrated.github.lfsEnabled, false);
+  assert.equal(migrated.github.lfsEnabled, undefined);
   await store.change(value => { value.localAssetsEnabled = false; value.github.autoRestore = true; return value; });
   const current = await store.read();
   assert.equal(current.localAssetsEnabled, false); assert.equal(current.github.enabled, false);
-  assert.equal(current.github.autoRestore, true); assert.equal(current.github.lfsEnabled, false);
+  assert.equal(current.github.autoRestore, true); assert.equal(current.github.lfsEnabled, undefined);
 });

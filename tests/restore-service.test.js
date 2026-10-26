@@ -58,7 +58,7 @@ function setup(fixtures = [fixture()]) {
       const content = localFiles.get(path);
       return content == null ? null : typeof content === 'string' ? new TextEncoder().encode(content) : content;
     },
-    hydrateAssets: async input => { hydration.push(input); return hydrate(input); },
+    reconcileRestoredAssets: async input => { hydration.push(input); return hydrate(input); },
     now: () => clock,
   };
   const service = createRestoreService(dependencies);
@@ -135,7 +135,8 @@ test('worker restart resumes the fixed snapshot and does not refetch moving bran
   const state = await restored.tick({ config, directory: env.directory });
   assert.equal(state.status, 'completed'); assert.equal(env.fetchCount(), 1);
   assert.equal(JSON.parse(env.calls[0].files[0].content).conversation_id, 'one');
-  assert.equal(env.hydration[0].snapshot.commitSha, '1'.repeat(40));
+  assert.equal(env.hydration[0].snapshot, undefined);
+  assert.equal(env.hydration[0].config, undefined, 'Local attachment reconciliation never needs cloud credentials');
 });
 
 test('restarting completed same-commit restore reconciles missing managed assets again', async () => {

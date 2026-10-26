@@ -213,3 +213,17 @@ test('symbolic links in the source ZIP are refused before extraction', t => {
   assert.notEqual(result.status, 0); assert.match(result.stderr, /压缩包包含符号链接/);
   assert.equal(f.version(), '0.1.3'); assert.equal(f.backups().length, 0);
 });
+
+test('removing the retired LFS module preserves it in the rollback backup', t => {
+  const f = fixture(t, { installed: '0.3.23', remote: '0.3.24' });
+  writeFileSync(join(f.target, 'lib/lfs.js'), '// old LFS implementation');
+  const result = f.run();
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  assert.equal(f.version(), '0.3.24');
+  assert.equal(existsSync(join(f.target, 'lib/lfs.js')), false);
+  assert.equal(readFileSync(join(f.backups()[0], 'lib/lfs.js'), 'utf8'), '// old LFS implementation');
+  const rollback = f.run(['--rollback']);
+  assert.equal(rollback.status, 0, rollback.stderr + rollback.stdout);
+  assert.equal(f.version(), '0.3.23');
+  assert.equal(readFileSync(join(f.target, 'lib/lfs.js'), 'utf8'), '// old LFS implementation');
+});

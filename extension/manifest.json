@@ -1,15 +1,13 @@
 {
   "manifest_version": 3,
   "name": "AI Memory Collector",
-  "version": "0.3.23",
+  "version": "0.3.24",
   "description": "按账号自动备份 ChatGPT 对话、图片和附件到本地，支持增量采集、缺失补齐及可选私有 GitHub 同步。",
   "minimum_chrome_version": "120",
   "permissions": ["scripting", "sidePanel", "alarms", "activeTab"],
   "optional_host_permissions": [
-    "https://chatgpt.com/*", "https://api.github.com/*", "https://github.com/*",
-    "https://lfs.github.com/*", "https://github-cloud.githubusercontent.com/*",
-    "https://objects.githubusercontent.com/*", "https://media.githubusercontent.com/*",
-    "https://github-cloud.s3.amazonaws.com/*", "https://*.oaiusercontent.com/*", "https://*/*"
+    "https://chatgpt.com/*", "https://api.github.com/*",
+    "https://*.oaiusercontent.com/*", "https://*/*"
   ],
   "background": { "service_worker": "background.js", "type": "module" },
   "action": { "default_title": "打开 AI Memory Collector" },

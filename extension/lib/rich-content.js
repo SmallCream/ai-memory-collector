@@ -10,7 +10,7 @@ const attrEscape = value => String(value).replace(/&/g, '&amp;').replace(/"/g, '
 const textEscape = value => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const markdownLabel = value => String(value || '').replace(/[\r\n]/g, ' ').replace(/([\\\[\]])/g, '\\$1');
 const normalizedLabel = value => value.trim().replace(/\s+/g, ' ').toLowerCase();
-const DOWNLOAD_EXTENSION = /\.(?:zip|pdf|docx?|xlsx?|pptx?|odt|ods|odp|rtf|txt|csv|tsv|md|jsonl?|ya?ml|xml|py|[cm]?js|tsx?|jsx|css|html?|sql|sh|r)$/i;
+const DOWNLOAD_EXTENSION = /\.(?:zip|gz|tgz|pdf|docx?|xlsx?|pptx?|odt|ods|odp|rtf|txt|csv|tsv|md|jsonl?|ya?ml|xml|py|[cm]?js|tsx?|jsx|css|html?|sql|sh|r)$/i;
 
 // GitHub's blob route is a file-viewing web page. Only this observed page shape
 // is excluded; raw/download query variants and other hosts retain their existing

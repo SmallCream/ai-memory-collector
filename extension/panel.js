@@ -20,9 +20,6 @@ let activeAliasKey = null;
 let externalImagePermission = false;
 let refreshPending = null;
 const renderedLists = new Map();
-const githubOrigins = ['https://api.github.com/*', 'https://github.com/*', 'https://lfs.github.com/*',
-  'https://github-cloud.githubusercontent.com/*', 'https://objects.githubusercontent.com/*',
-  'https://media.githubusercontent.com/*', 'https://github-cloud.s3.amazonaws.com/*'];
 const runningStatuses = new Set(['running', 'scanning', 'collecting', 'saving', 'syncing']);
 const pausedStatuses = new Set(['paused', 'blocked', 'waiting', 'retrying', 'interrupted', 'waiting-source', 'waiting-permission', 'partial']);
 const controls = () => document.querySelectorAll('button,input,select');
@@ -63,7 +60,7 @@ function restoreMissingMessage(restore) {
   if (!missing) return '';
   const conversations = restore?.missingCloudConversations ?? restore?.progress?.missingCloudConversations;
   const scope = Number.isSafeInteger(conversations) && conversations > 0 ? `（涉及 ${count(conversations)} 条对话）` : '';
-  return `云端未备份 ${count(missing)} 个附件${scope}。已恢复的文件会保留；请在原电脑上传这些附件后再次恢复，或从仍可访问的原始对话补采。仅重试无法恢复尚未上传的附件。`;
+  return `本地缺少 ${count(missing)} 个附件${scope}。已恢复的文件会保留；请从原电脑复制本地附件目录，或从仍可访问的原始对话补采。GitHub 仅恢复对话文件。`;
 }
 function assetFailureCode(value) { return typeof value === 'string' && /^[A-Z][A-Z0-9_]{0,60}$/.test(value) ? value : 'ASSET_UNKNOWN'; }
 function assetFailureMessage(code) {
@@ -159,14 +156,13 @@ function renderInternalAttachments(diagnostics, missing) {
 }
 const activityStages = { identify: '核验账号与保存位置', list: '读取对话列表', detail: '读取对话详情',
   save: '保存对话文件', download: '下载对话附件', 'save-image': '保存附件到本地',
-  'upload-image': '上传附件到 GitHub LFS', 'restore-image': '从 GitHub 下载附件',
   github: '同步 GitHub', sync: '提交对话到 GitHub', 'sync-archives': '提交对话到 GitHub',
   commit: '提交对话到 GitHub', 'apply-remote': '写入远端合并结果', 'refresh-source': '刷新附件下载来源',
-  'prepare-upload': '准备附件上传', 'restore-snapshot': '读取仓库目录', 'restore-metadata': '读取归档清单',
+  'restore-snapshot': '读取仓库目录', 'restore-metadata': '读取归档清单',
   'restore-conversation': '恢复对话文件', restore: '恢复仓库文件',
   'restore-scan': '读取仓库目录', 'restore-file': '下载对话归档', 'restore-save': '保存恢复的对话', 'restore-assets': '补齐归档附件' };
 const taskStatuses = { pending: '排队中', retry: '等待重试', failed: '失败待处理', saved: '已保存',
-  skipped: '无变化，已跳过', downloaded: '已下载', uploaded: '已上传', 'internal-missing': '内部附件未下载',
+  skipped: '无变化，已跳过', downloaded: '已下载', 'internal-missing': '内部附件未下载',
   suspended: '内部附件未下载', delivering: '正在交付归档', queued: '排队中', waiting: '等待处理',
   running: '正在处理', external: '保留外链', unavailable: '尚未取得',
   'paused-by-setting': '按设置暂停下载', 'paused-setting': '按设置暂停下载', paused: '已暂停',
@@ -202,10 +198,10 @@ function appendText(parent, tag, value, className) {
 function cloudVisibility() {
   const github = current?.config?.github || {}, status = current?.githubStatus || {};
   const upload = github.enabled === true || status.manual === true ||
-    current?.activity?.github?.current?.status === 'running' || current?.activity?.upload?.current?.status === 'running';
+    current?.activity?.github?.current?.status === 'running';
   const restore = github.autoRestore === true || Boolean(current?.restoreStatus && current.restoreStatus.status !== 'idle') ||
     current?.activity?.restore?.current?.status === 'running';
-  return { upload, restore, assets: upload && github.lfsEnabled !== false };
+  return { upload, restore };
 }
 function renderCompleteness(diagnostics) {
   const rows = Array.isArray(diagnostics?.conversations) ? diagnostics.conversations.slice(0, 50) : [];
@@ -355,11 +351,9 @@ function renderDetailedProgress() {
   renderTaskList('collection-recent', 'collection-recent-note', collection?.recent, 0, '暂无步骤完成记录。', 'recent');
   const cloud = cloudVisibility();
   const transferChannels = [['对话附件下载', activity.download],
-    ...(cloud.assets ? [['附件上传', activity.upload]] : []),
     ...(cloud.upload ? [['GitHub 对话提交', activity.github]] : []),
-    ...(cloud.restore ? [['仓库恢复（全部账号）', activity.restore], ['当前账号附件恢复', activity.restoreImages]] : [])];
+    ...(cloud.restore ? [['仓库恢复（全部账号）', activity.restore]] : [])];
   text('transfer-heading', cloud.upload || cloud.restore ? '下载与上传详情' : '附件下载详情');
-  show('upload-queue-section', cloud.assets);
   show('outbox-queue-section', cloud.upload);
   show('restore-queue-section', cloud.restore);
   const running = transferChannels.filter(([, log]) => log?.current?.status === 'running');
@@ -373,13 +367,12 @@ function renderDetailedProgress() {
   else if (current.config?.localAssetsEnabled === false && !cloud.upload && !cloud.restore) { badge = '下载已暂停'; wait = '附件自动下载已关闭；已有本地文件保留，可手动补齐缺失。'; }
   else if (!cloud.upload && !cloud.restore) { badge = '本地备份'; wait = '对话和附件保存在本地，下载失败项会保留进度。'; }
   else if (cloud.upload && job?.status === 'running' && Number(outbox.total ?? github.pending) > 0) { badge = '等待提交'; wait = '对话采集中，完成本轮后提交 GitHub；附件下载仍可继续处理。'; }
-  else if (Number(asset.pending) > 0 || cloud.upload && Number(outbox.total ?? github.pending) > 0) { badge = '等待处理'; wait = cloud.assets ? '等待后台处理队列。附件已上传后，还需要提交 JSON、Markdown 与清单。' : '等待后台处理队列，对话和附件各自保留进度。'; }
+  else if (Number(asset.pending) > 0 || cloud.upload && Number(outbox.total ?? github.pending) > 0) { badge = '等待处理'; wait = '等待后台处理队列，对话和附件各自保留进度。'; }
   else if (cloud.upload && github.status === 'synced') { badge = '已同步'; wait = '当前已知的对话提交已完成；未下载附件仍保留各自状态。'; }
   text('transfer-details-status', badge); text('transfer-wait', wait);
   text('transfer-detail-counts', `附件待处理 ${count(asset.pending)} · 失败 ${count(asset.failed)} · 内部附件未下载 ${count(asset.internalMissing)}${cloud.upload ? ` · 待提交对话 ${count(outbox.total ?? github.pending)}` : ''}`);
   renderActivityCards('transfer-current', transferChannels);
   renderTaskList('download-queue', 'download-queue-note', asset.captureItems, asset.captureTotal, '暂无附件下载任务。');
-  renderTaskList('upload-queue', 'upload-queue-note', cloud.assets ? asset.uploadItems : [], cloud.assets ? asset.uploadTotal : 0, '本次备份不上传附件。');
   renderTaskList('outbox-queue', 'outbox-queue-note', cloud.upload ? outbox.items : [], cloud.upload ? outbox.total : 0, '暂无待提交的对话。', 'outbox');
   const restore = current.restoreStatus;
   text('transfer-restore-detail', restore ? `已处理 ${count(restore.processed)} / ${count(restore.total)} 条 · 待处理 ${count(restore.pending)} · 失败 ${count(restore.failed)}${Number(restore.nextRetryAt) > Date.now() ? ` · 重试时间 ${clock(restore.nextRetryAt)}` : ''}${restore.error?.code ? ` · ${assetFailureCode(restore.error.code)}` : ''}${restoreMissingAssets(restore) ? ` · ${restoreMissingMessage(restore)}` : ''}` : '尚未执行仓库恢复。');
@@ -416,7 +409,6 @@ function fillSettings() {
   $('local-assets-enabled').checked = config.localAssetsEnabled !== false;
   $('interval-minutes').value = String([15, 30, 60].includes(config.intervalMinutes) ? config.intervalMinutes : 30);
   $('github-enabled').checked = config.github?.enabled === true;
-  $('lfs-enabled').checked = config.github?.lfsEnabled === true;
   $('github-auto-restore').checked = config.github?.autoRestore === true;
   $('repository').value = config.github?.repository || '';
   $('branch').value = config.github?.branch || '';
@@ -429,7 +421,7 @@ function unsavedGithubSettings() {
   const github = current?.config?.github || {};
   return $('repository').value.trim() !== (github.repository || '') || $('branch').value.trim() !== (github.branch || '') ||
     Boolean($('github-token').value.trim()) || $('github-enabled').checked !== (github.enabled === true) ||
-    $('lfs-enabled').checked !== (github.lfsEnabled === true) || $('github-auto-restore').checked !== (github.autoRestore === true);
+    $('github-auto-restore').checked !== (github.autoRestore === true);
 }
 function render() {
   if (!current) return;
@@ -515,11 +507,11 @@ function render() {
   const githubError = current.githubStatus?.error;
   const githubErrorCode = typeof githubError?.code === 'string' && /^[A-Z][A-Z0-9_]{0,60}$/.test(githubError.code) ? githubError.code : 'GITHUB_ERROR';
   // Older persisted states can contain both a failed request and the preceding
-  // LFS progress message. Always expose the failure without expanding a card.
+  // upload progress message. Always expose the failure without expanding a card.
   const githubDetail = cloud.upload ? githubError ?
     `同步未完成（${githubErrorCode}）：${safeMessage(githubError.message || '请检查权限或网络后重试。')
       .replace(/(?:https?:\/\/|blob:|data:)[^\s<>"']+/gi, '[链接已隐藏]')}` : current.githubStatus?.message ||
-      (config.github?.lfsEnabled === false ? '本次只备份对话文件；未上传的图片和附件仅在原电脑。' : '') : '';
+      'GitHub 只备份对话文件；图片和附件保存在本地。' : '';
   text('github-detail', safeMessage(githubDetail));
   show('github-detail', Boolean(githubDetail));
   $('github-detail').classList.toggle('warning-text', Boolean(githubError) || current.githubStatus?.status === 'conflicts');
@@ -530,12 +522,9 @@ function render() {
   const internalMissing = Number(diagnostics?.internalMissing ?? assets.internalMissing) || 0;
   const assetParts = [];
   if (Number(assets.local) > 0) assetParts.push(`本地附件 ${count(assets.local)}`);
-  if (cloud.assets && Number(assets.uploaded) > 0) assetParts.push(`已上传 ${count(assets.uploaded)}`);
-  if (Number(assets.downloaded) > 0) assetParts.push(`已恢复 ${count(assets.downloaded)}`);
   if (Number(assets.external) > 0) assetParts.push(`外链 ${count(assets.external)}`);
   if (pendingImages > 0) assetParts.push(`${diagnostics ? '待处理' : '待采集'} ${count(pendingImages)}${failedImages > 0 ? `（其中失败 ${count(failedImages)}）` : ''}`);
   else if (failedImages > 0) assetParts.push(`待处理失败 ${count(failedImages)}`);
-  if (cloud.assets && Number(assets.pendingUpload) > 0) assetParts.push(`待上传 ${count(assets.pendingUpload)}`);
   if (internalMissing > 0) assetParts.push(`内部附件未下载 ${count(internalMissing)}`);
   if (Number(diagnostics?.unsupported ?? assets.unsupported) > 0) assetParts.push(`暂不支持 ${count(diagnostics?.unsupported ?? assets.unsupported)}`);
   text('asset-summary-text', assetParts.join(' · ')); show('asset-summary', assetParts.length > 0);
@@ -547,9 +536,6 @@ function render() {
   renderDetailedProgress();
   show('retry-images', failedImages > 0);
   show('image-retry-note', failedImages > 0);
-  const imagePermissionNeeded = assets.needsPermission || current.githubStatus?.needsPermission ||
-    /PERMISSION/.test(assets.error?.code || current.githubStatus?.error?.code || '');
-  show('grant-github-images', Boolean(cloud.assets && imagePermissionNeeded));
   const restore = current.restoreStatus;
   const restoreRunning = ['running', 'restoring', 'scanning', 'downloading', 'saving'].includes(restore?.status);
   const restoreProgress = restore?.progress || restore || {};
@@ -569,7 +555,7 @@ function render() {
     partial: '部分恢复完成', failed: '恢复未完成', error: '恢复未完成', paused: '恢复已暂停',
     blocked: '恢复需要处理', interrupted: '恢复已中断', 'waiting-permission': '等待权限', needsPermission: '等待权限', empty: '仓库暂无可恢复内容' };
   const restoreComplete = ['completed', 'complete', 'success'].includes(restore?.status);
-  text('restore-phase', restoreRunning ? '正在恢复对话与附件' : restoreComplete && restoreCloudMissing ? '部分恢复完成' : restoreLabels[restore?.status] || '恢复进度已保留');
+  text('restore-phase', restoreRunning ? '正在恢复对话' : restoreComplete && restoreCloudMissing ? '部分恢复完成' : restoreLabels[restore?.status] || '恢复进度已保留');
   text('restore-count', restoreTotal ? `${restoreCompleted} / ${restoreTotal}` : '');
   if (restoreTotal > 0) { $('restore-meter').max = Math.max(restoreTotal, restoreCompleted, 1); $('restore-meter').value = restoreCompleted; }
   else $('restore-meter').removeAttribute('value');
@@ -625,7 +611,7 @@ function render() {
   $('grant-external-images').disabled = busy || externalImagePermission;
   if (current.identityChecking === true) {
     for (const id of ['wizard-bind', 'bind-account', 'wizard-finish', 'start-capture', 'full-capture', 'pause-capture',
-      'resume-capture', 'repair-local', 'retry-images', 'retry-internal-images', 'retry-github', 'backup-github-now', 'grant-github-images']) $(id).disabled = true;
+      'resume-capture', 'repair-local', 'retry-images', 'retry-internal-images', 'retry-github', 'backup-github-now']) $(id).disabled = true;
   }
   if (!started) { started = true; window.dispatchEvent(new Event('collector:ready')); }
 }
@@ -695,13 +681,13 @@ async function restoreDirectory() {
   if (await directory.requestPermission({ mode: 'readwrite' }) !== 'granted') throw new Error('目录权限未恢复；已有采集进度会保留。');
   await send('collector:directory-changed');
 }
-async function grantGithub(lfs = false) {
-  const granted = await chrome.permissions.request({ origins: lfs ? githubOrigins : ['https://api.github.com/*'] });
-  if (!granted) throw new Error('未获得 GitHub 访问权限。已有数据会保留，可再次点击授权或关闭附件同步后保存配置。');
+async function grantGithub() {
+  const granted = await chrome.permissions.request({ origins: ['https://api.github.com/*'] });
+  if (!granted) throw new Error('未获得 GitHub 访问权限。已有数据会保留，可再次点击授权后保存配置。');
 }
 async function restoreGithub(retry = false) {
   // Start the permission request directly from this click, before any network await.
-  await grantGithub(true);
+  await grantGithub();
   await send(retry ? 'collector:restore-retry' : 'collector:restore');
 }
 async function saveGithub(wizard = false) {
@@ -710,7 +696,6 @@ async function saveGithub(wizard = false) {
   const tokenInput = $(wizard ? 'wizard-token' : 'github-token');
   const token = tokenInput.value.trim();
   const enabled = $(wizard ? 'wizard-github-enabled' : 'github-enabled').checked;
-  const lfsEnabled = $(wizard ? 'wizard-lfs-enabled' : 'lfs-enabled').checked;
   const autoRestore = $(wizard ? 'wizard-github-auto-restore' : 'github-auto-restore').checked;
   const previous = current?.config?.github || {};
   if ((wizard || enabled || autoRestore) && (!repository || !(token || previous.hasToken))) {
@@ -719,8 +704,8 @@ async function saveGithub(wizard = false) {
   const changedCredentials = repository !== (previous.repository || '') || branch !== (previous.branch || '') || Boolean(token);
   // Turning automatic tasks off must work even when site access has been revoked.
   const verify = Boolean(repository && (token || previous.hasToken)) && (wizard || enabled || autoRestore || changedCredentials);
-  if (verify) await grantGithub(lfsEnabled || autoRestore);
-  await send('collector:github-config', { repository, branch, enabled, lfsEnabled, autoRestore, ...(token ? { token } : {}) });
+  if (verify) await grantGithub();
+  await send('collector:github-config', { repository, branch, enabled, autoRestore, ...(token ? { token } : {}) });
   if (verify) await send('collector:github-test');
   tokenInput.value = '';
   if (wizard) { wizardGithubVerified = true; text('wizard-github-status', '私有仓库连接验证成功。'); }
@@ -732,7 +717,6 @@ function populateWizardGithub() {
   $('wizard-branch').value = github.branch || '';
   $('wizard-token').value = '';
   $('wizard-github-enabled').checked = github.enabled === true;
-  $('wizard-lfs-enabled').checked = github.lfsEnabled === true;
   $('wizard-github-auto-restore').checked = github.autoRestore === true;
   $('wizard-token').placeholder = github.hasToken ? '已保存 Token，留空沿用' : '粘贴仅授权此仓库的 Token';
   wizardGithubVerified = false;
@@ -767,12 +751,11 @@ action('pause-capture', () => send('collector:pause'));
 action('resume-capture', () => send('collector:resume'));
 action('retry-images', () => send('collector:retry-images'));
 action('retry-internal-images', () => send('collector:retry-images', { includeInternal: true }));
-action('retry-github', async () => { await grantGithub(current?.config?.github?.lfsEnabled !== false); await send('collector:retry-github'); });
+action('retry-github', async () => { await grantGithub(); await send('collector:retry-github'); });
 action('backup-github-now', async () => {
-  if (unsavedGithubSettings()) throw new Error('请先保存 GitHub 设置，再按保存后的附件范围备份。');
-  await grantGithub(current?.config?.github?.lfsEnabled === true); await send('collector:retry-github');
+  if (unsavedGithubSettings()) throw new Error('请先保存 GitHub 设置，再备份对话。');
+  await grantGithub(); await send('collector:retry-github');
 });
-action('grant-github-images', async () => { await grantGithub(true); await send('collector:retry-github'); });
 for (const id of ['open-restore', 'wizard-open-restore']) action(id, () => { screen = 'settings'; settingsLoaded = false; });
 action('restore-github', () => restoreGithub(false));
 action('restore-retry', () => restoreGithub(true));
@@ -791,10 +774,10 @@ action('forget-token', async () => { await send('collector:github-config', { tok
 action('collapse-panel', () => closePanel(false));
 action('hide-panel', () => closePanel(true));
 action('settings-hide', () => closePanel(true));
-for (const id of ['wizard-repository', 'wizard-branch', 'wizard-token', 'wizard-github-enabled', 'wizard-lfs-enabled', 'wizard-github-auto-restore']) $(id).addEventListener('input', () => {
+for (const id of ['wizard-repository', 'wizard-branch', 'wizard-token', 'wizard-github-enabled', 'wizard-github-auto-restore']) $(id).addEventListener('input', () => {
   wizardGithubVerified = false; $('wizard-next-2').disabled = true; text('wizard-github-status', '配置已改变，请重新验证。');
 });
-for (const id of ['repository', 'branch', 'github-token', 'github-enabled', 'lfs-enabled', 'github-auto-restore']) {
+for (const id of ['repository', 'branch', 'github-token', 'github-enabled', 'github-auto-restore']) {
   $(id).addEventListener('input', () => { render(); });
 }
 window.addEventListener('focus', () => { refreshProgress(); });

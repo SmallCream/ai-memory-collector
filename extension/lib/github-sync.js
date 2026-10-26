@@ -1,7 +1,6 @@
 /** Atomic, private-repository archive sync. No page/session credentials enter this module. */
 import { buildArchive } from './archive.js';
 import { createGitHubClient, inspectGitHubRepository, commitProbe, GitHubProbeError } from './github.js';
-import { formatLfsPointer } from './lfs.js';
 import { ASSET_EXTENSIONS } from './asset-store.js';
 import { analyzeAssets, reconcileAssetCapturePolicy } from './assets.js';
 import { reconcileFileCitation } from './asset-reconciliation.js';
@@ -15,7 +14,6 @@ const sha = value => typeof value === 'string' && /^[a-f0-9]{40,64}$/i.test(valu
 const accountKeyPattern = /^acct-[a-f0-9]{24}$/;
 const idPattern = /^[A-Za-z0-9][A-Za-z0-9_-]{0,159}$/;
 const READY_ASSETS = new Set(['downloaded', 'ready', 'local', 'synced']);
-const LFS_RULE = 'assets/** filter=lfs diff=lfs merge=lfs -text';
 function fail(code, message) { throw new GitHubProbeError(code, message); }
 function json(value) { return JSON.stringify(value, null, 2) + '\n'; }
 function parse(text, code = 'ARCHIVE_FORMAT') {
@@ -59,28 +57,6 @@ function assetsOf(entry, prefix) {
     }
   }
   return entry.assets;
-}
-function validatePointers(bundles, supplied) {
-  if (!Array.isArray(supplied) || supplied.length > MAX_FILES) fail('ARCHIVE_ASSET', 'LFS 指针列表无效或过多。');
-  const references = new Map(), pointers = new Map();
-  for (const bundle of bundles) for (const entry of bundle.entries) for (const asset of assetsOf(entry, bundle.prefix)) {
-    if (!READY_ASSETS.has(asset.status)) continue;
-    const expected = { accountKey: bundle.accountKey, path: asset.localPath, oid: asset.oid, size: asset.size,
-      content: formatLfsPointer(asset) };
-    const previous = references.get(asset.localPath);
-    if (previous && !sameJSON(previous, expected)) fail('ARCHIVE_ASSET', '同一资源路径对应了不同内容。');
-    references.set(asset.localPath, expected);
-  }
-  for (const pointer of supplied) {
-    const reference = references.get(pointer?.path);
-    if (!reference || pointer.accountKey !== reference.accountKey || pointer.oid !== reference.oid ||
-        pointer.size !== reference.size || pointer.content !== reference.content) {
-      fail('ACCOUNT_OWNERSHIP', 'LFS 指针不属于本批账号和对话资源，未提交。');
-    }
-    if (pointers.has(pointer.path) && pointers.get(pointer.path).content !== pointer.content) fail('ARCHIVE_ASSET', 'LFS 指针路径重复且内容不同。');
-    pointers.set(pointer.path, { ...reference });
-  }
-  return { references, pointers };
 }
 async function mergeSameNativeAssets(localEntry, remoteEntry, prefix, native) {
   if (localEntry.assets === undefined && remoteEntry?.assets === undefined) return undefined;
@@ -248,42 +224,16 @@ async function snapshot(api, head) {
   }
   return { head, treeSha: commit.tree.sha, entries, read, assertAncestors };
 }
-async function plan(api, remote, bundles, assetPlan) {
+async function plan(api, remote, bundles) {
   const changes = new Map(), conflicts = [], remoteWinners = [];
   async function read(path) { return changes.has(path) ? changes.get(path) : remote.read(path); }
   async function put(path, content) {
     safePath(path); remote.assertAncestors(path);
     if (await remote.read(path) === content) changes.delete(path); else changes.set(path, content);
   }
-  const assetPrefixes = new Set();
-  async function ensureAsset(asset, prefix) {
-    if (!READY_ASSETS.has(asset.status)) return;
-    const expected = formatLfsPointer(asset);
-    const current = await read(asset.localPath);
-    if (current !== null && current !== expected) fail('ASSET_IMMUTABLE_CONFLICT', '远端附件路径已有不同内容，已保留原文件。');
-    if (current === null) {
-      const pointer = assetPlan.pointers.get(asset.localPath);
-      if (!pointer) {
-        if (!assetPlan.includeAssets || asset.cloudStatus === 'local-only') {
-          // This metadata is written only to the remote manifest. The native
-          // JSON and local file receipts remain unchanged; no missing binary
-          // is represented by a fabricated Git LFS pointer.
-          asset.cloudStatus = 'local-only';
-          return;
-        }
-        fail('LFS_ASSET_MISSING', '附件尚未上传 LFS，暂不提交引用该附件的归档。');
-      }
-      if (pointer.content !== expected) fail('LFS_ASSET_MISSING', '附件尚未上传 LFS，暂不提交引用该附件的归档。');
-      await put(asset.localPath, pointer.content);
-    }
-    // An immutable matching pointer is stronger evidence than an older
-    // text-only upload marker, including when uploads have since been disabled.
-    delete asset.cloudStatus;
-    assetPrefixes.add(prefix);
-  }
   // Validate every local ready reference, even if a newer remote conversation wins.
   for (const bundle of bundles) for (const entry of bundle.entries) for (const asset of assetsOf(entry, bundle.prefix)) {
-    await ensureAsset(asset, bundle.prefix);
+    if (READY_ASSETS.has(asset.status)) asset.cloudStatus = 'local-only';
   }
   for (const bundle of bundles) {
     const { prefix, platform, accountKey, files, manifestPath, accountPath } = bundle;
@@ -350,7 +300,7 @@ async function plan(api, remote, bundles, assetPlan) {
       }
       if (sameNative && (localEntry.assets !== undefined || previous?.assets !== undefined)) {
         const mergedAssets = await mergeSameNativeAssets(localEntry, previous, prefix, native);
-        for (const asset of mergedAssets) await ensureAsset(asset, prefix);
+        for (const asset of mergedAssets) if (READY_ASSETS.has(asset.status)) asset.cloudStatus = 'local-only';
         const rebuilt = await buildArchive({ conversation: parse(remoteJSON),
           identity: { accountKey, displayName: bundle.account.displayName },
           capturedAt: previous?.lastChangedAt || previous?.firstCapturedAt || localEntry.firstCapturedAt || new Date().toISOString(),
@@ -382,7 +332,7 @@ async function plan(api, remote, bundles, assetPlan) {
         continue;
       }
       if (remoteWins) {
-        for (const asset of assetsOf(previous, prefix)) await ensureAsset(asset, prefix);
+        for (const asset of assetsOf(previous, prefix)) if (READY_ASSETS.has(asset.status)) asset.cloudStatus = 'local-only';
         if (remoteMD === null) {
           // Rebuild from the selected remote native version, never from the stale local copy.
           const regenerated = await buildArchive({ conversation: parse(remoteJSON),
@@ -409,30 +359,13 @@ async function plan(api, remote, bundles, assetPlan) {
     if (manifestText === null || !sameJSON(parse(manifestText), manifest)) await put(manifestPath, json(manifest));
     if (accountText === null) await put(accountPath, files.get(accountPath));
   }
-  for (const prefix of assetPrefixes) {
-    const attributesPath = `${prefix}/.gitattributes`;
-    // A more specific attributes file can override the account rule. Do not guess
-    // Git's full pattern/macro semantics or silently rewrite user-owned rules.
-    for (const path of remote.entries.keys()) if (path.startsWith(`${prefix}/assets/`) && path.endsWith('/.gitattributes')) {
-      const text = await read(path);
-      if (text?.split(/\r?\n/).some(line => line.trim() && !line.trimStart().startsWith('#'))) {
-        fail('LFS_ATTRIBUTES_CONFLICT', '附件目录包含自定义 Git 属性规则，请先处理后再启用 LFS。');
-      }
-    }
-    const previous = await read(attributesPath);
-    const lines = (previous || '').split(/\r?\n/).filter(line => line.trim() && !line.trimStart().startsWith('#'));
-    // At this directory level the final rule takes precedence, preserving every existing line.
-    if (lines.at(-1)?.trim() !== LFS_RULE) {
-      await put(attributesPath, (previous ? previous + (previous.endsWith('\n') ? '' : '\n') : '') + LFS_RULE + '\n');
-    }
-  }
   for (const winner of remoteWinners) {
     const prefix = safePath(winner.files[0].path);
     winner.files.push({ path: `${prefix}/archive/manifest.json`, content: await read(`${prefix}/archive/manifest.json`) },
       { path: `${prefix}/account.json`, content: await read(`${prefix}/account.json`) });
   }
   if (changes.size > MAX_FILES || [...changes.values()].reduce((total, text) => total + encoder.encode(text).byteLength, 0) > MAX_BYTES) {
-    fail('ARCHIVE_SIZE', '包含附件指针的本批同步内容过多，请分批重试。');
+    fail('ARCHIVE_SIZE', '本批对话同步内容过多，请分批重试。');
   }
   return { changes, conflicts, remoteWinners };
 }
@@ -462,7 +395,7 @@ async function verifyCommit(api, branch, commitSha, treeSha, changes) {
  * Conflicting snapshots are preserved under conflicts/, never forcibly merged.
  * Remote winners are returned for optional guarded local reconciliation.
  */
-export async function syncArchives({ config, bundles, assetPointers = [], fetchImpl = globalThis.fetch,
+export async function syncArchives({ config, bundles, fetchImpl = globalThis.fetch,
   isCurrent = async () => true } = {}) {
   async function requireCurrent() {
     let current = false;
@@ -470,9 +403,6 @@ export async function syncArchives({ config, bundles, assetPointers = [], fetchI
     if (current !== true) fail('GITHUB_TARGET_CHANGED', '同步设置或目标已变化，尚未发送的上传已停止；本地数据和待处理记录已保留。');
   }
   const checked = validateBundles(bundles);
-  if (config?.lfsEnabled === false && assetPointers.length) fail('ASSET_UPLOAD_DISABLED', '附件上传已关闭，本次未提交附件指针。');
-  const assetPlan = validatePointers(checked, assetPointers);
-  assetPlan.includeAssets = config?.lfsEnabled !== false;
   const parts = typeof config?.repository === 'string' ? config.repository.split('/') : [];
   if (parts.length !== 2) fail('INVALID_REPOSITORY', '仓库格式应为 owner/repository。');
   // Guard the transport too: commitProbe has its own read-before-PUT sequence,
@@ -498,7 +428,7 @@ export async function syncArchives({ config, bundles, assetPointers = [], fetchI
     await requireCurrent();
     const head = attempt === 0 ? info.headSha : await headOf(api, info.branch);
     const remote = await snapshot(api, head);
-    const { changes, conflicts, remoteWinners } = await plan(api, remote, checked, assetPlan);
+    const { changes, conflicts, remoteWinners } = await plan(api, remote, checked);
     if (!changes.size) return { status: 'unchanged', commitSha: head, branch: info.branch, filesChanged: 0, conflicts, remoteWinners };
     await requireCurrent();
     const tree = (await api.request('/git/trees', { method: 'POST', body: { base_tree: remote.treeSha,
