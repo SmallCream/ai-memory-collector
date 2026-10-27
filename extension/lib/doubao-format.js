@@ -17,13 +17,35 @@ export function validateDoubaoConversation(native) {
       native.conversation?.conversation_id !== native.conversation_id || native.has_more !== false || !Array.isArray(native.messages) ||
       !Number.isFinite(native.update_time) || native.update_time < 0) fail();
   const ids = new Set(); let index = -1n;
-  for (const m of native.messages) {
+  for (const [position, m] of native.messages.entries()) {
     const blocks = record(m) ? messageBlocks(m) : null;
     if (!record(m) || !decimal(m.message_id) || ids.has(m.message_id) || m.conversation_id !== native.conversation_id ||
-        !decimal(m.index_in_conv) || BigInt(m.index_in_conv) <= index || m.status !== 0 ||
-        !(m.content_status === 0 || m.content_status === 120 && m.ext?.is_interrupted === 'true') ||
-        ![1, 2].includes(m.user_type) || m.ext?.is_finish !== '1' || !blocks ||
-        blocks.some(b => !record(b) || b.is_finish !== true)) fail();
+        !decimal(m.index_in_conv) || BigInt(m.index_in_conv) <= index ||
+        ![1, 2].includes(m.user_type) || m.ext?.is_finish !== '1' || !blocks) fail();
+    // The chain retains empty, explicitly ended interruption records with
+    // status=1. Preserve them instead of rejecting the entire conversation.
+    if (m.status !== 0 && !(m.status === 1 && m.user_type === 2 && m.content_status === 120 &&
+        m.ext.is_interrupted === 'true' && m.content_type === 9999 &&
+        typeof m.content === 'string' && m.content.trim() === '[]' && blocks.length === 0)) fail();
+    // Older completed assistant replies can lack is_interrupted. Accept that
+    // observed historical shape only when a later message also validates.
+    if (!(m.content_status === 0 || m.user_type === 2 && m.content_status === 120 &&
+        (m.ext.is_interrupted === 'true' || m.status === 0 && !Object.hasOwn(m.ext, 'is_interrupted') &&
+          position < native.messages.length - 1))) fail();
+    for (const block of blocks) {
+      if (!record(block)) fail();
+      if (block.is_finish === true) continue;
+      // Uploaded user images are not streamed reply blocks: the website keeps
+      // is_finish=false even after upload/parse/review have all completed.
+      const attachments = block.content?.attachment_block?.attachments;
+      if (!(m.user_type === 1 && m.content_status === 0 && m.content_type === 9999 &&
+          block.block_type === 10052 && block.is_finish === false && record(block.content) &&
+          Object.entries(block.content).every(([key, value]) => key === 'attachment_block' || key === 'pc_event_block' && value === '') &&
+          Array.isArray(attachments) && attachments.length > 0 && attachments.every(a =>
+            a?.type === 1 && a.upload_status === 1 && a.progress === 100 && a.parse_state === 1 && a.review_state === 1 &&
+            typeof a.image?.image_ori?.url === 'string' && doubaoAssetReference(a.image.image_ori.url) &&
+            a.image.image_ori.width > 0 && a.image.image_ori.height > 0))) fail();
+    }
     ids.add(m.message_id); index = BigInt(m.index_in_conv);
   }
 }
@@ -141,7 +163,9 @@ export function renderDoubaoMessages(native, resolveAsset) {
       const text = typeof body?.text === 'string' ? body.text : body === undefined ? message.content : '〔非正文消息内容保留在原始 JSON 中〕';
       parts.push(renderRichText(text, { resolveAsset: resolve }));
     }
-    if (message.content_status === 120 && message.ext?.is_interrupted === 'true') parts.unshift('〔来源已标记此条回复中断，以下保留已返回内容〕');
+    if (message.content_status === 120) parts.unshift(message.status === 1
+      ? '〔来源保留的已结束空中断记录（status=1），未返回正文〕'
+      : '〔来源已标记此条回复中断，以下保留已返回内容〕');
     for (const resource of resources.filter(r => r.messageId === message.message_id && !r.path.endsWith('/text') && !r.path.endsWith('/content'))) {
       const target = resolve(resource.sourceRef);
       const name = renderRichText(resource.fileName).replace(/[\[\]\n]/g, ' ');

@@ -188,6 +188,62 @@ test('Doubao preserves explicitly finished interrupted responses without accepti
     assert.throws(() => validateDoubaoConversation(invalid), { code: 'PARTIAL_DETAIL' });
   }
 });
+test('Doubao completed user image uploads do not require the streamed-block finish flag', async () => {
+  const n = native(), m = n.messages[0]; m.content_type = 9999;
+  m.content_block = [{ block_type: 10052, is_finish: false, content: { pc_event_block: '', attachment_block: { attachments: [
+    { type: 1, upload_status: 1, progress: 100, parse_state: 1, review_state: 1,
+      image: { image_ori: { url: 'https://p-test.byteimg.com/upload.png', width: 800, height: 600 } } },
+  ] } } }];
+  const f = adapterFixture({ pages: [{ messages: [...n.messages].reverse(), has_more: false }] });
+  const detail = await f.detail({});
+  const archive = await buildArchive({ conversation: detail.payload, identity, capturedAt: detail.capturedAt });
+  assert.equal((await extractAssets(detail.payload)).length, 1);
+  assert.equal(JSON.parse(archive.files[0].content).messages[0].content_block[0].is_finish, false);
+  assert.match(archive.files[1].content, /附件尚未保存/);
+  for (const mutate of [x => { x.user_type = 2; }, x => { x.ext.is_finish = '0'; },
+    x => { x.content_block[0].block_type = 10000; }, x => { delete x.content_block[0].content; },
+    x => { x.content_block[0].content.text_block = { text: 'not finished' }; },
+    x => { x.content_block[0].content.attachment_block.attachments = []; },
+    ...['type', 'upload_status', 'progress', 'parse_state', 'review_state'].map(key => x => {
+      x.content_block[0].content.attachment_block.attachments[0][key] = 0;
+    }), x => { x.content_block[0].content.attachment_block.attachments[0].image.image_ori.url = ''; },
+    x => { x.content_block[0].content.attachment_block.attachments.push({ type: 1, progress: 50 }); }]) {
+    const invalid = structuredClone(n); mutate(invalid.messages[0]);
+    assert.throws(() => validateDoubaoConversation(invalid), { code: 'PARTIAL_DETAIL' });
+  }
+});
+
+test('Doubao preserves ended empty interruption records but rejects unknown status combinations', async () => {
+  const n = native(), m = n.messages[1];
+  Object.assign(m, { status: 1, content_status: 120, content_type: 9999, content: '[]', content_block: [] });
+  m.ext.is_interrupted = 'true';
+  const f = adapterFixture({ pages: [{ messages: [...n.messages].reverse(), has_more: false }] });
+  const detail = await f.detail({});
+  const archive = await buildArchive({ conversation: detail.payload, identity, capturedAt: detail.capturedAt });
+  assert.equal(JSON.parse(archive.files[0].content).messages[1].status, 1);
+  assert.match(archive.files[1].content, /已结束空中断记录/);
+  for (const mutate of [x => { x.status = 2; }, x => { x.content_status = 0; }, x => { x.user_type = 1; },
+    x => { x.ext.is_finish = '0'; }, x => { delete x.ext.is_interrupted; },
+    x => { x.content = 'nonempty'; }, x => { x.content = 1; },
+    x => { x.content_block = message(2).content_block; }]) {
+    const invalid = structuredClone(n); mutate(invalid.messages[1]);
+    assert.throws(() => validateDoubaoConversation(invalid), { code: 'PARTIAL_DETAIL' });
+  }
+});
+
+test('Doubao legacy interrupted replies without a flag require a later validated message', async () => {
+  const n = native(); n.messages[1].content_status = 120; n.messages.push(message(3));
+  const archive = await buildArchive({ conversation: n, identity, capturedAt: '2026-10-26T00:00:00Z' });
+  assert.match(archive.files[1].content, /来源已标记此条回复中断/);
+  assert.equal(JSON.parse(archive.files[0].content).messages[1].ext.is_interrupted, undefined);
+  for (const mutate of [x => { x.messages.pop(); }, x => { x.messages[2].ext.is_finish = '0'; },
+    x => { x.messages[1].ext.is_interrupted = 'false'; }, x => { x.messages[1].ext.is_finish = '0'; },
+    x => { x.messages[1].content_block[0].is_finish = false; }]) {
+    const invalid = structuredClone(n); mutate(invalid);
+    assert.throws(() => validateDoubaoConversation(invalid), { code: 'PARTIAL_DETAIL' });
+  }
+});
+
 test('Doubao resources use stable IDs across signed URL refreshes and ignore interface images', async () => {
   const n = native();
   n.messages[1].content_block.push({ is_finish: true, content: { image_block: { image_ori: { url: 'https://p-test.byteimg.com/picture.png?signature=private-one', icon_url: 'https://p-test.byteimg.com/icon.png' } } } });
