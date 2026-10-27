@@ -83,7 +83,7 @@ test('Doubao content bridge exposes only the same bounded status and panel entry
 
 test('content script cannot configure, bind, capture, sync, or fetch private UI state', async () => {
   const app = background(); app.calls.length = 0;
-  for (const type of ['collector:get-state', 'collector:configure', 'collector:github-config', 'collector:github-test',
+  for (const type of ['collector:diagnostics', 'collector:export-diagnostics', 'collector:clear-diagnostics', 'collector:get-state', 'collector:configure', 'collector:github-config', 'collector:github-test',
     'collector:start', 'collector:bind', 'collector:resume', 'collector:pause', 'collector:retry-github',
     'collector:restore', 'collector:restore-retry', 'collector:retry-images',
     'collector:directory-changed', 'collector:permissions-changed', 'collector:close-panel']) {

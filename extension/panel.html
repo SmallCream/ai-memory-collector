@@ -73,12 +73,14 @@
     <p id="identity-checking-note" class="hint warning-text" hidden>正在核验当前标签页；下方为上次确认账号的进度。</p>
     <div id="account-alert" class="notice" hidden><p id="account-alert-text"></p><label for="new-account-alias">账号名称<input id="new-account-alias" maxlength="60" autocomplete="off"></label><button id="bind-account" class="primary block">为此账号启用采集</button><button id="home-grant" class="primary block" hidden>授权 ChatGPT</button><button id="home-open-chatgpt" hidden>打开 ChatGPT</button><button id="home-open-doubao" hidden>打开豆包</button></div>
     <div class="headline"><h1 id="home-heading">自动归档你的对话</h1><p id="schedule-status" class="muted"></p></div>
+    <p id="run-summary" class="surface" hidden></p><button id="open-diagnostics" class="text-button">问题与诊断日志</button>
     <div id="job-progress" hidden><div class="progress-heading"><strong id="job-phase"></strong><span id="job-count" class="muted"></span></div><progress id="progress-meter" aria-label="采集进度"></progress><p id="job-detail" class="hint"></p></div>
     <details id="collection-details" class="task-details" hidden>
       <summary>采集详情<span id="collection-details-status" class="detail-badge"></span></summary>
       <p id="collection-connection" class="hint warning-text" hidden></p>
       <p id="collection-wait" class="hint"></p>
       <p id="collection-detail-counts" class="detail-counts"></p>
+      <p id="collection-read-counts" class="hint"></p>
       <p id="collection-message-progress" class="detail-counts" hidden></p>
       <div id="collection-current" class="activity-cards"></div>
       <section class="detail-section"><h3>对话队列</h3><p id="collection-queue-note" class="hint"></p><ol id="collection-queue" class="task-list"></ol></section>
@@ -111,8 +113,24 @@
     <section class="settings-group" aria-labelledby="restore-heading"><h2 id="restore-heading">从 GitHub 恢复对话</h2><p class="hint">下载已保存仓库中各账号的对话到所选目录，无需登录来源平台。请先保存仓库配置并授权本地目录；附件需从原电脑复制或绑定来源账号后补采；恢复不会启用账号采集。</p><p id="restore-requirements" class="hint"></p><div class="button-row"><button id="restore-github" class="primary">从 GitHub 恢复对话</button><button id="restore-retry" hidden>重新尝试恢复</button></div><div id="restore-progress" class="restore-progress" role="status" aria-live="polite" hidden><div class="progress-heading"><strong id="restore-phase"></strong><span id="restore-count" class="muted"></span></div><progress id="restore-meter" aria-label="恢复进度"></progress><p id="restore-detail" class="hint"></p></div></section>
     <section class="settings-group"><h2>平台访问</h2><p class="hint">按需授权平台，再到对应网页打开采集器并启用当前账号。</p><button id="settings-grant-chatgpt">授权 ChatGPT</button><button id="settings-grant-doubao">授权豆包</button></section>
     <section class="settings-group" aria-labelledby="external-images-heading"><h2 id="external-images-heading">外链附件</h2><p class="hint">可选：授权后，扩展会匿名检测对话中的 HTTPS 外链图片及受支持文件。此权限覆盖 HTTPS 网站；请求不携带 AI 平台或 GitHub 凭据。未授权的外链保留原始链接。</p><button id="grant-doubao-images" hidden>允许下载豆包原图（byteimg.com）</button><button id="grant-external-images">允许检测外链附件</button><p id="external-images-status" class="hint"></p></section>
+    <section class="settings-group"><h2>诊断与日志</h2><p class="hint">查看当前账号与仓库恢复的近期步骤、失败原因和已恢复记录。日志保存在本浏览器，可导出脱敏诊断。</p><button id="settings-diagnostics">打开诊断与日志</button></section>
     <section class="settings-group"><h2>当前账号</h2><p id="settings-account"></p><p class="hint">账号按实际登录身份识别。切换身份后先核验；新账号需要单独启用。</p></section>
     <button id="settings-hide" class="text-button">隐藏页面上的悬浮入口</button><p class="hint">隐藏后，点击浏览器工具栏的采集器图标即可恢复。</p>
+  </section>
+  <section id="diagnostics" hidden aria-labelledby="diagnostics-heading">
+    <button id="diagnostics-back" class="text-button">‹ 返回首页处理</button><h1 id="diagnostics-heading">诊断与日志</h1>
+    <p class="hint">保留最近 7 天，每类最多 200 条历史步骤。这里的“已恢复”只代表对应步骤成功，最终备份结果以首页为准。仓库恢复记录包含全部恢复账号。</p>
+    <label for="diagnostics-account">查看账号<select id="diagnostics-account"></select></label>
+    <div class="diagnostic-filters">
+      <label for="diagnostics-channel">阶段<select id="diagnostics-channel"><option value="all">全部阶段</option><option value="collection">对话采集／写入</option><option value="download">附件下载／写入</option><option value="github">GitHub 备份</option><option value="restore">仓库恢复</option></select></label>
+      <label for="diagnostics-status">结果<select id="diagnostics-status"><option value="all">全部结果</option><option value="failed">失败记录</option><option value="recovered">本步骤已恢复</option><option value="interrupted">中断记录</option></select></label>
+      <label for="diagnostics-period">时间<select id="diagnostics-period"><option value="week">最近 7 天</option><option value="day">最近 24 小时</option></select></label>
+      <label for="diagnostics-code">错误代码<input id="diagnostics-code" placeholder="例如 HTTP_403" maxlength="60" autocomplete="off"></label>
+    </div>
+    <div class="button-row"><button id="refresh-diagnostics">刷新日志</button><button id="preview-diagnostics">预览脱敏导出</button><button id="clear-diagnostics">清除已结束日志</button></div>
+    <p class="hint">清除只影响所选账号和仓库恢复的日志，进行中的步骤、采集任务及已保存文件保留。日志不自动上传。</p>
+    <p id="diagnostics-count" class="hint" role="status"></p><ol id="diagnostics-list" class="task-list diagnostic-list"></ol>
+    <section id="diagnostics-export" hidden><h2>脱敏导出预览</h2><p class="hint">导出所选账号与仓库恢复的保留记录，不受列表筛选影响。只含版本、平台、时间、阶段、固定错误码和计数；对象使用本次导出内的匿名编号。不包含正文、标题、文件名、账号名称、凭据、网址或完整本地路径。</p><pre id="diagnostics-preview" tabindex="0"></pre><div class="button-row"><button id="save-diagnostics" class="primary">保存诊断 JSON</button><button id="cancel-diagnostics-export">关闭预览</button></div></section>
   </section>
 </main>
 <script src="bootstrap.js" defer></script>

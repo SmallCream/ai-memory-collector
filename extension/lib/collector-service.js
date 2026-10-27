@@ -1,5 +1,6 @@
 import { platformSites } from '../adapters/index.js';
 import { createConfigStore, publicConfig, cleanAlias, collectorError, safeError, INTERVALS } from './config.js';
+import { createDiagnosticReport } from './diagnostics.js';
 import { createActivityLog } from './activity-log.js';
 import { createLocalUploadQueue } from './local-upload-queue.js';
 export const ALARM_NAME = 'collector-work';
@@ -560,6 +561,28 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
   }
   async function executeCommand(message, tabId) {
     switch (message.type) {
+      case 'collector:diagnostics':
+      case 'collector:export-diagnostics':
+      case 'collector:clear-diagnostics': {
+        const config = await settings.read();
+        const accounts = Object.values(config.accounts);
+        const selectedKey = message.accountKey || identities.get(tabId)?.identity.accountKey || accounts[0]?.accountKey;
+        const account = accounts.find(item => item.accountKey === selectedKey);
+        if (message.accountKey && !account) throw collectorError('ACCOUNT_DISABLED', '请选择已配置的账号。');
+        const channels = {};
+        for (const channel of ['collection', 'download', 'github', 'restore']) {
+          const owner = channel === 'restore' ? 'repository' : account?.accountKey;
+          if (!owner) continue;
+          if (message.type === 'collector:clear-diagnostics') await activity.clear(owner, channel);
+          channels[channel] = await activity.read(owner, channel, { history: true });
+        }
+        const snapshot = { platform: account?.platform, accountKey: account?.accountKey || null,
+          accounts: accounts.map(item => ({ accountKey: item.accountKey, label: cleanAlias(item.alias, item.displayName), platform: item.platform })),
+          channels, job: account ? await engine.getState(account.accountKey) : null };
+        if (message.type === 'collector:export-diagnostics') return { ok: true,
+          report: createDiagnosticReport(snapshot, { version: browser.runtime?.getManifest?.().version, now: now() }) };
+        return { ok: true, diagnostics: snapshot };
+      }
       case 'collector:get-state': return { ok: true, state: await state(tabId, { refreshIdentity: message.refreshIdentity === true }) };
       case 'collector:bind': await bind(message.alias, tabId); break;
       case 'collector:configure': await configure(message); break;
@@ -678,7 +701,7 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
   function command(message, tabId) {
     // Pause signals the current page reader without waiting for the filesystem
     // owner. Its durable job update still uses the engine's per-account lock.
-    if (['collector:get-state', 'collector:pause', 'collector:stop', 'collector:retry-github'].includes(message.type)) return executeCommand(message, tabId);
+    if (['collector:get-state', 'collector:diagnostics', 'collector:export-diagnostics', 'collector:clear-diagnostics', 'collector:pause', 'collector:stop', 'collector:retry-github'].includes(message.type)) return executeCommand(message, tabId);
     return exclusive(() => executeCommand(message, tabId));
   }
   return { initialize, command, state, pump, enableTab, identify, engine, withFileLock,

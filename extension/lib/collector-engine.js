@@ -329,6 +329,7 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
       storageKey: account.storageKey, tabId, mode: actualMode, status: 'running', phase: 'list',
       startedAt: now(), updatedAt: now(), completedAt: null, offset: 0, pages: 0,
       discovered: 0, processed: 0, added: 0, updated: 0, unchanged: 0, failed: 0, skipped: 0,
+      statistics: { listReads: 0, detailReads: 0, detailConversations: 0 },
       total: null, queue: [], known: COPY(known), manifestIds, unfinishedIds: unfinished, enumerationComplete: false,
       initializedComplete: false, listAttempts: 0, listRetryAt: null, nextRetryAt: null, error: null,
       accountCooldownUntil: ledger.accountCooldownUntil || 0,
@@ -427,6 +428,10 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
   }
 
   async function listStep(job, account, tabId, directory) {
+    if (job.statistics) {
+      job.statistics.listReads++;
+      try { await publish(job); } catch { /* Display counters do not block source reads. */ }
+    }
     const page = await adapter.list(tabId, { accountKey: account.accountKey, offset: job.offset });
     if (!page || !Array.isArray(page.items) || page.items.some(item => !/^[A-Za-z0-9_-]{1,160}$/.test(item?.id || ''))) throw fail('FORMAT');
     if (!(page.nextOffset === null || (account.platform === 'doubao'
@@ -559,11 +564,17 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
   }
 
   async function detailStep(job, account, tabId, directory, item) {
-    const info = { title: item.title, conversationId: item.id, completed: job.processed, total: job.discovered };
+    const info = { taskId: job.id, title: item.title, conversationId: item.id, completed: job.processed, total: job.discovered };
     job.messageProgress = null;
     await publish(job);
     const detail = await activity.run(account.accountKey, 'collection', { ...info, stage: 'detail' }, async () => {
       const baseline = await readConversationBaseline(directory, account, item.id);
+      if (job.statistics) {
+        job.statistics.detailReads++;
+        if (!item.detailRead) job.statistics.detailConversations++;
+        item.detailRead = true;
+        try { await publish(job); } catch { /* Display counters do not block source reads. */ }
+      }
       const result = await adapter.detail(tabId, { accountKey: account.accountKey, conversationId: item.id,
         baseline, forceFull: job.mode === 'full' || needsMessageFullCheck(baseline?.entry, now()),
         shouldPause: () => pauseRequests.has(account.accountKey),
@@ -648,7 +659,7 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
         job.tabId = tabId;
         if (job.phase === 'list') {
           try { return await activity.run(account.accountKey, 'collection', {
-            stage: 'list', title: `对话列表 · 第 ${job.pages + 1} 页`, completed: job.pages,
+            taskId: job.id, stage: 'list', title: `对话列表 · 第 ${job.pages + 1} 页`, completed: job.pages,
           }, () => listStep(job, account, tabId, directory)); }
           catch (error) { return handleError(job, error); }
         }

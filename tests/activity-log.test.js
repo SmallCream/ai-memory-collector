@@ -51,3 +51,58 @@ test('logs are bounded, account isolated, metadata only and sanitized again on r
     recent: [{ status: 'failed', code: 'https://bad.test/', response: 'private' }] });
   assert.doesNotMatch(JSON.stringify(await env.log.read('one', 'collection')), /https:|private/);
 });
+
+test('persistent history groups repeated failures and marks only the same object and step recovered', async () => {
+  const env = setup(), info = { stage: 'download', conversationId: 'chat', assetId: 'asset-a', fileName: 'same.png' };
+  const failure = () => { throw Object.assign(new Error('private response'), { code: 'HTTP_403' }); };
+  for (let i = 0; i < 3; i++) { await assert.rejects(env.log.run('one', 'download', info, failure)); env.advance(1); }
+  let history = (await env.log.read('one', 'download', { history: true })).history;
+  assert.equal(history.length, 1); assert.equal(history[0].occurrences, 3); assert.equal(history[0].firstFailedAt, 100);
+  await env.log.run('one', 'download', { ...info, assetId: 'asset-b' }, async () => {});
+  assert.equal((await env.log.read('one', 'download', { history: true })).history.find(row => row.code).recoveredAt, undefined);
+  await env.log.run('one', 'download', info, async () => {});
+  history = (await createActivityLog({ ...env.dependencies, workerId: 'new' }).read('one', 'download', { history: true })).history;
+  assert.equal(history.find(row => row.code).recoveredAt, 103);
+});
+
+test('history is bounded and expires, while clearing preserves a running operation and unrelated work', async () => {
+  const env = setup(); env.store.set('collectorJob:one', { status: 'paused' });
+  for (let i = 0; i < 210; i++) await env.log.run('one', 'collection', { stage: 'detail', conversationId: String(i) }, async () => {});
+  assert.equal((await env.log.read('one', 'collection', { history: true })).history.length, 200);
+  env.advance(8 * 86400000);
+  assert.equal((await env.log.read('one', 'collection', { history: true })).history.length, 0);
+  let release; const pending = env.log.run('one', 'collection', { stage: 'detail' }, () => new Promise(resolve => { release = resolve; }));
+  await turn(); await env.log.clear('one', 'collection');
+  const cleared = await env.log.read('one', 'collection', { history: true });
+  assert.equal(cleared.current.status, 'running'); assert.equal(cleared.history.length, 0);
+  assert.deepEqual(env.store.get('collectorJob:one'), { status: 'paused' }); release(); await pending;
+  assert.equal((await env.log.read('one', 'collection', { history: true })).history.length, 1);
+});
+
+test('starting a new step preserves a previous worker interruption in history', async () => {
+  const env = setup();
+  env.store.set('activity:v1:one:collection', { workerId: 'old', current: { status: 'running', stage: 'detail', operationId: 'old-op', startedAt: 90, updatedAt: 90 }, recent: [] });
+  await env.log.run('one', 'collection', { stage: 'identify' }, async () => {});
+  const log = await env.log.read('one', 'collection', { history: true });
+  assert.equal(log.history.find(row => row.operationId === 'old-op').status, 'interrupted');
+});
+
+test('diagnostic read and clear expose storage failures instead of claiming empty logs or success', async () => {
+  const log = createActivityLog({ getSetting: async () => { throw new Error('storage'); }, setSetting: async () => {} });
+  assert.equal((await log.read('one', 'collection', { history: true })).unavailable, true);
+  await assert.rejects(log.clear('one', 'collection'), { code: 'DIAGNOSTICS_STORAGE' });
+});
+
+test('routine successes do not crowd out unresolved failures and list recovery matches the same task page', async () => {
+  const env = setup(), info = { stage: 'list', taskId: 'run-a', completed: 1 };
+  await assert.rejects(env.log.run('one', 'collection', info, () => { throw Object.assign(new Error('retry'), { code: 'HTTP_503' }); }));
+  for (let n = 0; n < 210; n++) await env.log.run('one', 'collection', { stage: 'identify' }, async () => {});
+  let history = (await env.log.read('one', 'collection', { history: true })).history;
+  assert.equal(history.length, 200); assert.ok(history.some(item => item.code === 'HTTP_503'));
+  await env.log.run('one', 'collection', { ...info, completed: 2 }, async () => {});
+  assert.equal((await env.log.read('one', 'collection', { history: true })).history.find(item => item.code).recoveredAt, undefined);
+  await env.log.run('one', 'collection', info, async () => {});
+  // Keep the recovery evidence near the new success, even after a busy run.
+  history = (await env.log.read('one', 'collection', { history: true })).history;
+  assert.equal(history.find(item => item.code === 'HTTP_503').recoveredAt, 100);
+});

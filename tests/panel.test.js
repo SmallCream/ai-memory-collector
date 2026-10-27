@@ -887,3 +887,20 @@ test('paused and stopped jobs do not trigger identity polling from idle alarms',
     assert.equal(checks, 0); assert.equal((await f.service.engine.getState(accountKey)).status, status);
   }
 });
+
+test('diagnostic read export and clear work offline without account probing and isolate selected accounts', async () => {
+  const f = fixture();
+  f.store.set(`activity:v1:${accountKey}:collection`, { current: null, recent: [{ stage: 'detail', status: 'failed', code: 'HTTP_403', title: 'PRIVATE', finishedAt: 2_000_000_000_000 }] });
+  f.store.set('activity:v1:other:collection', { recent: [{ title: 'unrelated' }] });
+  f.dependencies.adapter.identify = async () => { throw new Error('diagnostics must not identify'); };
+  f.tabs.length = 0; f.permissions.clear();
+  const result = await f.service.command({ type: 'collector:diagnostics', accountKey });
+  assert.equal(result.diagnostics.channels.collection.history.length, 1);
+  const exported = await f.service.command({ type: 'collector:export-diagnostics', accountKey });
+  assert.doesNotMatch(JSON.stringify(exported.report), /PRIVATE|unrelated/);
+  await assert.rejects(f.service.command({ type: 'collector:diagnostics', accountKey: 'other' }), { code: 'ACCOUNT_DISABLED' });
+  await f.service.command({ type: 'collector:clear-diagnostics', accountKey });
+  assert.equal((await f.service.command({ type: 'collector:diagnostics', accountKey })).diagnostics.channels.collection.history.length, 0);
+  assert.equal(f.store.get('activity:v1:other:collection').recent.length, 1);
+  assert.equal(f.calls.lists, 0); assert.equal(f.calls.saves.length, 0);
+});

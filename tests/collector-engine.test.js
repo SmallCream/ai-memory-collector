@@ -972,3 +972,19 @@ test('source suspension preserves explicit user pauses, including a pause racing
     assert.deepEqual(f.calls.saves, []);
   });
 });
+
+test('read statistics count attempts separately from conversations and survive restart', async () => {
+  const f = setup();
+  await f.engine.start({ account, tabId: 1 }); await f.engine.tick({ account, tabId: 1 });
+  f.setDetailError('HTTP_503');
+  const failed = await f.engine.tick({ account, tabId: 1 });
+  assert.equal(failed.statistics.listReads, f.calls.pages.length);
+  assert.equal(failed.statistics.detailReads, 1); assert.equal(failed.statistics.detailConversations, 1);
+  f.setDetailError(null); f.advance(3600000);
+  const result = await complete(createCollectorEngine(f.dependencies));
+  assert.equal(result.statistics.detailReads, f.calls.details.length);
+  assert.equal(result.statistics.detailConversations, new Set(f.calls.details).size);
+  await f.engine.start({ account: { ...account, initialized: true }, tabId: 1, mode: 'incremental' });
+  const unchanged = await complete(f.engine, { ...account, initialized: true });
+  assert.equal(unchanged.statistics.detailReads, 0); assert.equal(unchanged.statistics.detailConversations, 0);
+});

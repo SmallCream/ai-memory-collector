@@ -1,0 +1,36 @@
+name: 故障反馈
+description: 报告采集、附件、保存或升级问题（不要提交私人数据）
+title: "[问题] "
+body:
+  - type: markdown
+    attributes:
+      value: 请勿上传聊天正文、Token、Cookie、签名链接、原始 HAR 或私人归档。私密安全报告渠道尚待配置，不要公开安全漏洞细节。
+  - type: input
+    id: version
+    attributes:
+      label: 插件版本、Chrome 版本与操作系统
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 相关平台
+      options:
+        - ChatGPT
+        - 豆包
+        - GitHub 备份或恢复
+        - 本地保存或升级
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 操作步骤、预期结果与实际结果
+      description: 使用虚构名称描述，不粘贴私人对话内容。
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 错误代码与脱敏诊断（可选）
+      description: 从设置 → 诊断与日志 → 预览脱敏导出，检查后保存并附加。不要上传浏览器配置或原始网络记录。

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI Memory Collector",
-  "version": "0.4.8",
+  "version": "0.4.9",
   "description": "按平台和账号自动备份 ChatGPT、豆包对话与受支持资源到本地，支持增量采集、缺失补齐及可选私有 GitHub 同步。",
   "minimum_chrome_version": "120",
   "permissions": [

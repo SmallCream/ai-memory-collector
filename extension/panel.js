@@ -18,6 +18,7 @@ let settingsLoaded = false;
 let stateRevision = 0;
 let activeAliasKey = null;
 let externalImagePermission = false;
+let diagnosticSnapshot = null, diagnosticExport = null, diagnosticRevision = 0;
 let refreshPending = null;
 let refreshChecksIdentity = false;
 const renderedLists = new Map();
@@ -343,6 +344,9 @@ function renderDetailedProgress() {
   }
   if (job?.status === 'running' && !liveCollection && Number(job?.nextRetryAt) > Date.now()) text('collection-details-status', '等待重试');
   text('collection-wait', collectionWait);
+  show('run-summary', Boolean(job));
+  text('run-summary', job ? `本轮发现 ${count(job.discovered)} 条对话；未变化跳过 ${count(job.skipped)} 条，已新增 ${count(job.added)} 条、更新 ${count(job.updated)} 条，待处理 ${count(diagnostics.remaining ?? Math.max(0, (job.discovered || 0) - (job.processed || 0)))} 条。附件与 GitHub 结果分别显示。` : '');
+  text('collection-read-counts', job?.statistics ? `列表读取 ${count(job.statistics.listReads)} 次；正文读取 ${count(job.statistics.detailConversations)} 条／${count(job.statistics.detailReads)} 次（含重复尝试）。一次正文读取可能包含多页网络请求。` : job ? '此任务创建于旧版本，未记录完整读取次数；下一轮新建任务开始统计。' : '');
   text('collection-detail-counts', job ? `已发现 ${count(job.discovered)} 条 · 已处理 ${count(job.processed)} 条 · 未变化已跳过 ${count(diagnostics.skipped ?? job.skipped)} 条 · 待处理 ${count(diagnostics.remaining ?? Math.max(0, (job.discovered || 0) - (job.processed || 0)))} 条 · 失败／重试 ${count(diagnostics.failed !== undefined ? Number(diagnostics.failed) + Number(diagnostics.retrying || 0) : job.failed)} 条${job.pages ? ` · 已读 ${count(job.pages)} 页列表` : ''}` : '');
   const messages = job?.messageProgress;
   show('collection-message-progress', Boolean(messages));
@@ -435,7 +439,7 @@ function render() {
   const isPaused = pausedStatuses.has(job?.status);
   const isPartial = job?.status === 'partial';
   const isStopped = job?.status === 'stopped';
-  const isWizard = !config.setupComplete && screen !== 'settings';
+  const isWizard = !config.setupComplete && screen === 'home';
   const cloud = cloudVisibility();
   show('legacy-notice', current.legacyPending === true);
   show('context-error', Boolean(current.error?.message) && (screen === 'settings' || !current.identity));
@@ -447,6 +451,7 @@ function render() {
   show('wizard', isWizard);
   show('home', !isWizard && screen === 'home');
   show('settings', screen === 'settings');
+  show('diagnostics', screen === 'diagnostics');
   show('open-settings', screen !== 'settings');
   text('back-home', config.setupComplete ? '‹ 返回采集' : '‹ 返回首次设置');
   const selectedName = account?.alias || identity?.displayName || '尚未识别账号';
@@ -625,6 +630,7 @@ function render() {
   if (!started) { started = true; window.dispatchEvent(new Event('collector:ready')); }
 }
 async function readState(refreshIdentity = false) {
+  if (screen === 'diagnostics') { await loadDiagnostics(); return; }
   const revision = ++stateRevision;
   const reply = await chrome.runtime.sendMessage({ type: 'collector:get-state', refreshIdentity, ...(sourceTabId === null ? {} : { tabId: sourceTabId }) });
   if (!reply?.ok) throw errorObject(reply?.error || '暂时无法读取后台状态。');
@@ -740,6 +746,94 @@ async function closePanel(hide = false) {
   await send('collector:close-panel', { hide });
   if (!setupPage) window.close();
 }
+async function loadDiagnostics(type = 'collector:diagnostics') {
+  const revision = ++diagnosticRevision;
+  const accountKey = $('diagnostics-account').value || diagnosticSnapshot?.accountKey || current?.account?.accountKey;
+  const reply = await send(type, accountKey ? { accountKey } : {});
+  if (revision !== diagnosticRevision) return;
+  diagnosticSnapshot = reply.diagnostics;
+  const accounts = diagnosticSnapshot?.accounts || [];
+  const key = JSON.stringify(accounts);
+  if (renderedLists.get('diagnostics-account') !== key) {
+    $('diagnostics-account').replaceChildren();
+    for (const account of accounts) {
+      const option = document.createElement('option'); option.value = account.accountKey;
+      option.textContent = `${account.platform === 'doubao' ? '豆包' : 'ChatGPT'} · ${assetLabel(account.label, '已配置账号')}`;
+      $('diagnostics-account').append(option);
+    }
+    renderedLists.set('diagnostics-account', key);
+  }
+  $('diagnostics-account').value = diagnosticSnapshot?.accountKey || '';
+  renderDiagnostics();
+}
+function renderDiagnostics() {
+  const channelNames = { collection: '对话采集／写入', download: '附件下载／写入', github: 'GitHub 备份', restore: '仓库恢复' };
+  const selectedChannel = $('diagnostics-channel').value || 'all', selectedStatus = $('diagnostics-status').value || 'all';
+  const after = Date.now() - ($('diagnostics-period').value === 'day' ? 1 : 7) * 86400000;
+  const code = $('diagnostics-code').value.trim().toUpperCase();
+  const records = [];
+  for (const [channel, log] of Object.entries(diagnosticSnapshot?.channels || {})) {
+    if (selectedChannel !== 'all' && selectedChannel !== channel) continue;
+    const rows = [...(log.history || [])];
+    if (log.current && !rows.some(item => item.operationId && item.operationId === log.current.operationId)) rows.unshift(log.current);
+    for (const item of rows) {
+      if ((item.finishedAt || item.updatedAt || 0) < after) continue;
+      if (selectedStatus === 'failed' && (item.status !== 'failed' || item.recoveredAt)) continue;
+      if (selectedStatus === 'recovered' && !item.recoveredAt) continue;
+      if (selectedStatus === 'interrupted' && item.status !== 'interrupted') continue;
+      if (code && !assetFailureCode(item.code).includes(code)) continue;
+      records.push({ ...item, channel });
+    }
+  }
+  records.sort((a, b) => (b.finishedAt || b.updatedAt || 0) - (a.finishedAt || a.updatedAt || 0));
+  text('diagnostics-count', records.length ? `符合筛选 ${records.length} 条，显示前 ${Math.min(100, records.length)} 条。完整保留记录可导出；历史失败不等于当前任务仍失败。` : '当前筛选没有日志。旧版本仅能沿用尚未被覆盖的最近记录；没有日志不代表没有待处理任务。');
+  const unavailable = Object.entries(diagnosticSnapshot?.channels || {}).filter(([, log]) => log.unavailable).map(([channel]) => channelNames[channel]);
+  if (unavailable.length) text('diagnostics-count', `暂时无法读取 ${unavailable.join('、')} 的日志；以下记录可能不完整，请稍后刷新。`);
+  const list = $('diagnostics-list'), scroll = list.scrollTop;
+  const renderKey = JSON.stringify(records.slice(0, 100));
+  if (renderedLists.get('diagnostics-list') === renderKey) return;
+  renderedLists.set('diagnostics-list', renderKey); list.replaceChildren();
+  for (const item of records.slice(0, 100)) {
+    const row = document.createElement('li'), details = document.createElement('details');
+    appendText(details, 'summary', `${channelNames[item.channel] || '任务'} · ${activityName(item)} · ${item.recoveredAt ? '本步骤已恢复' : activityStatuses[item.status] || '已记录'}${item.code ? ' · ' + assetFailureCode(item.code) : ''}`);
+    appendText(details, 'p', activityTitle(item));
+    appendText(details, 'p', `${new Date(item.finishedAt || item.updatedAt).toLocaleString()} · 耗时 ${duration((item.finishedAt || item.updatedAt) - item.startedAt)}${item.occurrences ? ` · 同类失败 ${count(item.occurrences)} 次` : ''}`, 'muted');
+    if (item.taskId) appendText(details, 'p', `本机任务编号：${assetLabel(item.taskId, '')}`, 'muted');
+    if (item.status === 'failed') {
+      const reason = detailFailureMessage(item);
+      const advice = item.channel === 'download' ? assetFailureMessage(item.code) :
+        item.code === 'HTTP_401' || item.code === 'HTTP_403' ? '来源拒绝了请求，请检查登录状态、权限及原网页是否可访问。' :
+        item.code === 'DIRECTORY_PERMISSION' ? '请回到首页或设置恢复保存目录权限。' :
+        item.code === 'HTTP_429' ? '服务限制请求频率，请等待冷却后重试。' :
+        item.code === 'ACCOUNT_CHANGED' ? '账号发生变化，请回到任务所属账号后处理。' :
+        '此步骤未完成。请回到首页查看当前任务状态和可用操作；已有归档保留。';
+      appendText(details, 'p', reason || advice);
+      if (item.recoveredAt) appendText(details, 'p', `该步骤于 ${new Date(item.recoveredAt).toLocaleString()} 成功；其他阶段请以首页结果为准。`);
+    }
+    row.append(details); list.append(row);
+  }
+  if (Number.isFinite(scroll)) list.scrollTop = scroll;
+}
+for (const id of ['open-diagnostics', 'settings-diagnostics']) action(id, async () => {
+  diagnosticExport = null; show('diagnostics-export', false);
+  await loadDiagnostics(); screen = 'diagnostics';
+});
+action('diagnostics-back', () => { screen = 'home'; });
+action('refresh-diagnostics', () => loadDiagnostics());
+action('clear-diagnostics', async () => { await loadDiagnostics('collector:clear-diagnostics'); diagnosticExport = null; show('diagnostics-export', false); });
+$('diagnostics-account').addEventListener('change', () => { diagnosticExport = null; show('diagnostics-export', false); void loadDiagnostics().catch(error => feedback(safeMessage(error), true)); });
+for (const id of ['diagnostics-channel', 'diagnostics-status', 'diagnostics-period', 'diagnostics-code']) $(id).addEventListener('input', renderDiagnostics);
+action('preview-diagnostics', async () => {
+  const reply = await send('collector:export-diagnostics', { accountKey: $('diagnostics-account').value || undefined });
+  diagnosticExport = reply.report; text('diagnostics-preview', JSON.stringify(diagnosticExport, null, 2)); show('diagnostics-export', true);
+});
+action('save-diagnostics', () => {
+  if (!diagnosticExport) throw new Error('请先生成脱敏导出预览。');
+  const url = URL.createObjectURL(new Blob([JSON.stringify(diagnosticExport, null, 2) + '\n'], { type: 'application/json' }));
+  const link = document.createElement('a'); link.href = url; link.download = 'ai-memory-collector-diagnostics.json';
+  document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+action('cancel-diagnostics-export', () => { diagnosticExport = null; show('diagnostics-export', false); });
 action('grant-chatgpt', grantChatGPT);
 action('home-grant', () => current.platform === 'doubao' ? grantDoubao() : grantChatGPT());
 action('grant-doubao', grantDoubao);

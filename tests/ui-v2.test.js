@@ -21,6 +21,7 @@ class Element {
   setAttribute(key, value) { this.attributes[key] = value; }
   removeAttribute(key) { delete this.attributes[key]; }
   addEventListener(name, listener) { this.listeners.set(name, listener); }
+  remove() { this.removed = true; }
   async click() { if (!this.disabled) await this.listeners.get('click')?.(); }
 }
 const initialState = () => ({
@@ -48,10 +49,10 @@ async function setup(options = {}) {
   const context = vm.createContext({
     document: { body, hidden: false, getElementById: id => { assert(elements.has(id), `unknown ID ${id}`); return elements.get(id); },
       querySelectorAll: () => all, querySelector: selector => steps[Number(/\d+/.exec(selector)?.[0])],
-      createElement: tag => new Element(tag), addEventListener() {} },
+      createElement: tag => { const element = new Element(tag); options.createdElements?.push(element); return element; }, addEventListener() {} },
     window: { addEventListener: (name, callback) => windowListeners.set(name, callback), dispatchEvent: event => events.push(event.type),
       close: () => events.push('window-close'), showDirectoryPicker: async () => { events.push('directory-picker'); return directory; } },
-    location: { href: options.url || 'chrome-extension://test/panel.html' }, URL, Date, Set, Map, Number, String, Array, Boolean, Event,
+    location: { href: options.url || 'chrome-extension://test/panel.html' }, URL: options.URL || URL, Blob, Date, Set, Map, Number, String, Array, Boolean, Event,
     setInterval: callback => { intervalCallbacks.push(callback); return 1; }, clearInterval() {},
     setTimeout: options.setTimeout || setTimeout, clearTimeout: options.clearTimeout || clearTimeout,
     getSetting: async key => settings.get(key), setSetting: async (key, value) => { events.push(`setting:${key}`); settings.set(key, value); },
@@ -1038,4 +1039,46 @@ test('opening and refocusing the panel request identity refresh but passive poll
   assert.equal(app.messages.at(-1).refreshIdentity, false);
   app.focus(); await new Promise(resolve => setImmediate(resolve));
   assert.equal(app.messages.at(-1).refreshIdentity, true);
+});
+
+
+test('diagnostic entry filters local records, previews a bounded report and saves only that report', async () => {
+  const blobs = [], createdElements = [];
+  class ExportURL extends URL {
+    static createObjectURL(blob) { blobs.push(blob); return 'blob:synthetic'; }
+    static revokeObjectURL() {}
+  }
+  const record = { operationId: 'op-one', taskId: 'run-one', stage: 'download', status: 'failed', code: 'HTTP_404',
+    title: 'Local private title', fileName: 'private.png', startedAt: Date.now() - 1000, finishedAt: Date.now() };
+  const snapshot = { accountKey: 'acct-demo', accounts: [{ accountKey: 'acct-demo', platform: 'chatgpt', label: 'Demo' }], channels: { download: { history: [record] } } };
+  const report = { schemaVersion: 1, records: [{ code: 'HTTP_404', conversation: 'conversation-1' }] };
+  const app = await setup({ URL: ExportURL, createdElements, messageHook: message => {
+    if (message.type === 'collector:diagnostics') return { ok: true, diagnostics: structuredClone(snapshot) };
+    if (message.type === 'collector:export-diagnostics') return { ok: true, report };
+    if (message.type === 'collector:clear-diagnostics') { snapshot.channels.download.history = []; return { ok: true, diagnostics: structuredClone(snapshot) }; }
+  } });
+  await app.click('open-diagnostics');
+  assert.equal(app.elements.get('diagnostics').hidden, false); assert.equal(app.elements.get('home').hidden, true);
+  assert.equal(app.elements.get('diagnostics-list').children.length, 1);
+  app.elements.get('diagnostics-code').value = 'HTTP_403'; app.elements.get('diagnostics-code').listeners.get('input')();
+  assert.equal(app.elements.get('diagnostics-list').children.length, 0);
+  await app.click('preview-diagnostics');
+  assert.equal(app.elements.get('diagnostics-export').hidden, false);
+  assert.doesNotMatch(app.elements.get('diagnostics-preview').textContent, /private/);
+  await app.click('save-diagnostics');
+  assert.deepEqual(JSON.parse(await blobs[0].text()), report);
+  assert.equal(createdElements.find(element => element.tagName === 'a').download, 'ai-memory-collector-diagnostics.json');
+  const before = app.messages.filter(message => message.type === 'collector:get-state').length;
+  await app.poll(); assert.equal(app.messages.filter(message => message.type === 'collector:get-state').length, before);
+  await app.click('clear-diagnostics'); assert.equal(app.elements.get('diagnostics-export').hidden, true);
+});
+
+test('read summary distinguishes unique details and attempts and never invents old counters', async () => {
+  const state = initialState(); state.job = { status: 'completed', discovered: 222, processed: 222, skipped: 220, added: 1, updated: 1,
+    statistics: { listReads: 12, detailReads: 3, detailConversations: 2 } };
+  const app = await setup({ state });
+  assert.match(app.elements.get('run-summary').textContent, /未变化跳过 220/);
+  assert.match(app.elements.get('collection-read-counts').textContent, /正文读取 2 条／3 次/);
+  delete state.job.statistics; app.setState(state); await app.poll();
+  assert.match(app.elements.get('collection-read-counts').textContent, /未记录/);
 });

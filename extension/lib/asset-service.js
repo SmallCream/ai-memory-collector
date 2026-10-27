@@ -243,7 +243,7 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
     return { ...asset, status: 'external', mimeType: result.mimeType };
   }
   async function capture(asset, request, shouldPause) {
-    const info = { title: request.title, conversationId: request.conversationId, fileName: asset.fileName,
+    const info = { title: request.title, conversationId: request.conversationId, assetId: asset.id, fileName: asset.fileName,
       ...(Number.isSafeInteger(asset.expectedSize) ? { size: asset.expectedSize } : {}) };
     if (asset.sourceType === 'external') return activity.run(request.account.accountKey, 'download',
       { ...info, stage: 'check-external' }, async () => {
