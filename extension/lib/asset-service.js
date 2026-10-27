@@ -242,12 +242,16 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
     }
     return { ...asset, status: 'external', mimeType: result.mimeType };
   }
-  async function capture(asset, request) {
+  async function capture(asset, request, shouldPause) {
     const info = { title: request.title, conversationId: request.conversationId, fileName: asset.fileName,
       ...(Number.isSafeInteger(asset.expectedSize) ? { size: asset.expectedSize } : {}) };
     if (asset.sourceType === 'external') return activity.run(request.account.accountKey, 'download',
-      { ...info, stage: 'check-external' }, () => external(asset));
+      { ...info, stage: 'check-external' }, async () => {
+        if (await shouldPause()) throw collectorError('COLLECTION_PAUSED', '采集已停止。');
+        return external(asset);
+      });
     const { managed, bytes } = await activity.run(request.account.accountKey, 'download', { ...info, stage: 'download' }, async () => {
+      if (await shouldPause()) throw collectorError('COLLECTION_PAUSED', '采集已停止。');
       let bytes, mimeType = asset.mimeType, quality = 'original';
       const retrievalURL = asset.retrieval?.url || asset.retrieval?.sourceRef || asset.sourceRef;
       if (asset.sourceType === 'embedded' && /^data:image\/(?:png|jpeg|gif|webp|avif);base64,/i.test(retrievalURL)) {
@@ -268,7 +272,7 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
       () => writeLocalAsset({ ...request, asset: managed, bytes, getSetting, setSetting }));
     return managed;
   }
-  async function tick({ directory, account, tabId, manualOnly = false, captureEnabled = true, networkAllowed = true }) {
+  async function tick({ directory, account, tabId, manualOnly = false, captureEnabled = true, networkAllowed = true, shouldPause = () => false }) {
     const state = await jobs(account);
     const runnable = task => (!manualOnly || task.manualRetry === true || deliveryPending(task)) &&
       (captureEnabled || task.manualRetry === true || task.pendingArchives?.length || task.interfaceRetirement) &&
@@ -399,6 +403,7 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
             try {
               const online = await activity.run(account.accountKey, 'download', { stage: 'refresh-source', title: entry.title,
                 conversationId: task.conversationId, fileName: asset.fileName }, async () => {
+                if (await shouldPause()) throw collectorError('COLLECTION_PAUSED', '采集已停止。');
                 const detail = await refreshConversation({ tabId, accountKey: account.accountKey, conversationId: task.conversationId });
                 if (detail?.identity?.accountKey !== account.accountKey) throw collectorError('ACCOUNT_CHANGED', '附件详情所属账号不匹配。');
                 if (nativeId(detail?.payload || {}) !== task.conversationId || detail.completeness !== 'complete') {
@@ -435,7 +440,7 @@ export function createAssetService({ getSetting, setSetting, readAccountManifest
             try {
               if (sourceFailure) throw sourceFailure;
               completed = ready(asset) || asset.status === 'external' ? asset : await capture(requestAsset,
-                { directory, account, tabId, conversationId: task.conversationId, title: entry.title });
+                { directory, account, tabId, conversationId: task.conversationId, title: entry.title }, shouldPause);
               delete task.autoRetrySuspended; delete task.localMissing; delete task.retryHeld;
             } catch (error) {
               if (error?.code === 'COLLECTION_PAUSED') throw error;

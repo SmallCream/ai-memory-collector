@@ -326,10 +326,11 @@ function renderDetailedProgress() {
   const job = current.job, diagnostics = job?.diagnostics || {}, activity = current.activity || {};
   const collection = activity.collection, liveCollection = collection?.current?.status === 'running';
   show('collection-details', Boolean(job || collection?.current));
-  const jobLabels = { running: liveCollection ? '正在处理' : '等待调度', paused: '已暂停', blocked: '需要处理', partial: '部分完成', completed: '已完成' };
+  const jobLabels = { running: liveCollection ? '正在处理' : '等待调度', paused: '已暂停', stopped: '已停止', blocked: '需要处理', partial: '部分完成', completed: '已完成' };
   text('collection-details-status', jobLabels[job?.status] || '暂无任务');
   let collectionWait = '';
   if (job?.status === 'paused') collectionWait = '采集已暂停，点击“继续采集”后处理未完成项。';
+  else if (job?.status === 'stopped') collectionWait = '本轮已停止，已保存数据保留。点击开始按钮将重新扫描列表，不再继续旧队列。';
   else if (job?.status === 'blocked') collectionWait = assetLabel(job.error?.message, '采集等待登录或保存权限恢复。');
   else if (!liveCollection && Number(job?.nextRetryAt) > Date.now()) collectionWait = `等待重试至 ${clock(job.nextRetryAt)}，剩余 ${duration(job.nextRetryAt - Date.now())}。`;
   else if (job?.status === 'running' && !liveCollection) collectionWait = '当前没有进行中的请求，等待后台调度下一项。';
@@ -432,6 +433,7 @@ function render() {
   const isRunning = runningStatuses.has(job?.status);
   const isPaused = pausedStatuses.has(job?.status);
   const isPartial = job?.status === 'partial';
+  const isStopped = job?.status === 'stopped';
   const isWizard = !config.setupComplete && screen !== 'settings';
   const cloud = cloudVisibility();
   show('legacy-notice', current.legacyPending === true);
@@ -473,8 +475,8 @@ function render() {
   const interval = config.intervalMinutes || 30;
   text('home-heading', isRunning ?
     job.mode === 'full' ? '正在全量补采' : job.mode === 'initial' ? '正在初始化采集' : '正在检查新增与更新' :
-    isPartial ? '部分采集已完成' : isPaused ? '采集已暂停' : !account?.initialized ? '准备好首次采集' : config.autoEnabled === false ? '对话归档已就绪' : '对话正在自动归档');
-  text('schedule-status', config.autoEnabled === false ? '自动采集已暂停，可以手动采集。' :
+    isStopped ? '本轮采集已停止' : isPartial ? '部分采集已完成' : isPaused ? '采集已暂停' : !account?.initialized ? '准备好首次采集' : config.autoEnabled === false ? '对话归档已就绪' : '对话正在自动归档');
+  text('schedule-status', isStopped ? '当前账号自动采集和自动附件下载已停止；重新开始后按设置恢复，手动补齐仍可使用。' : config.autoEnabled === false ? '自动采集已暂停，可以手动采集。' :
     isRunning ? `每 ${interval} 分钟自动检查 · 当前任务完成后继续调度` :
     current.nextRunAt ? `自动采集已开启 · 下次检查 ${time(current.nextRunAt)}` : `自动采集已开启 · 每 ${interval} 分钟检查`);
   show('job-progress', isRunning || isPaused);
@@ -488,12 +490,13 @@ function render() {
     $('progress-meter').value = processed;
   } else $('progress-meter').removeAttribute('value');
   text('job-detail', isPartial ? `已保存的对话会保留，继续处理未完成项${Number(job?.failed) > 0 ? `（${count(job.failed)} 条待处理）` : ''}。` : isPaused ? '恢复后继续处理未完成项。' : '收起面板不会主动暂停任务。');
-  const error = jobError(job) || (hasIdentity ? current.error?.message : '');
+  const error = (!isStopped && jobError(job)) || (hasIdentity ? current.error?.message : '');
   show('job-error', Boolean(error)); text('job-error', safeMessage(error || ''));
   show('start-capture', !isRunning && !isPaused);
   text('start-capture', account?.initialized ? '立即检查更新' : '开始初始化采集');
   show('full-capture', Boolean(account?.initialized) && !isRunning && (!isPaused || isPartial));
   show('pause-capture', isRunning);
+  show('stop-capture', isRunning || isPaused);
   show('resume-capture', isPaused);
   text('resume-capture', isPartial ? '重试未完成项' : '继续采集');
   const directoryName = current.directory?.name || directory?.name || '尚未选择';
@@ -605,6 +608,7 @@ function render() {
   $('full-capture').disabled = busy || !account?.enabled || !granted;
   $('repair-local').disabled = busy || !account?.enabled || !granted || ['requested', 'running'].includes(current.maintenanceStatus?.status);
   $('resume-capture').disabled = busy || !account?.enabled || !granted;
+  $('stop-capture').disabled = busy || !account?.accountKey;
   $('retry-images').disabled = busy || failedImages <= 0 || !account?.enabled || !granted || !hasIdentity ||
     account.accountKey !== identity.accountKey || !Number.isSafeInteger(current.tabId) || current.tabId < 0;
   $('retry-internal-images').disabled = busy || internalMissing <= 0 || !account?.enabled || !granted || !hasIdentity ||
@@ -764,6 +768,7 @@ action('start-capture', () => send('collector:start', { mode: current?.account?.
 action('full-capture', () => send('collector:start', { mode: 'full' }));
 action('repair-local', () => send('collector:repair-local'));
 action('pause-capture', () => send('collector:pause'));
+action('stop-capture', () => send('collector:stop', { accountKey: current?.account?.accountKey }));
 action('resume-capture', () => send('collector:resume'));
 action('retry-images', () => send('collector:retry-images'));
 action('retry-internal-images', () => send('collector:retry-images', { includeInternal: true }));

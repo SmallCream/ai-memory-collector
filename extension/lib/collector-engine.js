@@ -173,7 +173,7 @@ function counts(job) {
   const times = job.queue.filter(item => item.status === 'retry').map(item => item.nextRetryAt);
   if (job.listRetryAt) times.push(job.listRetryAt);
   if (job.accountCooldownUntil > (job.updatedAt || 0)) times.push(job.accountCooldownUntil);
-  job.nextRetryAt = times.length ? Math.min(...times) : null;
+  job.nextRetryAt = job.status === 'stopped' ? null : times.length ? Math.min(...times) : null;
 }
 
 /** Dependencies deliberately accept promises so IndexedDB and real file handles
@@ -317,7 +317,11 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
     // Saving the files precedes outbox/index acknowledgement. Never let a
     // manifest fallback swallow a crashed or failed delivery from the last run.
     const unfinished = [...new Set([...(previousJob?.unfinishedIds || []),
-      ...(previousJob?.queue || []).filter(item => !['saved', 'skipped'].includes(item.status)).map(item => item.id)])];
+      ...(previousJob?.queue || []).filter(item => !['saved', 'skipped'].includes(item.status) &&
+        // A stopped scan may reconsider untouched entries against the current
+        // manifest. Preserve failed or uncertain delivery work for rechecking.
+        (previousJob.status !== 'stopped' || item.status !== 'pending' || item.attempts > 0 || previousJob.error))
+        .map(item => item.id)])];
     const known = baselines(manifest, indexed, unfinished);
     const actualMode = mode === 'incremental' && !account.initialized ? 'initial' : mode;
     const job = {
@@ -608,11 +612,13 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
   }
 
   return {
-    start({ account, tabId, mode = 'incremental' }) {
+    start({ account, tabId, mode = 'incremental', automatic = false }) {
       validateAccount(account); validateTab(tabId);
       if (!MODES.has(mode)) return Promise.reject(fail('INVALID_MODE', '不支持的采集方式。'));
       return locked(account.accountKey, async () => {
         const job = await load(account);
+        // A scheduled start may have been queued just before a user stop.
+        if (automatic && job?.status === 'stopped') return stateOf(job);
         if (job && LIVE.has(job.status)) {
           if (mode === 'full' && job.mode !== 'full') throw fail('BUSY', '已有采集任务，请先完成或暂停当前任务后再补采。');
           return stateOf(job);
@@ -666,11 +672,24 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
         job.status = 'paused'; return publish(job);
       });
     },
+    stop(accountKey) {
+      // Cancel network reads promptly, but let an already-started archive and
+      // outbox commit finish under the account lock before ending the job.
+      pauseRequests.add(accountKey);
+      return locked(accountKey, async () => {
+        const job = await getSetting(keys(accountKey).job);
+        if (!job || job.status === 'stopped') return stateOf(job);
+        job.status = 'stopped'; job.stoppedAt = now(); job.listRetryAt = null;
+        job.initializedComplete = false;
+        return publish(job);
+      });
+    },
     resume({ account, tabId }) {
       validateAccount(account); validateTab(tabId);
       return locked(account.accountKey, async () => {
         pauseRequests.delete(account.accountKey);
         const job = await load(account);
+        if (job?.status === 'stopped') return stateOf(job);
         if (!job) return createJob(account, tabId, account.initialized ? 'incremental' : 'initial');
         try {
           await directoryFor(account);

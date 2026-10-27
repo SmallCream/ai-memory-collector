@@ -67,6 +67,22 @@ function bundle(assets) {
   return [{ files: [{ path: `data/web/chatgpt/${account.storageKey}/archive/manifest.json`,
     content: JSON.stringify({ conversations: { one: { assets } } }) }] }];
 }
+
+test('a stop during attachment preparation prevents download and source refresh without consuming the retry', async t => {
+  for (const refresh of [false, true]) await t.test(refresh ? 'refresh source' : 'download', async () => {
+    const env = setup(); let refreshes = 0;
+    env.dependencies.refreshConversation = async () => { refreshes++; return detail(); };
+    env.restart(); await env.save(detail());
+    if (refresh) await env.service.requestMissing({ account });
+    const result = await env.service.tick({ directory: env.fs.directory, account, tabId: 7, shouldPause: async () => true });
+    assert.equal(env.captures.length, 0); assert.equal(refreshes, 0);
+    const jobs = await env.fs.getSetting(`assetJobs:${account.accountKey}`);
+    assert.equal(jobs.tasks.length, 1); assert.equal(jobs.tasks[0].attempt, 0);
+    assert.equal(jobs.tasks[0].error, undefined);
+    assert.equal((await env.manifest()).conversations['conversation-one'].assets[0].status, 'pending');
+    await env.tick(); assert.equal(env.captures.length, 1);
+  });
+});
 const snapshot = assets => ({ entries: assets.map(asset => ({ path: asset.localPath, pointer: formatLfsPointer(asset) })) });
 
 async function legacyFileCitation({ downloaded = false, ambiguous = false } = {}) {

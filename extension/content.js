@@ -42,7 +42,7 @@
       const status = state?.status || state?.job?.status;
       label.textContent = ['running', 'scanning', 'collecting', 'saving', 'syncing'].includes(status) ? '采集中' :
         ['paused', 'blocked', 'waiting', 'interrupted'].includes(status) ? '已暂停' :
-        status === 'partial' ? '待补采' :
+        status === 'partial' ? '待补采' : status === 'stopped' ? '已停止' :
         ['completed', 'done'].includes(status) ? '已完成' : '采集器';
     } catch { /* Disconnected extension will be removed on the next pass. */ }
   }

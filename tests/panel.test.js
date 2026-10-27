@@ -645,6 +645,54 @@ test('pause cancels the active source request before waiting for its account loc
   assert.equal((await f.service.engine.getState(accountKey)).status, 'paused');
 });
 
+test('stop cancels the actual worker tab, survives restart and suppresses scheduled capture until a new start', { timeout: 5000 }, async () => {
+  const f = fixture(), began = deferred(), aborted = deferred(), assets = [];
+  const original = f.dependencies.adapter.detail;
+  f.dependencies.adapter.detail = async () => { began.resolve(); await aborted.promise; throw issue('COLLECTION_PAUSED'); };
+  const cancelled = [];
+  f.dependencies.adapter.cancel = async (tabId, input) => {
+    assert.equal(input.accountKey, accountKey); cancelled.push(tabId); aborted.resolve();
+  };
+  f.dependencies.assetService = { tick: async input => { assets.push(input); return { runnable: false }; } };
+  f.service = createCollectorService(f.dependencies);
+  await f.service.pump(); await f.service.pump();
+  const old = await f.service.engine.getState(accountKey);
+  const running = f.service.pump(); await began.promise;
+  // A panel in another tab must cancel the tab actually executing this job.
+  await f.service.command({ type: 'collector:stop', accountKey }, 999); await running;
+  assert.ok(cancelled.includes(1)); assert.equal(f.calls.saves.length, 0);
+  assert.equal((await f.service.engine.getState(accountKey)).status, 'stopped');
+  const lists = f.calls.lists; f.advance(2 * 60 * 60_000);
+  f.service = createCollectorService(f.dependencies);
+  await f.service.pump(); await f.service.pump();
+  assert.equal(f.calls.lists, lists); assert.equal(assets.at(-1).manualOnly, true);
+  assert.equal((await f.service.state(1)).nextRunAt, null);
+  assert.equal((await f.service.engine.getState(accountKey)).status, 'stopped');
+  f.dependencies.adapter.detail = original;
+  await f.service.command({ type: 'collector:start', mode: 'incremental' }, 1);
+  const next = await f.service.engine.getState(accountKey);
+  assert.notEqual(next.id, old.id); assert.equal(next.phase, 'list');
+  assert.equal((await complete(f)).status, 'completed');
+});
+
+test('stop waits for an already started archive commit and retains its backup receipt', { timeout: 5000 }, async () => {
+  const gate = deferred(), began = deferred();
+  const f = fixture({ config: { autoEnabled: false }, github: { enabled: true } });
+  const original = f.dependencies.saveConversation;
+  f.dependencies.saveConversation = async input => { began.resolve(); await gate.promise; return original(input); };
+  f.service = createCollectorService(f.dependencies);
+  await f.service.command({ type: 'collector:start' }, 1); await f.service.pump();
+  const running = f.service.pump(); await began.promise;
+  let done = false;
+  const stopping = f.service.command({ type: 'collector:stop', accountKey }, 1).then(() => { done = true; });
+  await turn(); assert.equal(done, false);
+  await assert.rejects(f.service.command({ type: 'collector:start' }, 1), { code: 'BUSY' });
+  gate.resolve(); await running; await stopping;
+  assert.equal(f.root.entries.size, 1); assert.equal(f.calls.saves.length, 1);
+  assert.equal((await f.service.engine.getState(accountKey)).status, 'stopped');
+  assert.equal((await f.service.engine.getOutbox(accountKey)).length, 1);
+});
+
 const sourceInterruptions = [
   { name: 'tab closure', code: 'SOURCE_UNAVAILABLE',
     interrupt: async f => { f.tabs.splice(0); await f.service.tabGone(1); },

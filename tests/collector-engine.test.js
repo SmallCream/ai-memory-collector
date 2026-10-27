@@ -253,6 +253,45 @@ test('incremental skips archived unchanged older conversations, full backfill re
   assert.equal(full.status, 'completed');
 });
 
+test('stop abandons untouched queue decisions, preserves archives and outbox, and starts a fresh scan after restart', async () => {
+  const f = setup();
+  await f.engine.start({ account, tabId: 1 }); await complete(f.engine);
+  const outbox = await f.engine.getOutbox(account.accountKey);
+  await f.engine.start({ account, tabId: 1, mode: 'full' });
+  await f.engine.tick({ account, tabId: 1 });
+  const prior = await f.engine.getState(account.accountKey);
+  assert.equal(prior.diagnostics.remaining, 2);
+  await f.engine.stop(account.accountKey);
+  const restarted = createCollectorEngine(f.dependencies);
+  assert.equal((await restarted.tick({ account, tabId: 1 })).status, 'stopped');
+  assert.equal((await restarted.resume({ account, tabId: 1 })).status, 'stopped');
+  assert.equal((await restarted.start({ account, tabId: 1, automatic: true })).status, 'stopped');
+  assert.equal((await restarted.getState(account.accountKey)).nextRetryAt, null);
+  assert.deepEqual(await restarted.getOutbox(account.accountKey), outbox);
+  assert.equal(f.local.size, 2);
+  f.calls.details.length = 0;
+  const next = await restarted.start({ account: { ...account, initialized: true }, tabId: 1, mode: 'incremental' });
+  assert.notEqual(next.id, prior.id); assert.equal(next.phase, 'list');
+  const finished = await complete(restarted);
+  assert.equal(finished.status, 'completed'); assert.equal(finished.diagnostics.skipped, 2);
+  assert.deepEqual(f.calls.details, []);
+});
+
+test('stop retains failed delivery obligations even if a complete archive exists', async () => {
+  const f = setup();
+  await f.engine.start({ account, tabId: 1 }); await complete(f.engine);
+  f.setDetailError('HTTP_404');
+  await f.engine.start({ account, tabId: 1, mode: 'full' }); await complete(f.engine);
+  await f.engine.stop(account.accountKey);
+  const stopped = await f.engine.getState(account.accountKey);
+  assert.equal(stopped.status, 'stopped'); assert.equal(stopped.failed, 2);
+  f.advance(25 * 60 * 60_000); f.setDetailError(null); f.calls.details.length = 0;
+  const next = await f.engine.start({ account, tabId: 1 });
+  assert.notEqual(next.id, stopped.id); assert.equal(next.phase, 'list');
+  await complete(f.engine);
+  assert.deepEqual(f.calls.details, ['a', 'b']);
+});
+
 test('unknown and changed timestamps remain eligible for incremental detail collection', async () => {
   const f = setup();
   await f.engine.start({ account, tabId: 1, mode: 'initial' }); await complete(f.engine);

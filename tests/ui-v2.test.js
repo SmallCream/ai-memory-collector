@@ -160,6 +160,30 @@ test('running tasks expose pause and prevent duplicate incremental or full contr
   await app.click('pause-capture'); assert(app.messages.some(x => x.type === 'collector:pause'));
 });
 
+test('stop is available during identity checking and missing directory permission, with explicit account ownership', async () => {
+  const state = initialState(); state.job = { status: 'running' }; state.identityChecking = true;
+  state.directory.granted = false;
+  const app = await setup({ state });
+  assert.equal(app.elements.get('stop-capture').hidden, false);
+  assert.equal(app.elements.get('stop-capture').disabled, false);
+  await app.click('stop-capture');
+  assert.ok(app.messages.some(value => value.type === 'collector:stop' && value.accountKey === state.account.accountKey));
+});
+
+test('stopped jobs offer a new scan instead of resuming the old queue or promising scheduled restart', async () => {
+  const state = initialState(); state.job = { status: 'stopped', nextRetryAt: Date.now() + 60000 };
+  const app = await setup({ state });
+  assert.equal(app.elements.get('resume-capture').hidden, true);
+  assert.equal(app.elements.get('stop-capture').hidden, true);
+  assert.equal(app.elements.get('start-capture').hidden, false);
+  assert.match(app.elements.get('home-heading').textContent, /已停止/);
+  assert.match(app.elements.get('schedule-status').textContent, /重新开始/);
+  assert.equal(app.elements.get('collection-details-status').textContent, '已停止');
+  assert.doesNotMatch(app.elements.get('collection-wait').textContent, /等待重试/);
+  await app.click('start-capture');
+  assert.ok(app.messages.some(value => value.type === 'collector:start' && value.mode === 'incremental'));
+});
+
 test('settings poll updates status without erasing in-progress input', async () => {
   const app = await setup(); await app.click('open-settings');
   app.elements.get('repository').value = 'editing/new-value';

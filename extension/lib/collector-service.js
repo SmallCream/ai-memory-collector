@@ -12,6 +12,7 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
   now = Date.now, later = setTimeout }) {
   const settings = createConfigStore({ getSetting, setSetting });
   const identities = new Map(), syncLocks = new Map(), identityReads = new Map(), accountWork = new Map();
+  const stoppingAccounts = new Set();
   const activity = createActivityLog({ getSetting, setSetting, now });
   let pumping = null, continuation = null, startupError = null, restoring = null, changingDirectory = false;
   let mutationQueue = Promise.resolve();
@@ -127,11 +128,12 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
       } catch (e) { error = safeError(e); }
     } else error = { code: 'SITE_PERMISSION_REQUIRED', message: '请先授权访问 ChatGPT 或豆包，之后会自动识别当前账号。' };
     const account = current?.account || null, directory = await directoryState();
+    const job = account ? await engine.getState(account.accountKey) : null;
     return { config: publicConfig(config), directory, platform: site.platform, siteOrigin: site.origin, siteLabel: site.label,
       identity: current?.identity || null, identityChecking: current?.identityChecking === true, account,
-      job: account ? await engine.getState(account.accountKey) : null,
+      job,
       lastResult: account?.lastResult || null,
-      nextRunAt: config.autoEnabled && account?.enabled ? account.nextRunAt || now() : null,
+      nextRunAt: config.autoEnabled && account?.enabled && job?.status !== 'stopped' ? account.nextRunAt || now() : null,
       githubStatus: account ? await getSetting(`githubStatus:${account.accountKey}`) || { status: 'idle' } : { status: 'idle' },
       assetStatus: account ? await getSetting(`assetStatus:${account.accountKey}`) || null : null,
       assetDiagnostics: account && assetService?.diagnostics ? await assetService.diagnostics({ account,
@@ -417,22 +419,27 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
       'SITE_PERMISSION_DENIED', 'IDENTITY', 'HTTP_401'].includes(job.error?.code) && (await directoryState()).granted) {
       job = await engine.resume({ account, tabId: tab.id });
     }
-    if (job?.status === 'running' && !syncLocks.has(account.accountKey) && await cooldown(account) <= now()) {
+    if (!stoppingAccounts.has(account.accountKey) && job?.status === 'running' && !syncLocks.has(account.accountKey) && await cooldown(account) <= now()) {
       job = await engine.tick({ account, tabId: tab.id });
       await finish(account, job, config);
       if (job?.status === 'running' && (!job.nextRetryAt || job.nextRetryAt <= now())) continueSoon();
-    } else if (config.autoEnabled && (!job || ['completed', 'partial'].includes(job.status)) &&
+    } else if (!stoppingAccounts.has(account.accountKey) && config.autoEnabled && (!job || ['completed', 'partial'].includes(job.status)) &&
         (account.nextRunAt || 0) <= now() && !syncLocks.has(account.accountKey)) {
-      await engine.start({ account, tabId: tab.id, mode: account.initialized ? 'incremental' : 'initial' });
+      await engine.start({ account, tabId: tab.id, mode: account.initialized ? 'incremental' : 'initial', automatic: true });
       continueSoon();
     }
-    if (assetService && (await directoryState()).granted) {
+    job = await engine.getState(account.accountKey);
+    if (!stoppingAccounts.has(account.accountKey) && assetService && (await directoryState()).granted) {
       // Network waits do not own the global file lock. Honor current settings,
       // including a toggle changed while the preceding detail was in flight.
       config = await settings.read();
       const work = await assetService.tick({ directory: await getSetting('directory'), account, tabId: tab.id,
         captureEnabled: config.localAssetsEnabled !== false, networkAllowed: await cooldown(account) <= now(),
-        manualOnly: job?.status === 'paused' });
+        manualOnly: ['paused', 'stopped'].includes(job?.status),
+        // A stop arriving during attachment preparation must prevent the next
+        // network request. Explicit manual work started after stopping is allowed.
+        shouldPause: async () => stoppingAccounts.has(account.accountKey) ||
+          job?.status !== 'stopped' && (await engine.getState(account.accountKey))?.status === 'stopped' });
       if (work.runnable) continueSoon();
     }
     if (job?.status !== 'running') await synchronize(account);
@@ -580,9 +587,27 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
       case 'collector:start': {
         const { account, tab, config } = await context(tabId, true);
         if (!account?.enabled || !config.setupComplete) throw collectorError('SETUP_INCOMPLETE', '请先完成配置并启用此账号。');
+        if (stoppingAccounts.has(account.accountKey)) throw collectorError('BUSY', '正在停止本轮采集，请稍后重新开始。');
         if (!(await directoryState()).granted) throw collectorError('DIRECTORY_PERMISSION', '请在设置中恢复保存目录权限。');
         if (syncLocks.has(account.accountKey)) throw collectorError('BUSY', '正在同步本地文件，请稍后开始采集。');
         await engine.start({ account, tabId: tab.id, mode: message.mode }); continueSoon(); break;
+      }
+      case 'collector:stop': {
+        // Only the trusted panel can select a configured account. Stopping
+        // must still work while login/identity refresh or permissions fail.
+        const account = (await settings.read()).accounts[message.accountKey];
+        if (!account) throw collectorError('ACCOUNT_DISABLED', '当前账号尚未配置。');
+        if (stoppingAccounts.has(account.accountKey)) throw collectorError('BUSY', '正在停止本轮采集。');
+        stoppingAccounts.add(account.accountKey);
+        try {
+          await Promise.all([engine.stop(account.accountKey), (async () => {
+            const job = await engine.getState(account.accountKey);
+            const tabs = new Set([...identities].filter(([, value]) => value.identity.accountKey === account.accountKey).map(([id]) => id));
+            if (Number.isInteger(job?.tabId)) tabs.add(job.tabId);
+            await Promise.allSettled([...tabs].map(id => cancelSource(id, account.accountKey)));
+          })()]);
+        } finally { stoppingAccounts.delete(account.accountKey); }
+        break;
       }
       case 'collector:pause': {
         // Use the most recently verified ownership for cancellation; never wait
@@ -598,6 +623,7 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
       case 'collector:resume': {
         const { account, tab } = await context(tabId, true);
         if (!account?.enabled) throw collectorError('ACCOUNT_DISABLED', '请先启用此账号。');
+        if (stoppingAccounts.has(account.accountKey)) throw collectorError('BUSY', '正在停止本轮采集，请稍后重新开始。');
         if (syncLocks.has(account.accountKey)) throw collectorError('BUSY', '正在同步本地文件，请稍后继续采集。');
         await engine.resume({ account, tabId: tab.id }); continueSoon(); break;
       }
@@ -636,7 +662,7 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
   function command(message, tabId) {
     // Pause signals the current page reader without waiting for the filesystem
     // owner. Its durable job update still uses the engine's per-account lock.
-    if (['collector:get-state', 'collector:pause', 'collector:retry-github'].includes(message.type)) return executeCommand(message, tabId);
+    if (['collector:get-state', 'collector:pause', 'collector:stop', 'collector:retry-github'].includes(message.type)) return executeCommand(message, tabId);
     return exclusive(() => executeCommand(message, tabId));
   }
   return { initialize, command, state, pump, enableTab, identify, engine, withFileLock,
