@@ -244,6 +244,28 @@ test('Doubao legacy interrupted replies without a flag require a later validated
   }
 });
 
+test('Doubao legacy empty interruption objects require a later validated message and retain original state', async () => {
+  const n = native(), m = n.messages[1];
+  Object.assign(m, { status: 1, content_status: 120, content_type: 1, content: '{}', content_block: [] });
+  n.messages.push(message(3));
+  const f = adapterFixture({ pages: [{ messages: [...n.messages].reverse(), has_more: false }] });
+  const detail = await f.detail({});
+  const archive = await buildArchive({ conversation: detail.payload, identity, capturedAt: detail.capturedAt });
+  const stored = JSON.parse(archive.files[0].content).messages[1];
+  assert.equal(stored.status, 1); assert.equal(stored.content_type, 1); assert.equal(stored.content, '{}');
+  assert.equal(stored.ext.is_interrupted, undefined);
+  assert.match(archive.files[1].content, /已结束空中断记录/);
+  for (const mutate of [x => { x.messages.pop(); }, x => { x.messages[2].ext.is_finish = '0'; },
+    x => { x.messages[1].content = '{"text":"not empty"}'; }, x => { x.messages[1].content = '[]'; },
+    x => { x.messages[1].content_type = 9999; }, x => { x.messages[1].ext.is_interrupted = 'false'; },
+    x => { x.messages[1].ext.is_finish = '0'; }, x => { x.messages[1].content_status = 121; },
+    x => { x.messages[1].status = 2; }, x => { x.messages[1].user_type = 1; },
+    x => { x.messages[1].content_block = message(2).content_block; }]) {
+    const invalid = structuredClone(n); mutate(invalid);
+    assert.throws(() => validateDoubaoConversation(invalid), { code: 'PARTIAL_DETAIL' });
+  }
+});
+
 test('Doubao resources use stable IDs across signed URL refreshes and ignore interface images', async () => {
   const n = native();
   n.messages[1].content_block.push({ is_finish: true, content: { image_block: { image_ori: { url: 'https://p-test.byteimg.com/picture.png?signature=private-one', icon_url: 'https://p-test.byteimg.com/icon.png' } } } });

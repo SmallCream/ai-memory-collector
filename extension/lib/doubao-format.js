@@ -25,12 +25,14 @@ export function validateDoubaoConversation(native) {
     // The chain retains empty, explicitly ended interruption records with
     // status=1. Preserve them instead of rejecting the entire conversation.
     if (m.status !== 0 && !(m.status === 1 && m.user_type === 2 && m.content_status === 120 &&
-        m.ext.is_interrupted === 'true' && m.content_type === 9999 &&
-        typeof m.content === 'string' && m.content.trim() === '[]' && blocks.length === 0)) fail();
+        typeof m.content === 'string' && blocks.length === 0 &&
+        (m.ext.is_interrupted === 'true' && m.content_type === 9999 && m.content.trim() === '[]' ||
+          m.content_type === 1 && m.content.trim() === '{}' && !Object.hasOwn(m.ext, 'is_interrupted') &&
+            position < native.messages.length - 1))) fail();
     // Older completed assistant replies can lack is_interrupted. Accept that
     // observed historical shape only when a later message also validates.
     if (!(m.content_status === 0 || m.user_type === 2 && m.content_status === 120 &&
-        (m.ext.is_interrupted === 'true' || m.status === 0 && !Object.hasOwn(m.ext, 'is_interrupted') &&
+        (m.ext.is_interrupted === 'true' || !Object.hasOwn(m.ext, 'is_interrupted') &&
           position < native.messages.length - 1))) fail();
     for (const block of blocks) {
       if (!record(block)) fail();
