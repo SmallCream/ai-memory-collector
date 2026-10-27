@@ -22,7 +22,7 @@ async function pendingWrite({ directory, account, asset, getSetting = defaultGet
   return { key, pending };
 }
 
-export const MAX_ASSET_BYTES = 16 * 1024 * 1024;
+export const MAX_ASSET_BYTES = 32 * 1024 * 1024;
 export const ASSET_EXTENSIONS = 'png|jpg|gif|webp|avif|bin|zip|gz|tgz|pdf|docx|xlsx|pptx|txt|md|csv|tsv|json|js|mjs|cjs|ts|tsx|jsx|py|css|yaml|yml|sql|sh|ps1|xml|log';
 export const isSupportedAssetExtension = value => new RegExp(`^(?:${ASSET_EXTENSIONS})$`).test(value);
 export function assetPath(account, oid, extension = 'bin') {
@@ -121,7 +121,7 @@ export function imageExtension(bytes) {
  * Office formats; filenames alone never turn an HTML response into a ZIP/PDF.
  */
 export function inspectAttachmentBytes(bytes, hint = {}) {
-  if (!(bytes instanceof Uint8Array) || !bytes.length || bytes.length > 16 * 1024 * 1024) return null;
+  if (!(bytes instanceof Uint8Array) || !bytes.length || bytes.length > 32 * 1024 * 1024) return null;
   const mime = String(hint.mimeType || '').split(';')[0].trim().toLowerCase();
   const extension = /\.([a-z0-9]+)$/i.exec(String(hint.fileName || ''))?.[1]?.toLowerCase();
   const neutral = !mime || mime === 'application/octet-stream' || mime === 'binary/octet-stream';

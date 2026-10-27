@@ -412,8 +412,22 @@ test('Doubao image 403 refreshes only the bound original URI, preserving existin
       { fetchImpl: async () => new Response(jpeg, { headers: { 'content-type': 'image/jpeg' } }) });
     await unchanged.resolve({ tabId: 1, account, conversationId: cid, asset });
     const oversized = createDoubaoAssetResolver(browser, adapter, { fetchImpl: async url => url === source
-      ? new Response('', { status: 403 }) : new Response(new Uint8Array(16 * 1024 * 1024 + 1)) });
+      ? new Response('', { status: 403 }) : new Response(new Uint8Array(32 * 1024 * 1024 + 1)) });
     await assert.rejects(oversized.resolve({ tabId: 1, account, conversationId: cid, asset }), { code: 'ASSET_SIZE' });
+  }
+});
+
+test('Doubao accepts 20 MiB images and still rejects streams above 32 MiB', async () => {
+  const n = native(); n.messages[0].content_block.push({ is_finish: true, content: { image_block: { url: 'https://p-test.byteimg.com/large.png' } } });
+  const [asset] = await extractAssets(n);
+  for (const size of [20 * 1024 * 1024, 32 * 1024 * 1024 + 1]) {
+    const bytes = new Uint8Array(size); bytes.set([137, 80, 78, 71, 13, 10, 26, 10]);
+    const resolver = createDoubaoAssetResolver({ permissions: { contains: async () => true } },
+      { detail: async () => ({ payload: n }), identify: async () => identity },
+      { fetchImpl: async () => new Response(bytes, { headers: { 'content-type': 'image/png' } }) });
+    const pending = resolver.resolve({ tabId: 1, account, conversationId: cid, asset });
+    if (size > 32 * 1024 * 1024) await assert.rejects(pending, { code: 'ASSET_SIZE' });
+    else assert.deepEqual((await pending).bytes, bytes);
   }
 });
 

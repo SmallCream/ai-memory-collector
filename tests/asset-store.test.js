@@ -103,6 +103,19 @@ test('PowerShell attachments preserve UTF8 bytes and reject HTML or binary respo
   await writeLocalAsset(value);
   assert.deepEqual(await verifiedLocalAsset(value), bytes);
 });
+
+test('32 MiB attachment boundary accepts and stores files above the previous 16 MiB limit', async () => {
+  assert.equal(MAX_ASSET_BYTES, 32 * 1024 * 1024);
+  const bytes = new Uint8Array(20 * 1024 * 1024).fill(97);
+  assert.equal(assetExtension(bytes, { fileName: 'large.txt', mimeType: 'text/plain' }), 'txt');
+  const fs = memoryBinaryFs(), value = await input(fs, bytes);
+  value.asset.localPath = assetPath(account, value.asset.oid, 'txt');
+  await writeLocalAsset(value);
+  assert.equal((await verifiedLocalAsset(value)).byteLength, bytes.byteLength);
+  const edge = new Uint8Array(MAX_ASSET_BYTES).fill(97);
+  assert.equal(inspectAttachmentBytes(edge, { fileName: 'edge.txt' }).extension, 'txt');
+  assert.equal(inspectAttachmentBytes(new Uint8Array(MAX_ASSET_BYTES + 1), { fileName: 'oversize.txt' }), null);
+});
 const OFFICE = {
   docx: 'UEsDBBQAAAAAAIaLVl3HHBc8CAAAAAgAAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbDxUeXBlcy8+UEsDBBQAAAAAAIaLVl2fm+xuBwAAAAcAAAARAAAAd29yZC9kb2N1bWVudC54bWxleGFtcGxlUEsBAhQDFAAAAAAAhotWXcccFzwIAAAACAAAABMAAAAAAAAAAAAAAIABAAAAAFtDb250ZW50X1R5cGVzXS54bWxQSwECFAMUAAAAAACGi1Zdn5vsbgcAAAAHAAAAEQAAAAAAAAAAAAAAgAE5AAAAd29yZC9kb2N1bWVudC54bWxQSwUGAAAAAAIAAgCAAAAAbwAAAAAA',
   xlsx: 'UEsDBBQAAAAAAIaLVl3HHBc8CAAAAAgAAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbDxUeXBlcy8+UEsDBBQAAAAAAIaLVl2fm+xuBwAAAAcAAAAPAAAAeGwvd29ya2Jvb2sueG1sZXhhbXBsZVBLAQIUAxQAAAAAAIaLVl3HHBc8CAAAAAgAAAATAAAAAAAAAAAAAACAAQAAAABbQ29udGVudF9UeXBlc10ueG1sUEsBAhQDFAAAAAAAhotWXZ+b7G4HAAAABwAAAA8AAAAAAAAAAAAAAIABOQAAAHhsL3dvcmtib29rLnhtbFBLBQYAAAAAAgACAH4AAABtAAAAAAA=',

@@ -60,8 +60,9 @@ const definitions = [
   ['ASSET_INPUT', 'input_message_invalid', '附件来源消息标识不合法。', ['附件来源消息标识不合法。']],
   ['ASSET_INPUT', 'input_source_invalid', '附件来源标识缺失、不合法或不一致。', ['附件来源标识不合法或不一致。', '图片来源标识不合法或不一致。']],
   ['ASSET_INPUT', 'input_hash_invalid', '附件哈希格式无效。', ['附件哈希格式无效。', '图片哈希格式无效。']],
-  ['ASSET_INPUT', 'input_limit_invalid', '附件大小上限配置无效，应介于 1 字节和 16 MiB。',
-    ['附件大小上限必须介于 1 字节和 16 MiB。', '图片大小上限必须介于 1 字节和 16 MiB。']],
+  ['ASSET_INPUT', 'input_limit_invalid', '附件大小上限配置无效，应介于 1 字节和 32 MiB。',
+    ['附件大小上限必须介于 1 字节和 32 MiB。', '图片大小上限必须介于 1 字节和 32 MiB。',
+      '附件大小上限必须介于 1 字节和 16 MiB。', '图片大小上限必须介于 1 字节和 16 MiB。']],
   ['ASSET_INPUT', 'input_conversation_invalid', '附件所属对话标识不合法。', ['附件所属对话标识不合法。', '图片所属对话标识不合法。']],
   ['ASSET_INPUT', 'input_context_invalid', '附件请求缺少有效账号和资源信息。', ['附件请求缺少有效账号和资源信息。', '图片请求缺少有效账号和资源信息。']],
   ['ASSET_INPUT', 'input_parameters_invalid', '附件请求参数不合法。', ['附件请求参数不合法。', '图片请求参数不合法。']],
@@ -107,7 +108,7 @@ export function sanitizeAssetFailureDiagnostics(value) {
     if (Number.isSafeInteger(entry.httpStatus) && entry.httpStatus >= 100 && entry.httpStatus <= 599) item.httpStatus = entry.httpStatus;
     if (typeof entry.mimeType === 'string') item.mimeType = mimeTypes.has(entry.mimeType) ? entry.mimeType : 'unknown';
     if (detectedTypes.has(entry.detectedType)) item.detectedType = entry.detectedType;
-    if (Number.isSafeInteger(entry.byteLength) && entry.byteLength >= 0 && entry.byteLength <= 16 * 1024 * 1024) item.byteLength = entry.byteLength;
+    if (Number.isSafeInteger(entry.byteLength) && entry.byteLength >= 0 && entry.byteLength <= 32 * 1024 * 1024) item.byteLength = entry.byteLength;
     const reason = byReason.get(entry.reason);
     if (reason && reason.code === item.code) item.reason = entry.reason;
     output.push(item);

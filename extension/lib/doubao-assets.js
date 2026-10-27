@@ -60,7 +60,7 @@ export function createDoubaoAssetResolver(browser, adapter, { fetchImpl = global
         }
         const reader = response.body.getReader(), chunks = []; let length = 0;
         try { for (;;) { const { done, value } = await reader.read(); if (done) break;
-          length += value.byteLength; if (length > MAX_ASSET_BYTES) fail('ASSET_SIZE', '豆包附件超过 16 MiB 上限。'); chunks.push(value); }
+          length += value.byteLength; if (length > MAX_ASSET_BYTES) fail('ASSET_SIZE', '豆包附件超过 32 MiB 上限。'); chunks.push(value); }
         } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
         const bytes = new Uint8Array(length); let offset = 0;
         for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }

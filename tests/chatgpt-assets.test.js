@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
-import { createChatGPTAssetResolver, probeChatGPTAsset, validateExternalAsset } from '../extension/lib/chatgpt-assets.js';
+import { createChatGPTAssetResolver, probeChatGPTAsset, validateExternalAsset, DEFAULT_ASSET_LIMIT } from '../extension/lib/chatgpt-assets.js';
 import { extractAssets } from '../extension/lib/assets.js';
 import { assetFailureReason } from '../extension/lib/asset-failure.js';
 
@@ -39,7 +39,7 @@ function harness({ serve = () => pngResponse(), sessions = ['synthetic-user-A'],
     } });
   const fn = vm.runInContext(`(${probeChatGPTAsset.toString()})`, context);
   return { calls, run: overrides => fn({ expectedAccountKey: ACCOUNT, asset: { ...asset }, allowLibraryDownload: true,
-    maxBytes: 16 * 1024 * 1024, ...overrides }) };
+    maxBytes: DEFAULT_ASSET_LIMIT, ...overrides }) };
 }
 
 function browserFor(h, { tabs, mutate } = {}) {
@@ -53,6 +53,35 @@ function browserFor(h, { tabs, mutate } = {}) {
     return [{ frameId: 0, result: mutate ? mutate(result) : result }];
   } } };
 }
+
+test('ChatGPT serialized downloads and public validation accept 20 MiB and enforce the 32 MiB ceiling', async () => {
+  assert.equal(DEFAULT_ASSET_LIMIT, 32 * 1024 * 1024);
+  const bytes = new Uint8Array(20 * 1024 * 1024); bytes.set(PNG);
+  const h = harness({ serve: () => pngResponse(bytes) });
+  const result = await createChatGPTAssetResolver(browserFor(h), { allowLibraryDownload: true }).resolve({
+    tabId: 1, account: ACCOUNT, asset: { ...asset, size: bytes.length }, conversationId });
+  assert.deepEqual(result.bytes, bytes);
+  assert.throws(() => createChatGPTAssetResolver(browserFor(h), { maxBytes: DEFAULT_ASSET_LIMIT + 1 }), { code: 'ASSET_INPUT' });
+  const rejected = await h.run({ maxBytes: DEFAULT_ASSET_LIMIT + 1 });
+  assert.equal(rejected.error.code, 'ASSET_INPUT');
+  const browser = { permissions: { contains: async () => true } };
+  const external = await validateExternalAsset({ url: 'https://downloads.example.org/large.png', browser,
+    asset: { kind: 'image' }, fetchImpl: async () => pngResponse(bytes) });
+  assert.equal(external.status, 'external'); assert.equal(external.byteLength, bytes.length);
+  assert.equal(external.sha256, await hash(bytes)); assert.equal(external.bytes, undefined);
+});
+
+test('default gzip validation accepts expanded 20 MiB and rejects expanded data above 32 MiB', async () => {
+  const { gzipSync } = await import('node:zlib');
+  for (const size of [20 * 1024 * 1024, 32 * 1024 * 1024 + 1]) {
+    const bytes = gzipSync(new Uint8Array(size).fill(97));
+    const result = await validateExternalAsset({ url: 'https://downloads.example.org/large.gz',
+      browser: { permissions: { contains: async () => true } }, asset: { kind: 'attachment', fileName: 'large.gz' },
+      fetchImpl: async () => new Response(bytes, { headers: { 'content-type': 'application/gzip' } }) });
+    if (size > DEFAULT_ASSET_LIMIT) assert.equal(result.reason, 'too-large');
+    else assert.equal(result.status, 'external');
+  }
+});
 
 test('serialized failures distinguish unknown headers, unsupported image signatures and MIME mismatches without accepting any', async t => {
   const avif = new Uint8Array([0, 0, 0, 16, 102, 116, 121, 112, 97, 118, 105, 102, 0, 0, 0, 0]);
@@ -263,7 +292,7 @@ test('file download preserves errors and byte/account constraints when the DOM h
     const h = harness({ sessions: value.sessions, serve: (_, options) => options.redirect === 'manual' ? { type: 'opaqueredirect' } :
       locatedResponse((value.response || pngResponse)(), estuaryURL) });
     const result = await h.run({ asset: { ...asset, libraryFileId: null, ...value.source },
-      conversationId, allowFileDownload: true, maxBytes: value.maxBytes || 16 * 1024 * 1024 });
+      conversationId, allowFileDownload: true, maxBytes: value.maxBytes || DEFAULT_ASSET_LIMIT });
     assert.equal(result.error.code, value.code); assert.equal(result.binary, undefined);
     if (value.noDownload) assert.deepEqual(h.calls.map(call => call.url), [sessionURL]);
     assert.doesNotMatch(JSON.stringify(result), /https:\/\/|synthetic-.*secret/);
@@ -525,7 +554,7 @@ test('Library follow retains size, original-image and final account gates', asyn
   ]) await t.test(`${new URL(destination).pathname}: ${value.name}`, async () => {
     const h = harness({ sessions: value.sessions, serve: (_, options) => options.redirect === 'manual' ? { type: 'opaqueredirect' } :
       locatedResponse((value.response || pngResponse)(), destination) });
-    const result = await h.run({ asset: value.source || { ...asset }, maxBytes: value.maxBytes || 16 * 1024 * 1024 });
+    const result = await h.run({ asset: value.source || { ...asset }, maxBytes: value.maxBytes || DEFAULT_ASSET_LIMIT });
     assert.equal(result.error.code, value.code); assert.equal(result.binary, undefined);
   });
 });

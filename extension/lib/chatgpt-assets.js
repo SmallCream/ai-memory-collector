@@ -1,9 +1,9 @@
-import { assetExtension, inspectAttachmentBytes } from './asset-store.js';
+import { assetExtension, inspectAttachmentBytes, MAX_ASSET_BYTES } from './asset-store.js';
 import { createRequestControl, CollectorRequestCancelledError, safeRetryAfter } from './detail-request-lifetime.js';
 import { sanitizeAssetFailureDiagnostics } from './asset-failure.js';
 
 /** Read-only attachment retrieval. No download URL or session credential leaves the page. */
-export const DEFAULT_ASSET_LIMIT = 16 * 1024 * 1024;
+export const DEFAULT_ASSET_LIMIT = MAX_ASSET_BYTES;
 const ACCOUNT = /^acct-[a-f0-9]{24}$/;
 const FILE = /^file[-_][A-Za-z0-9_-]{1,160}$/;
 const LIBRARY = /^libfile_[A-Za-z0-9_-]{1,160}$/;
@@ -72,7 +72,7 @@ export function createChatGPTAssetResolver(browser, { allowLibraryDownload = fal
   maxBytes = DEFAULT_ASSET_LIMIT } = {}) {
   const requests = createRequestControl(() => browser ?? globalThis.chrome);
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > DEFAULT_ASSET_LIMIT) {
-    failure('ASSET_INPUT', '附件大小上限必须介于 1 字节和 16 MiB。', 'unavailable');
+    failure('ASSET_INPUT', '附件大小上限必须介于 1 字节和 32 MiB。', 'unavailable');
   }
   async function resolve({ tabId, account, asset, conversationId }) {
     const api = browser ?? globalThis.chrome;
@@ -266,7 +266,7 @@ export async function probeChatGPTAsset(request) {
     if (['COLLECTION_PAUSED', 'HTTP_429', 'HTTP_503'].includes(error?.code)) throw error;
     return error;
   };
-  const maxAllowed = 16 * 1024 * 1024;
+  const maxAllowed = 32 * 1024 * 1024;
   const diagnostics = [];
   let currentDiagnostic = null;
   const safeMimes = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp', 'image/avif', 'image/heif', 'image/heic',

@@ -180,7 +180,7 @@ test('response diagnostics retain only safe bounded source observations and reje
     httpStatus: 200, mimeType: 'image/jpeg', detectedType: 'png', byteLength: 1024,
     url: secret, headers: { authorization: secret }, body: secret, message: secret },
   { route: 'visible-image', code: secret, reason: secret, httpStatus: 999,
-    mimeType: `image/png; secret=${secret}`, detectedType: secret, byteLength: 16 * 1024 * 1024 + 1 },
+    mimeType: `image/png; secret=${secret}`, detectedType: secret, byteLength: 32 * 1024 * 1024 + 1 },
   { route: secret, code: 'ASSET_FORMAT', mimeType: 'image/png', byteLength: 10 },
   { route: 'library-download', code: 'HTTP_403', reason: 'format_html_response', httpStatus: 403,
     mimeType: 'missing', detectedType: 'not-read', byteLength: 0 }];
@@ -209,8 +209,8 @@ test('response diagnostics cap observations at five and reject malformed numbers
     assert.equal(item.httpStatus, undefined);
     assert.equal(item.byteLength, undefined);
   }
-  const [maximum] = sanitizeAssetFailureDiagnostics([{ route: 'interpreter-download', code: 'ASSET_FORMAT', byteLength: 16 * 1024 * 1024 }]);
-  assert.equal(maximum.byteLength, 16 * 1024 * 1024);
+  const [maximum] = sanitizeAssetFailureDiagnostics([{ route: 'interpreter-download', code: 'ASSET_FORMAT', byteLength: 32 * 1024 * 1024 }]);
+  assert.equal(maximum.byteLength, 32 * 1024 * 1024);
 });
 
 test('response summaries use Chinese fixed labels and omit unrecognized text at the UI boundary', () => {
