@@ -21,7 +21,7 @@ function background({ command, open } = {}) {
     async enableTab(tab) { calls.push(['enableTab', { ...tab }]); },
     async identify(tab, force) { calls.push(['identify', tab.id, force]); },
     async tabGone(id) { calls.push(['tabGone', id]); },
-    async state() { calls.push(['state']); return { tabId: 5 }; },
+    async state(...args) { calls.push(['state', ...args]); return { tabId: 5 }; },
     async command(message, tabId) { calls.push(['command', { ...message }, tabId]); return command ? command(message, tabId) : { ok: true, state: { config: { hasToken: true } } }; },
     async contentState(tabId) { calls.push(['contentState', tabId]); return { ok: true, status: 'idle', label: '采集器' }; },
   };
@@ -222,4 +222,18 @@ test('manifest exposes no external messages, executable remote code or web-acces
   assert.ok(!manifest.permissions.includes('debugger'));
   assert.ok(!manifest.content_security_policy.extension_pages.includes('unsafe-eval'));
   assert.match(manifest.content_security_policy.extension_pages, /script-src 'self';/);
+});
+
+
+test('source navigation, reload and activation explicitly recheck identity; alarms only pump', async () => {
+  const app = background(); await tick(); app.calls.length = 0;
+  for (const change of [{ url: 'https://www.doubao.com/chat/new' }, { status: 'complete' }]) {
+    app.events.updated(5, change, { id: 5, url: 'https://www.doubao.com/chat/new' }); await tick();
+    assert.ok(app.calls.some(call => call[0] === 'state' && call[1] === 5 && call[2].refreshIdentity === true));
+    app.calls.length = 0;
+  }
+  app.events.activated({ tabId: 5 }); await tick();
+  assert.ok(app.calls.some(call => call[0] === 'state' && call[1] === 5 && call[2].refreshIdentity === true));
+  app.calls.length = 0; app.events.alarm({ name: 'collector-work' }); await tick();
+  assert.deepEqual(app.calls, [['pump']]);
 });

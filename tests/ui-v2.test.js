@@ -84,7 +84,7 @@ async function setup(options = {}) {
   const run = script.replace(/^import .*;\n/gm, '');
   await vm.runInContext(`(async()=>{${run}\n})()`, context);
   return { elements, messages, events, permissionRequests, state: () => state, setState: value => { state = value; }, context,
-    click: id => elements.get(id).click(), poll: () => intervalCallbacks[0]() };
+    focus: () => windowListeners.get('focus')(), click: id => elements.get(id).click(), poll: () => intervalCallbacks[0]() };
 }
 
 test('current account identity is plain text and initialized home has incremental and full actions', async () => {
@@ -1028,4 +1028,14 @@ test('wizard cannot announce a verified connection without repository credential
   assert.equal(app.elements.get('wizard-next-2').disabled, true);
   assert.match(app.elements.get('global-status').textContent, /仓库与 Token/);
   assert(!app.messages.some(x => x.type === 'collector:github-config'));
+});
+
+
+test('opening and refocusing the panel request identity refresh but passive polling does not', async () => {
+  const app = await setup();
+  assert.equal(app.messages.find(message => message.type === 'collector:get-state').refreshIdentity, true);
+  await app.poll();
+  assert.equal(app.messages.at(-1).refreshIdentity, false);
+  app.focus(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.messages.at(-1).refreshIdentity, true);
 });

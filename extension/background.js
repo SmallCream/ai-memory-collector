@@ -98,12 +98,13 @@ chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === ALARM_NAME) igno
 chrome.tabs.onUpdated.addListener((id, change, tab) => {
   if (change.url || change.status === 'complete') ignore(service.enableTab(tab).then(async () => {
     if (change.url && !adapterForUrl(change.url)) await service.tabGone(id);
+    else if (adapterForUrl(tab.url)) await service.state(id, { refreshIdentity: true });
     await service.pump();
   }));
 });
 chrome.tabs.onActivated.addListener(info => ignore(chrome.tabs.get(info.tabId).then(async tab => {
   await service.enableTab(tab);
-  if (adapterForUrl(tab.url)) await service.identify(tab, true).catch(() => {});
+  if (adapterForUrl(tab.url)) await service.state(tab.id, { refreshIdentity: true }).catch(() => {});
   await service.pump();
 })));
 chrome.tabs.onRemoved.addListener(id => ignore(service.tabGone(id)));

@@ -12,6 +12,7 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
   now = Date.now, later = setTimeout }) {
   const settings = createConfigStore({ getSetting, setSetting });
   const identities = new Map(), syncLocks = new Map(), identityReads = new Map(), accountWork = new Map();
+  const identityErrors = new Map();
   const stoppingAccounts = new Set();
   const activity = createActivityLog({ getSetting, setSetting, now });
   let pumping = null, continuation = null, startupError = null, restoring = null, changingDirectory = false;
@@ -82,9 +83,11 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
         if (waitForPause) await paused; else void paused.catch(() => {});
       }
       identities.set(tab.id, { at: now(), identity });
+      identityErrors.delete(tab.id);
       return identity;
     } catch (error) {
       identities.delete(tab.id);
+      identityErrors.set(tab.id, error);
       if (cached?.identity.accountKey) {
         const interrupted = (await engine.getState(cached.identity.accountKey))?.status === 'running';
         await cancelSource(tab.id, cached.identity.accountKey);
@@ -102,7 +105,7 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
     const identity = await identify(tab, force), config = await settings.read();
     return { tab, identity, account: config.accounts[identity.accountKey], config };
   }
-  async function state(tabId) {
+  async function state(tabId, { refreshIdentity = false } = {}) {
     const config = await settings.read();
     let current = null, error = startupError;
     const selectedTab = await sourceTab(tabId).catch(() => null);
@@ -112,17 +115,19 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
         const tab = selectedTab;
         if (!tab) throw collectorError('TAB_UNAVAILABLE', '请打开并登录 ChatGPT 或豆包，插件会自动识别。');
         const cached = identities.get(tab.id);
-        if (cached && (now() - cached.at >= 10000 || identityReads.has(tab.id))) {
-          // Polling remains observable while identity verification or an older
-          // account's paused tick is waiting. The UI labels this cached identity.
+        if (!refreshIdentity && !cached && identityErrors.has(tab.id)) throw identityErrors.get(tab.id);
+        if (!cached || refreshIdentity || identityReads.has(tab.id)) {
+          // Passive UI polling never expires a confirmed identity. Explicit
+          // page/panel events revalidate without blocking progress reads.
           if (!identityReads.has(tab.id)) {
             const check = identify(tab, true, false);
             identityReads.set(tab.id, check);
             void check.catch(() => {}).finally(() => { if (identityReads.get(tab.id) === check) identityReads.delete(tab.id); });
           }
-          current = { tab, identity: cached.identity, account: config.accounts[cached.identity.accountKey], identityChecking: true };
+          const identity = cached?.identity || await identityReads.get(tab.id);
+          current = { tab, identity, account: config.accounts[identity.accountKey], identityChecking: Boolean(cached) };
         } else {
-          const identity = await identify(tab, false, false);
+          const identity = cached.identity;
           current = { tab, identity, account: config.accounts[identity.accountKey] };
         }
       } catch (e) { error = safeError(e); }
@@ -477,10 +482,21 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
       if (changingDirectory) return [];
       if (restoring) return [restoring];
       const seen = new Set(), work = [];
+      const discoveryConfig = await settings.read();
       for (const site of platformSites) if (await browser.permissions.contains({ origins: [`${site.origin}/*`] })) {
         const tabs = await browser.tabs.query({ url: `${site.origin}/*` });
         await Promise.allSettled(tabs.sort((a, b) => Number(b.active) - Number(a.active)).map(async tab => {
-          const identity = await identify(tab);
+          const cached = identities.get(tab.id)?.identity;
+          const account = cached && discoveryConfig.accounts[cached.accountKey];
+          const job = account && await engine.getState(account.accountKey);
+          // Idle alarms may maintain local files/backups without a source probe.
+          // Active/recovering collection and due scans still verify ownership;
+          // engine and attachment resolvers independently verify before writes.
+          const needsSource = account?.enabled && discoveryConfig.setupComplete &&
+            (['running', 'blocked'].includes(job?.status) || discoveryConfig.autoEnabled &&
+              (!job || ['completed', 'partial'].includes(job.status)) && (account.nextRunAt || 0) <= now());
+          const identity = identityReads.has(tab.id) ? await identityReads.get(tab.id) :
+            !cached || needsSource ? await identify(tab) : cached;
           if (seen.has(identity.accountKey)) return;
           seen.add(identity.accountKey);
           if (restoring || changingDirectory) return;
@@ -544,7 +560,7 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
   }
   async function executeCommand(message, tabId) {
     switch (message.type) {
-      case 'collector:get-state': return { ok: true, state: await state(tabId) };
+      case 'collector:get-state': return { ok: true, state: await state(tabId, { refreshIdentity: message.refreshIdentity === true }) };
       case 'collector:bind': await bind(message.alias, tabId); break;
       case 'collector:configure': await configure(message); break;
       case 'collector:directory-changed': await replaceDirectory(); break;
@@ -669,6 +685,7 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
     async tabGone(tabId) {
       const cached = identities.get(tabId);
       identities.delete(tabId);
+      identityErrors.delete(tabId);
       if (cached?.identity.accountKey) {
         const interrupted = (await engine.getState(cached.identity.accountKey))?.status === 'running';
         await cancelSource(tabId, cached.identity.accountKey);

@@ -19,6 +19,7 @@ let stateRevision = 0;
 let activeAliasKey = null;
 let externalImagePermission = false;
 let refreshPending = null;
+let refreshChecksIdentity = false;
 const renderedLists = new Map();
 const runningStatuses = new Set(['running', 'scanning', 'collecting', 'saving', 'syncing']);
 const pausedStatuses = new Set(['paused', 'blocked', 'waiting', 'retrying', 'interrupted', 'waiting-source', 'waiting-permission', 'partial']);
@@ -623,9 +624,9 @@ function render() {
   }
   if (!started) { started = true; window.dispatchEvent(new Event('collector:ready')); }
 }
-async function readState() {
+async function readState(refreshIdentity = false) {
   const revision = ++stateRevision;
-  const reply = await chrome.runtime.sendMessage({ type: 'collector:get-state', ...(sourceTabId === null ? {} : { tabId: sourceTabId }) });
+  const reply = await chrome.runtime.sendMessage({ type: 'collector:get-state', refreshIdentity, ...(sourceTabId === null ? {} : { tabId: sourceTabId }) });
   if (!reply?.ok) throw errorObject(reply?.error || '暂时无法读取后台状态。');
   if (revision !== stateRevision) return;
   if (chrome.permissions.contains) {
@@ -636,10 +637,11 @@ async function readState() {
   current = reply.state;
   render();
 }
-function refresh() {
-  if (refreshPending) return refreshPending;
+function refresh(refreshIdentity = false) {
+  if (refreshPending) return refreshIdentity && !refreshChecksIdentity ? refreshPending.then(() => refresh(true)) : refreshPending;
+  refreshChecksIdentity = refreshIdentity;
   let timer;
-  const request = readState();
+  const request = readState(refreshIdentity);
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => {
       stateRevision++; // A late response must not overwrite a newer read or command.
@@ -649,8 +651,8 @@ function refresh() {
   refreshPending = Promise.race([request, timeout]).finally(() => { clearTimeout(timer); refreshPending = null; });
   return refreshPending;
 }
-function refreshProgress() {
-  return refresh().then(() => {
+function refreshProgress(refreshIdentity = false) {
+  return refresh(refreshIdentity).then(() => {
     for (const id of ['collection-connection', 'transfer-connection']) { text(id, ''); show(id, false); }
   }).catch(error => {
     for (const id of ['collection-connection', 'transfer-connection']) {
@@ -801,9 +803,9 @@ for (const id of ['wizard-repository', 'wizard-branch', 'wizard-token', 'wizard-
 for (const id of ['repository', 'branch', 'github-token', 'github-enabled', 'github-auto-restore']) {
   $(id).addEventListener('input', () => { render(); });
 }
-window.addEventListener('focus', () => { refreshProgress(); });
-document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshProgress(); });
+window.addEventListener('focus', () => { refreshProgress(true); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshProgress(true); });
 const poll = setInterval(() => { if (!document.hidden) return refreshProgress(); }, 3000);
 window.addEventListener('pagehide', () => clearInterval(poll), { once: true });
-try { directory = await getSetting('directory'); await refresh(); feedback(''); }
+try { directory = await getSetting('directory'); await refresh(true); feedback(''); }
 catch (error) { feedback(safeMessage(error), true); window.dispatchEvent(new Event('collector:ready')); }

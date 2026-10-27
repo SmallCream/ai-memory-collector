@@ -170,12 +170,12 @@ test('get-state shows actual GitHub request progress while the writer owns the c
   assert.equal((await f.service.state(1)).activity.github.current.status, 'success');
 });
 
-test('stale identity checks do not block progress reads and are labelled until the new account is confirmed', async () => {
+test('explicit identity checks do not block progress reads and are labelled until the new account is confirmed', async () => {
   const f = fixture(); await f.service.state(1); f.advance(11000);
   const gate = deferred(); let checks = 0;
   const changed = { platform: 'chatgpt', accountKey: 'acct-new', displayName: 'Other account' };
   f.dependencies.adapter.identify = async () => { checks++; await gate.promise; return changed; };
-  const pending = await f.service.state(1);
+  const pending = (await f.service.command({ type: 'collector:get-state', refreshIdentity: true }, 1)).state;
   assert.equal(pending.identity.accountKey, accountKey); assert.equal(pending.identityChecking, true);
   await f.service.state(1); assert.equal(checks, 1);
   gate.resolve(); await turn();
@@ -814,4 +814,76 @@ test('journals belonging to another directory do not block a clean directory swi
   f.store.set('directoryCandidate', candidate);
   await f.service.command({ type: 'collector:directory-changed' }, 1);
   assert.equal(f.store.get('directory'), candidate);
+});
+
+
+test('idle panel, floating entry and alarms reuse identity across thirty minutes', async () => {
+  const f = fixture({ config: { autoEnabled: false } });
+  let checks = 0; const identify = f.dependencies.adapter.identify;
+  f.dependencies.adapter.identify = async (...args) => { checks++; return identify(...args); };
+  await f.service.state(1);
+  for (let minute = 0; minute < 30; minute++) {
+    f.advance(60000);
+    const state = await f.service.state(1);
+    assert.equal(state.identityChecking, false); assert.equal(state.identity.accountKey, accountKey);
+    await f.service.contentState(1); await f.service.pump();
+  }
+  assert.equal(checks, 1); assert.equal(f.calls.lists, 0); assert.equal(f.calls.details, 0);
+});
+
+test('scheduled collection verifies identity when due, not on intervening idle alarms', async () => {
+  const f = fixture({ config: { accounts: { [accountKey]: { ...account, nextRunAt: 2_000_000_120_000 } } } });
+  let checks = 0; const identify = f.dependencies.adapter.identify;
+  f.dependencies.adapter.identify = async (...args) => { checks++; return identify(...args); };
+  await f.service.state(1); f.advance(60000); await f.service.pump();
+  assert.equal(checks, 1); assert.equal(await f.service.engine.getState(accountKey), null);
+  f.advance(60000); await f.service.pump();
+  assert.ok(checks > 1); assert.equal((await f.service.engine.getState(accountKey)).status, 'running');
+});
+
+test('idle failed identity does not retry on every UI poll and explicit refresh recovers', async () => {
+  const f = fixture({ config: { autoEnabled: false } });
+  let checks = 0; const identify = f.dependencies.adapter.identify;
+  f.dependencies.adapter.identify = async (...args) => { checks++; return identify(...args); };
+  const identity = f.identities.get(1); f.identities.delete(1);
+  assert.equal((await f.service.state(1)).error.code, 'HTTP_401');
+  for (let n = 0; n < 10; n++) { f.advance(3000); await f.service.state(1); await f.service.contentState(1); }
+  assert.equal(checks, 1);
+  f.identities.set(1, identity);
+  const recovered = await f.service.state(1, { refreshIdentity: true });
+  assert.equal(recovered.identity.accountKey, accountKey); assert.equal(checks, 2);
+});
+
+test('manual collection rejects an unbound account even while the idle UI has the old identity', async () => {
+  const f = fixture({ config: { autoEnabled: false } }); await f.service.state(1);
+  f.identities.set(1, { platform: 'chatgpt', accountKey: 'acct-new', displayName: 'Other' });
+  assert.equal((await f.service.state(1)).identity.accountKey, accountKey);
+  await assert.rejects(f.service.command({ type: 'collector:start', mode: 'incremental' }, 1), { code: 'SETUP_INCOMPLETE' });
+  assert.equal(f.calls.lists, 0); assert.equal(f.calls.saves.length, 0);
+});
+
+test('identity switching after detail still prevents writes with a warm service cache', async () => {
+  const f = fixture(); const detail = f.dependencies.adapter.detail;
+  f.dependencies.adapter.detail = async (...args) => {
+    const result = await detail(...args);
+    f.identities.set(1, { platform: 'chatgpt', accountKey: 'acct-new' });
+    return result;
+  };
+  await f.service.pump(); await f.service.pump(); await f.service.pump();
+  assert.equal(f.calls.details, 1); assert.equal(f.calls.saves.length, 0);
+  assert.equal((await f.service.engine.getState(accountKey)).status, 'paused');
+  assert.equal((await f.service.engine.getOutbox(accountKey)).length, 0);
+});
+
+
+test('paused and stopped jobs do not trigger identity polling from idle alarms', async () => {
+  for (const status of ['paused', 'stopped']) {
+    const f = fixture(); await f.service.pump();
+    if (status === 'paused') await f.service.engine.pause(accountKey);
+    else await f.service.engine.stop(accountKey);
+    let checks = 0; const identify = f.dependencies.adapter.identify;
+    f.dependencies.adapter.identify = async (...args) => { checks++; return identify(...args); };
+    for (let n = 0; n < 3; n++) { f.advance(60000); await f.service.pump(); await f.service.state(1); }
+    assert.equal(checks, 0); assert.equal((await f.service.engine.getState(accountKey)).status, status);
+  }
 });
