@@ -106,7 +106,7 @@ function baselines(manifest, index, unfinished = []) {
       (sourceUpdatedAt === null || indexedTime <= sourceUpdatedAt) ? indexedTime : null;
     Object.defineProperty(result, id, { enumerable: true, configurable: true, writable: true,
       value: { conversationId: id, title: entry.title, contentHash: entry.contentHash, markdownHash: entry.markdownHash,
-        jsonPath: entry.jsonPath, markdownPath: entry.markdownPath,
+        jsonPath: entry.jsonPath, markdownPath: entry.markdownPath, rendererVersion: entry.rendererVersion,
         sourceCompleteness: entry.sourceCompleteness, sourceUpdatedAt, listUpdateTime, messageSync: COPY(entry.messageSync) } });
   }
   return result;

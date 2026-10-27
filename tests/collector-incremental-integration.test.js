@@ -81,3 +81,59 @@ test('real missing JSON or Markdown files are repaired without fetching unchange
     assert.deepEqual((await f.engine.getOutbox(account.accountKey)).map(item => item.conversationId), ['a']);
   });
 });
+
+test('Doubao incremental scans reuse real archives while changed, missing and legacy entries still refresh', async t => {
+  for (const scenario of ['unchanged', 'renamed', 'updated', 'missing-markdown', 'legacy-renderer', 'missing-renderer', 'full']) {
+    await t.test(scenario, async () => {
+      const f = setup();
+      const target = { ...account, platform: 'doubao', initialized: true };
+      const owner = { ...identity, platform: 'doubao' };
+      const items = ['11', '12'].map(id => ({ id, title: `Title ${id}`, updateTime: sourceTime }));
+      f.dependencies.adapter = {
+        identify: async () => owner,
+        list: async () => ({ items, nextOffset: null, total: 2 }),
+        detail: async (tabId, { conversationId }) => {
+          f.requests.push(conversationId);
+          const item = items.find(value => value.id === conversationId);
+          return { identity: owner, completeness: 'complete', capturedAt: '2026-10-21T08:00:00Z', payload: {
+            platform: 'doubao', sourceFormat: 'doubao-web-chain', conversation_id: conversationId,
+            title: item.title, create_time: sourceTime - 100, update_time: item.updateTime,
+            conversation: { conversation_id: conversationId, creator_id: '10001', conversation_type: 3,
+              name: item.title, create_time: String(sourceTime - 100), update_time: String(item.updateTime) },
+            messages: [1, 2].map(index => ({ conversation_id: conversationId,
+              message_id: `${conversationId}${index}`, index_in_conv: String(index), user_type: index,
+              status: 0, content_status: 0, ext: { is_finish: '1' }, content: '',
+              content_block: [{ block_type: 10000, is_finish: true, content: { text_block: { text: `Message ${index}` } } }] })),
+            regen_messages: {}, has_more: false,
+          } };
+        },
+      };
+      assert.equal((await run(createCollectorEngine(f.dependencies), target)).status, 'completed');
+      const manifest = await readAccountManifest(f.fs.directory, target);
+      assert.equal(manifest.conversations['11'].rendererVersion, 'doubao-1');
+      if (scenario === 'renamed') items[0].title = 'Renamed';
+      if (scenario === 'updated') items[0].updateTime++;
+      if (scenario === 'missing-markdown') f.fs.files.delete(manifest.conversations['11'].markdownPath);
+      if (scenario === 'legacy-renderer' || scenario === 'missing-renderer') {
+        if (scenario === 'legacy-renderer') manifest.conversations['11'].rendererVersion = 'rich-3';
+        else delete manifest.conversations['11'].rendererVersion;
+        const path = [...f.fs.files.keys()].find(value => value.endsWith('/archive/manifest.json'));
+        f.fs.put(path, JSON.stringify(manifest));
+      }
+      const writes = f.fs.writes.length;
+      f.requests.length = 0; f.checks.length = 0;
+      // Losing the browser index must not lose the on-disk renderer receipt.
+      f.fs.settings.delete(`collectorIndex:${target.accountKey}`);
+      const restarted = createCollectorEngine(f.dependencies);
+      if (scenario === 'full') await restarted.start({ account: target, tabId: 1, mode: 'full' });
+      const state = await run(restarted, target);
+      assert.equal(state.status, 'completed');
+      assert.deepEqual(f.requests, scenario === 'unchanged' ? [] : scenario === 'full' ? ['11', '12'] : ['11']);
+      assert.equal(state.diagnostics.skipped, scenario === 'unchanged' ? 2 : scenario === 'full' ? 0 : 1);
+      if (scenario === 'unchanged') {
+        assert.deepEqual(f.checks, ['11', '12']);
+        assert.equal(f.fs.writes.length, writes, 'unchanged Doubao archives must not be rewritten');
+      }
+    });
+  }
+});
