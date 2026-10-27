@@ -29,6 +29,8 @@ export function createDoubaoAdapter(browser) {
   return Object.freeze({ platform: 'doubao', origin: 'https://www.doubao.com', matches: isDoubaoUrl,
     cancel: (tabId, options) => requests.cancel(tabId, options),
     identify: tabId => requests.run(tabId, null, async scope => (await read(tabId, { kind: 'identity' }, scope)).identity),
+    fileUrl: (tabId, { accountKey, uri }) => requests.run(tabId, accountKey, async scope =>
+      (await read(tabId, { kind: 'file-url', expectedAccountKey: accountKey, uri }, scope)).payload),
     list: (tabId, { accountKey, offset = 0 }) => requests.run(tabId, accountKey, async scope =>
       (await read(tabId, { kind: 'list', expectedAccountKey: accountKey, offset }, scope)).payload),
     detail: (tabId, { accountKey, conversationId, shouldPause = () => false, onProgress }) => requests.run(tabId, accountKey, async scope => {

@@ -8,7 +8,7 @@ export async function probeDoubao(request) {
   let scope, registry;
   try {
     if (location.origin !== 'https://www.doubao.com' || window.top !== window) fail('ORIGIN', '请打开豆包网页端。');
-    if (!['identity', 'list', 'info', 'messages'].includes(request?.kind)) fail('FORMAT', '豆包读取请求无效。');
+    if (!['identity', 'list', 'info', 'messages', 'file-url'].includes(request?.kind)) fail('FORMAT', '豆包读取请求无效。');
     if (!/^[A-Za-z0-9_-]{1,100}$/.test(request.requestId || '')) fail('FORMAT', '豆包读取标识无效。');
     const key = '__aiMemoryCollectorDoubaoRequestsV1';
     registry = globalThis[key] instanceof Map ? globalThis[key] : (globalThis[key] = new Map());
@@ -32,7 +32,7 @@ export async function probeDoubao(request) {
         const response = await fetch(url.href, { method: 'POST', credentials: 'same-origin', redirect: 'error',
           cache: 'no-store', signal: controller.signal,
           headers: { 'Content-Type': 'application/json; encoding=utf-8', 'agw-js-conv': 'str' },
-          body: JSON.stringify({ cmd, uplink_body: { [bodyKey]: body }, sequence_id: crypto.randomUUID(), channel: 2, version: '1' }) });
+          body: JSON.stringify(cmd === null ? body : { cmd, uplink_body: { [bodyKey]: body }, sequence_id: crypto.randomUUID(), channel: 2, version: '1' }) });
         if (!response.ok) fail(`HTTP_${response.status}`, '豆包接口暂时无法读取，请检查登录或稍后重试。');
         if (!/application\/json/i.test(response.headers.get('content-type') || '')) fail('FORMAT', '豆包未返回有效 JSON。');
         const reader = response.body.getReader(), chunks = []; let size = 0;
@@ -43,6 +43,10 @@ export async function probeDoubao(request) {
         const bytes = new Uint8Array(size); let offset = 0;
         for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
         let data; try { data = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); } catch { fail('FORMAT', '豆包返回结构无法解析。'); }
+        if (cmd === null) {
+          if (!record(data) || data.code !== 0 || !record(data.data)) fail('FORMAT', '豆包未确认附件地址刷新成功。');
+          check(); return data.data;
+        }
         if (!record(data) || data.cmd !== cmd || data.status_code !== 0 || !record(data.downlink_body)) fail('FORMAT', '豆包未确认读取成功，请检查登录或网站验证。');
         check(); return data.downlink_body;
       } catch (error) {
@@ -72,6 +76,15 @@ export async function probeDoubao(request) {
     const owner = await identity(before);
     let payload;
     if (request.kind === 'identity') payload = null;
+    else if (request.kind === 'file-url') {
+      const uri = request.uri;
+      if (typeof uri !== 'string' || uri.length > 1024 || !/^tos-cn-i-[a-z0-9]+\/[A-Za-z0-9_./-]+$/.test(uri) ||
+          uri.split('/').some(part => !part || part === '.' || part === '..')) fail('ASSET_URL', '豆包附件来源标识无效。');
+      const result = await call('/alice/message/get_file_url', null, null, { uris: [uri], type: 'file' });
+      if (!Array.isArray(result.file_urls) || result.file_urls.length !== 1 || result.file_urls[0]?.uri !== uri ||
+          typeof result.file_urls[0].main_url !== 'string') fail('ASSET_URL', '豆包未返回匹配的附件地址。');
+      payload = { uri, urls: [...new Set([result.file_urls[0].main_url, result.file_urls[0].back_url].filter(value => typeof value === 'string' && value))] };
+    }
     else if (request.kind === 'list') {
       const items = before.cells.map(cell => {
         const conv = cell?.conversation;

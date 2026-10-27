@@ -88,7 +88,7 @@ export async function analyzeAssets(conversation) {
       const asset = { id, sourceRef, sourceType: resource.managed ? 'platform' : classified.sourceType,
         status: 'pending', kind: resource.kind, messageId: resource.messageId, fileName: resource.fileName,
         references: [sourceRef], occurrences: [{ messageId: resource.messageId, path: resource.path, kind: resource.kind }] };
-      Object.defineProperty(asset, 'retrieval', { value: { url: resource.url, sourceRef: resource.url }, enumerable: false });
+      Object.defineProperty(asset, 'retrieval', { value: { url: resource.url, sourceRef: resource.url, uri: resource.uri }, enumerable: false });
       result.set(id, asset);
     }
     return { assets: [...result.values()], interfaceIconIds: [], ordinaryLinkIds: [] };

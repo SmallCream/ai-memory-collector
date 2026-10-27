@@ -23,7 +23,7 @@ async function pendingWrite({ directory, account, asset, getSetting = defaultGet
 }
 
 export const MAX_ASSET_BYTES = 16 * 1024 * 1024;
-export const ASSET_EXTENSIONS = 'png|jpg|gif|webp|avif|bin|zip|gz|tgz|pdf|docx|xlsx|pptx|txt|md|csv|tsv|json|js|mjs|cjs|ts|tsx|jsx|py|css|yaml|yml|sql|sh|xml|log';
+export const ASSET_EXTENSIONS = 'png|jpg|gif|webp|avif|bin|zip|gz|tgz|pdf|docx|xlsx|pptx|txt|md|csv|tsv|json|js|mjs|cjs|ts|tsx|jsx|py|css|yaml|yml|sql|sh|ps1|xml|log';
 export const isSupportedAssetExtension = value => new RegExp(`^(?:${ASSET_EXTENSIONS})$`).test(value);
 export function assetPath(account, oid, extension = 'bin') {
   if (!/^[a-f0-9]{64}$/.test(oid) || !isSupportedAssetExtension(extension)) throw collectorError('ASSET_PATH', '附件路径无效。');
@@ -128,7 +128,7 @@ export function inspectAttachmentBytes(bytes, hint = {}) {
   const textTypes = { txt: 'text/plain', md: 'text/markdown', csv: 'text/csv', tsv: 'text/tab-separated-values',
     json: 'application/json', js: 'text/javascript', mjs: 'text/javascript', cjs: 'text/javascript',
     ts: 'text/plain', tsx: 'text/plain', jsx: 'text/javascript', py: 'text/x-python', css: 'text/css',
-    yaml: 'application/yaml', yml: 'application/yaml', sql: 'application/sql', sh: 'application/x-sh', xml: 'application/xml', log: 'text/plain' };
+    yaml: 'application/yaml', yml: 'application/yaml', sql: 'application/sql', sh: 'application/x-sh', ps1: 'text/plain', xml: 'application/xml', log: 'text/plain' };
   const office = { docx: ['word/', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
     xlsx: ['xl/', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
     pptx: ['ppt/', 'application/vnd.openxmlformats-officedocument.presentationml.presentation'] };

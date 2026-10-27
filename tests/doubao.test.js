@@ -327,6 +327,96 @@ test('Doubao asset downloads reconfirm source and account, request exact CDN per
   await assert.rejects(resolver.resolve({ tabId: 1, account, conversationId: cid, asset }), { code: 'ACCOUNT_CHANGED' });
 });
 
+test('Doubao file URL refresh uses the observed same-origin protocol and verifies account and URI', async () => {
+  const uri = 'tos-cn-i-example/rc/pc/super_tool/example.ps1';
+  const main = `https://p26-flow-sign.byteimg.com/${uri}?x-signature=synthetic`;
+  const f = probeFixture({ respond: body => body.cmd === 3200 ? recent() : Response.json({ code: 0,
+    data: { file_urls: [{ uri, main_url: main, back_url: main }] } }) });
+  const result = await f.run({ kind: 'file-url', uri });
+  assert.equal(result.ok, true); assert.equal(result.payload.urls.length, 1);
+  const call = f.calls.find(c => c.url.pathname === '/alice/message/get_file_url');
+  assert.deepEqual(call.body, { uris: [uri], type: 'file' });
+  assert.equal(call.options.credentials, 'same-origin'); assert.equal(call.options.redirect, 'error');
+  assert.ok(!/device_id|web_id|token|signature/i.test(call.url.search));
+  for (const invalid of ['https://evil.test/file', '../file', 'tos-cn-i-example/../other', uri + '?token=x', uri + '/']) {
+    const bad = probeFixture(); assert.equal((await bad.run({ kind: 'file-url', uri: invalid })).error.code, 'ASSET_URL');
+    assert.ok(bad.calls.every(c => c.url.pathname !== '/alice/message/get_file_url'));
+  }
+  for (const data of [{ code: 0, data: { file_urls: [{ uri: 'other', main_url: main }] } },
+    { code: 1, data: { secret: 'private response' } }]) {
+    const bad = probeFixture({ respond: body => body.cmd === 3200 ? recent() : Response.json(data) });
+    const failure = await bad.run({ kind: 'file-url', uri }); assert.equal(failure.ok, false);
+    assert.doesNotMatch(JSON.stringify(failure), /private response|x-signature/);
+  }
+  const changed = probeFixture({ respond: (body, count) => body.cmd === 3200 ? recent(count === 1 ? owner : '999') :
+    Response.json({ code: 0, data: { file_urls: [{ uri, main_url: main }] } }) });
+  assert.equal((await changed.run({ kind: 'file-url', uri })).error.code, 'ACCOUNT_CHANGED');
+});
+
+test('Doubao file refresh rotates CDN hosts for the same source and retries only the returned backup on 403', async () => {
+  const uri = 'tos-cn-i-example/rc/pc/super_tool/example.ps1', n = native();
+  n.messages[1].content_block.push({ is_finish: true, content: { file_block: { uri, name: 'example.ps1',
+    url: `https://p6-flow-sign.byteimg.com/${uri}?x-expires=1&x-signature=expired` } } });
+  const [asset] = await extractAssets(n), calls = [], permissions = [];
+  assert.doesNotMatch(JSON.stringify(asset), /expired|x-signature|retrieval/);
+  const urls = [`https://p26-flow-sign.byteimg.com/${uri}?x-signature=main`, `https://p6-flow-sign.byteimg.com/${uri}?x-signature=backup`];
+  const adapter = { detail: async () => ({ payload: n }), identify: async () => identity,
+    fileUrl: async (tab, input) => { assert.equal(input.accountKey, account.accountKey); assert.equal(input.uri, uri); return { uri, urls }; } };
+  const browser = { permissions: { contains: async value => { permissions.push(value.origins[0]); return true; } } };
+  const bytes = new TextEncoder().encode('# archive only\nWrite-Output "示例"\n');
+  const resolver = createDoubaoAssetResolver(browser, adapter, { fetchImpl: async (url, options) => {
+    calls.push(url); assert.equal(options.credentials, 'omit'); assert.equal(options.redirect, 'error');
+    return calls.length === 1 ? new Response('forbidden', { status: 403 }) : new Response(bytes, { headers: { 'content-type': 'text/plain' } });
+  } });
+  const result = await resolver.resolve({ tabId: 1, account, conversationId: cid, asset });
+  assert.deepEqual(result.bytes, bytes); assert.deepEqual(calls, urls);
+  assert.deepEqual(permissions, ['https://p26-flow-sign.byteimg.com/*', 'https://p6-flow-sign.byteimg.com/*']);
+  for (const invalid of ['https://evil.test/' + uri, 'https://p6-flow-sign.byteimg.com/other.ps1',
+    'https://user:password@p6-flow-sign.byteimg.com/' + uri, 'http://p6-flow-sign.byteimg.com/' + uri]) {
+    const guarded = createDoubaoAssetResolver(browser, { ...adapter, fileUrl: async () => ({ uri, urls: [urls[0], invalid] }) },
+      { fetchImpl: async () => assert.fail('invalid refreshed source must not be fetched') });
+    await assert.rejects(guarded.resolve({ tabId: 1, account, conversationId: cid, asset }), { code: 'ASSET_URL' });
+  }
+  const denied = createDoubaoAssetResolver({ permissions: { contains: async () => false } }, adapter,
+    { fetchImpl: async () => assert.fail('ungranted CDN must not be fetched') });
+  await assert.rejects(denied.resolve({ tabId: 1, account, conversationId: cid, asset }), { code: 'ASSET_PERMISSION' });
+  let stopped;
+  stopped = createDoubaoAssetResolver(browser, { ...adapter, fileUrl: async () => {
+    stopped.cancel(1); return { uri, urls };
+  } }, { fetchImpl: async () => assert.fail('cancelled refresh must not download') });
+  await assert.rejects(stopped.resolve({ tabId: 1, account, conversationId: cid, asset }), { code: 'COLLECTION_PAUSED' });
+});
+
+test('Doubao image 403 refreshes only the bound original URI, preserving existing IDs and successful downloads', async () => {
+  for (const generated of [false, true]) {
+    const uri = generated ? 'tos-cn-i-ik7evvg4ik/ci/123/diagram.png' : 'tos-cn-i-example/photo.JPG';
+    const source = `https://p3-flow-imagex-sign.byteimg.com/${uri}~tplv-example-image.png?x-signature=old`;
+    const n = native();
+    n.messages[0].content_block = [{ is_finish: true, content: generated ? { text_block: { text: `![diagram](${source})` } } :
+      { image_block: { uri, image_ori: { url: source }, image_preview: { url: 'https://p3-flow-sign.byteimg.com/preview.png' } } } }];
+    const [asset] = await extractAssets(n);
+    assert.equal(asset.retrieval.uri, uri);
+    assert.equal(asset.id, Buffer.from(await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode(
+      `doubao:${n.messages[0].message_id}:${source.split('?')[0]}`))).toString('hex'));
+    const target = `https://p26-flow-sign.byteimg.com/${uri}?x-signature=new`, calls = [];
+    const adapter = { detail: async () => ({ payload: n }), identify: async () => identity,
+      fileUrl: async (_, request) => { assert.equal(request.uri, uri); return { uri, urls: [target] }; } };
+    const browser = { permissions: { contains: async () => true } };
+    const jpeg = Uint8Array.from([255, 216, 255, 224, 0]);
+    const resolver = createDoubaoAssetResolver(browser, adapter, { fetchImpl: async url => {
+      calls.push(url); return url === source ? new Response('', { status: 403 }) : new Response(jpeg, { headers: { 'content-type': 'image/jpeg' } });
+    } });
+    assert.deepEqual((await resolver.resolve({ tabId: 1, account, conversationId: cid, asset })).bytes, jpeg);
+    assert.deepEqual(calls, [source, target]);
+    const unchanged = createDoubaoAssetResolver(browser, { ...adapter, fileUrl: async () => assert.fail('successful images need no refresh') },
+      { fetchImpl: async () => new Response(jpeg, { headers: { 'content-type': 'image/jpeg' } }) });
+    await unchanged.resolve({ tabId: 1, account, conversationId: cid, asset });
+    const oversized = createDoubaoAssetResolver(browser, adapter, { fetchImpl: async url => url === source
+      ? new Response('', { status: 403 }) : new Response(new Uint8Array(16 * 1024 * 1024 + 1)) });
+    await assert.rejects(oversized.resolve({ tabId: 1, account, conversationId: cid, asset }), { code: 'ASSET_SIZE' });
+  }
+});
+
 test('Doubao local save and commit-pinned repository restore preserve native and Markdown hashes', async () => {
   const local = memoryBinaryFs(), restored = memoryBinaryFs();
   const store = createArchiveStore({ get: local.getSetting, set: local.setSetting });

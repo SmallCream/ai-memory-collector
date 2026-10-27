@@ -104,21 +104,27 @@ export function doubaoResources(native) {
   const result = [];
   for (const message of native.messages || []) {
     const messageId = message.message_id;
-    const add = (url, kind, path, fileName) => {
+    const add = (url, kind, path, fileName, uri) => {
       if (typeof url !== 'string' || !safePublicURL(doubaoAssetReference(url) || '')) return;
       const parsed = new URL(url), managed = parsed.hostname.endsWith('.byteimg.com') || parsed.hostname === 'www.doubao.com';
-      result.push({ url, sourceRef: managed ? doubaoAssetReference(url) : url, managed, kind, messageId, path,
+      // Code-generated image links point to a file URI; the website displays
+      // that original file instead of the expired ImageX crop URL in prose.
+      if (!uri && kind === 'image' && parsed.hostname.endsWith('.byteimg.com') &&
+          /^\/tos-cn-i-ik7evvg4ik\/ci\/[0-9]+\/[A-Za-z0-9_.-]+(?:~tplv-[A-Za-z0-9:._-]+)?$/.test(parsed.pathname)) {
+        uri = parsed.pathname.slice(1).split('~')[0];
+      }
+      result.push({ url, uri, sourceRef: managed ? doubaoAssetReference(url) : url, managed, kind, messageId, path,
         fileName: fileName || referenceFileName(url) || (kind === 'image' ? '豆包图片' : '豆包附件') });
     };
-    function media(value, path, kind, depth = 0) {
+    function media(value, path, kind, depth = 0, originalUri) {
       if (depth > 30 || value == null) return;
       if (Array.isArray(value)) { value.forEach((item, i) => media(item, `${path}/${i}`, kind, depth + 1)); return; }
       if (!record(value)) return;
-      if (value.image_ori) { media(value.image_ori, `${path}/image_ori`, 'image', depth + 1); return; }
+      if (value.image_ori) { media(value.image_ori, `${path}/image_ori`, 'image', depth + 1, value.uri || value.key); return; }
       for (const [key, item] of Object.entries(value)) {
         if (/icon|thumb|avatar|preview|cover/i.test(key)) continue;
         if (['url', 'url_v2', 'download_url', 'image_url', 'file_url'].includes(key) && typeof item === 'string') {
-          add(item, kind, `${path}/${key}`, value.file_name || value.name);
+          add(item, kind, `${path}/${key}`, value.file_name || value.name, value.uri || originalUri);
           if (key === 'url' && item) break;
         } else if (record(item) || Array.isArray(item)) media(item, `${path}/${key}`, kind, depth + 1);
       }

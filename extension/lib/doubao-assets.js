@@ -25,10 +25,39 @@ export function createDoubaoAssetResolver(browser, adapter, { fetchImpl = global
         if (!allowed || url.protocol !== 'https:' || url.username || url.password || url.port || doubaoAssetReference(raw) !== asset.sourceRef) {
           fail('ASSET_URL', '此豆包资源地址尚未适配，原始来源已保留。');
         }
-        if (!await browser.permissions.contains({ origins: [`${url.origin}/*`] })) fail('ASSET_PERMISSION', '请授权豆包图片域名后重试。');
-        const response = await fetchImpl(url.href, { credentials: 'omit', redirect: 'error', cache: 'no-store',
-          referrerPolicy: 'no-referrer', signal: controller.signal });
-        if (!response.ok) fail(`HTTP_${response.status}`, '豆包附件暂时无法下载。');
+        async function refreshUrls() {
+          const uri = fresh.retrieval.uri;
+          const suffix = url.pathname.slice(uri.length + 1);
+          if (!url.pathname.startsWith(`/${uri}`) || suffix &&
+              !(fresh.kind === 'image' && /^~tplv-[A-Za-z0-9:._-]+$/.test(suffix))) fail('ASSET_URL', '豆包附件来源标识与原地址不一致。');
+          const refreshed = await adapter.fileUrl(tabId, { accountKey: account.accountKey, uri });
+          if (refreshed?.uri !== uri || !Array.isArray(refreshed.urls) || !refreshed.urls.length || refreshed.urls.length > 2) {
+            fail('ASSET_URL', '豆包未返回匹配的附件地址。');
+          }
+          return refreshed.urls.map(value => {
+            let next; try { next = new URL(value); } catch { fail('ASSET_URL', '豆包附件地址无法确认。'); }
+            // CDN host rotation is allowed only for the exact reconfirmed URI.
+            if (next.protocol !== 'https:' || !next.hostname.endsWith('.byteimg.com') || next.username || next.password ||
+                next.port || next.hash || next.pathname !== `/${uri}`) fail('ASSET_URL', '豆包附件地址与原始资源不一致。');
+            return next;
+          });
+        }
+        const hasUri = typeof fresh.retrieval?.uri === 'string' && fresh.retrieval.uri.length > 0;
+        let refreshed = fresh.kind === 'attachment' && hasUri;
+        const urls = refreshed ? await refreshUrls() : [url];
+        let response;
+        for (const [index, candidate] of urls.entries()) {
+          if (controller.signal.aborted) fail(expired ? 'TIMEOUT' : 'COLLECTION_PAUSED', '豆包附件读取已停止。');
+          if (!await browser.permissions.contains({ origins: [`${candidate.origin}/*`] })) fail('ASSET_PERMISSION', '请授权豆包图片域名后重试。');
+          response = await fetchImpl(candidate.href, { credentials: 'omit', redirect: 'error', cache: 'no-store',
+            referrerPolicy: 'no-referrer', signal: controller.signal });
+          if (response.ok) break;
+          await response.body?.cancel().catch(() => {});
+          if (response.status === 403 && !refreshed && hasUri) {
+            urls.push(...await refreshUrls()); refreshed = true;
+          }
+          if (response.status !== 403 || index === urls.length - 1) fail(`HTTP_${response.status}`, '豆包附件暂时无法下载。');
+        }
         const reader = response.body.getReader(), chunks = []; let length = 0;
         try { for (;;) { const { done, value } = await reader.read(); if (done) break;
           length += value.byteLength; if (length > MAX_ASSET_BYTES) fail('ASSET_SIZE', '豆包附件超过 16 MiB 上限。'); chunks.push(value); }

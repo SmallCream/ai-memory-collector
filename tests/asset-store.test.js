@@ -89,6 +89,20 @@ test('concurrent writes serialize before sharing a pending journal', async () =>
 
 
 const ZIP = new Uint8Array(Buffer.from('UEsDBBQAAAAAAIaLVl2fm+xuBwAAAAcAAAAKAAAAUkVBRE1FLnR4dGV4YW1wbGVQSwECFAMUAAAAAACGi1Zdn5vsbgcAAAAHAAAACgAAAAAAAAAAAAAAgAEAAAAAUkVBRE1FLnR4dFBLBQYAAAAAAQABADgAAAAvAAAAAAA=', 'base64'));
+test('PowerShell attachments preserve UTF8 bytes and reject HTML or binary responses', async () => {
+  const bytes = new TextEncoder().encode('\ufeff# 示例\r\nWrite-Output "archive only"\r\n');
+  const hint = { fileName: 'example.ps1', mimeType: 'text/plain' };
+  assert.equal(assetExtension(bytes, hint), 'ps1');
+  for (const bad of [new TextEncoder().encode('<html>Expired</html>'), new Uint8Array([255, 0, 254])]) {
+    assert.equal(inspectAttachmentBytes(bad, hint), null);
+  }
+  assert.equal(inspectAttachmentBytes(bytes, { ...hint, mimeType: 'text/html' }), null);
+  const fs = memoryBinaryFs(), value = await input(fs, bytes);
+  value.asset.localPath = assetPath(account, value.asset.oid, 'ps1');
+  assert.equal(validateAssetPath(account, value.asset.localPath, value.asset.oid), value.asset.localPath);
+  await writeLocalAsset(value);
+  assert.deepEqual(await verifiedLocalAsset(value), bytes);
+});
 const OFFICE = {
   docx: 'UEsDBBQAAAAAAIaLVl3HHBc8CAAAAAgAAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbDxUeXBlcy8+UEsDBBQAAAAAAIaLVl2fm+xuBwAAAAcAAAARAAAAd29yZC9kb2N1bWVudC54bWxleGFtcGxlUEsBAhQDFAAAAAAAhotWXcccFzwIAAAACAAAABMAAAAAAAAAAAAAAIABAAAAAFtDb250ZW50X1R5cGVzXS54bWxQSwECFAMUAAAAAACGi1Zdn5vsbgcAAAAHAAAAEQAAAAAAAAAAAAAAgAE5AAAAd29yZC9kb2N1bWVudC54bWxQSwUGAAAAAAIAAgCAAAAAbwAAAAAA',
   xlsx: 'UEsDBBQAAAAAAIaLVl3HHBc8CAAAAAgAAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbDxUeXBlcy8+UEsDBBQAAAAAAIaLVl2fm+xuBwAAAAcAAAAPAAAAeGwvd29ya2Jvb2sueG1sZXhhbXBsZVBLAQIUAxQAAAAAAIaLVl3HHBc8CAAAAAgAAAATAAAAAAAAAAAAAACAAQAAAABbQ29udGVudF9UeXBlc10ueG1sUEsBAhQDFAAAAAAAhotWXZ+b7G4HAAAABwAAAA8AAAAAAAAAAAAAAIABOQAAAHhsL3dvcmtib29rLnhtbFBLBQYAAAAAAgACAH4AAABtAAAAAAA=',
