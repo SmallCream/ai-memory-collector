@@ -96,7 +96,10 @@ test('current account identity is plain text and initialized home has incrementa
   assert.equal(app.elements.get('full-capture').hidden, false);
   await app.click('start-capture');
   await app.click('full-capture');
+  assert.equal(app.messages.filter(x => x.type === 'collector:start').length, 1);
+  await app.click('confirm-full-capture');
   assert.deepEqual(app.messages.filter(x => x.type === 'collector:start').map(x => x.mode), ['incremental', 'full']);
+  assert.equal(app.messages.find(x => x.type === 'collector:start' && x.mode === 'full').expectedAccountKey, 'acct-demo');
 });
 
 test('unbound account cannot capture and bind targets observed account via background', async () => {
@@ -1081,4 +1084,50 @@ test('read summary distinguishes unique details and attempts and never invents o
   assert.match(app.elements.get('collection-read-counts').textContent, /正文读取 2 条／3 次/);
   delete state.job.statistics; app.setState(state); await app.poll();
   assert.match(app.elements.get('collection-read-counts').textContent, /未记录/);
+});
+
+
+test('full capture confirmation can be cancelled and expires on account change or identity verification', async () => {
+  const app = await setup();
+  await app.click('full-capture');
+  assert.equal(app.elements.get('full-capture-confirmation').hidden, false);
+  await app.click('cancel-full-capture');
+  await app.click('confirm-full-capture');
+  assert.equal(app.messages.some(x => x.type === 'collector:start'), false);
+  await app.click('full-capture');
+  const state = initialState(); state.account.accountKey = 'other'; state.identity.accountKey = 'other';
+  app.setState(state); await app.poll();
+  assert.equal(app.elements.get('full-capture-confirmation').hidden, true);
+  await app.click('confirm-full-capture');
+  assert.equal(app.messages.some(x => x.type === 'collector:start'), false);
+  await app.click('full-capture');
+  state.identityChecking = true; app.setState(state); await app.poll();
+  assert.equal(app.elements.get('full-capture-confirmation').hidden, true);
+});
+
+test('home separates completed conversations from failed attachments and hides unused cloud', async () => {
+  const state = initialState(); state.job = { status: 'completed', discovered: 2, processed: 2, skipped: 2 };
+  state.assetStatus = { local: 5, failed: 1, pendingCapture: 1, internalMissing: 1 };
+  const app = await setup({ state });
+  assert.equal(app.elements.get('home-heading').textContent, '本轮对话检查完成');
+  assert.match(app.elements.get('overview-attachments').textContent, /本地附件 5.*失败 1.*内部附件未下载 1/);
+  assert.match(app.elements.get('overview-problems').textContent, /附件失败 1/);
+  assert.equal(app.elements.get('overview-cloud').hidden, true);
+  assert.equal(app.elements.get('repair-recommended').hidden, true);
+  state.maintenanceStatus = { missingAssets: 1 }; app.setState(state); await app.poll();
+  assert.equal(app.elements.get('repair-recommended').hidden, false);
+  await app.click('repair-recommended');
+  assert.equal(app.messages.filter(x => x.type === 'collector:repair-local').length, 1);
+});
+
+test('first use keeps cloud optional and full capture out of primary actions', async () => {
+  const app = await setup();
+  assert.match(app.elements.get('overview-attachments').textContent, /尚无可显示的统计/);
+  const primary = html.match(/<div class="main-actions">([\s\S]*?)<\/div>/)[1];
+  assert.doesNotMatch(primary, /id="full-capture"|id="repair-local"/);
+  for (const id of ['advanced-actions', 'wizard-cloud-options']) {
+    const tag = html.match(new RegExp('<details[^>]*id="' + id + '"[^>]*>'))[0];
+    assert.doesNotMatch(tag, /\bopen\b/);
+  }
+  assert.ok(html.indexOf('id="wizard-skip-github"') < html.indexOf('id="wizard-cloud-options"'));
 });

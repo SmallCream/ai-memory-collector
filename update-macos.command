@@ -8,6 +8,7 @@ usage() {
 AI Memory Collector — macOS 更新工具
 
 双击此文件：首次选择浏览器原来加载的 extension 文件夹，以后自动沿用。
+  --test      本次从测试渠道更新（不修改默认 main 渠道，可与 --choose 合用）
   --choose    重新选择原安装目录
   --rollback  恢复所选目录最近一次更新前的代码
   --help      显示此说明
@@ -20,14 +21,20 @@ HELP
 }
 
 mode=update
-case "${1:-}" in
-  '') ;;
-  --choose) mode=choose ;;
-  --rollback) mode=rollback ;;
-  --help|-h) usage; exit 0 ;;
-  *) usage; exit 2 ;;
-esac
-[ "$#" -le 1 ] || { usage; exit 2; }
+channel=main
+for option in "$@"; do
+  case "$option" in
+    --test) [ "$channel" = main ] || { usage; exit 2; }; channel=test ;;
+    --choose|--rollback)
+      [ "$mode" = update ] || { usage; exit 2; }
+      mode=${option#--} ;;
+    --help|-h) usage; exit 0 ;;
+    *) usage; exit 2 ;;
+  esac
+done
+[ "$mode" != rollback ] || [ "$channel" = main ] || { usage; exit 2; }
+source_ref='main'
+[ "$channel" != test ] || source_ref='feat/automatic-collector-v2'
 
 state_dir=${AMC_UPDATER_STATE_DIR:-"$HOME/Library/Application Support/AI Memory Collector Updater"}
 lock_dir="$state_dir/run.lock"
@@ -192,9 +199,10 @@ if [ "$mode" = rollback ]; then
   printf '准备恢复备份版本：%s\n' "${source_info%%|*}"
 else
   work_dir=$(mktemp -d "${TMPDIR:-/tmp}/ai-memory-collector-download.XXXXXX")
-  printf '正在检查 GitHub 上的最新代码…\n'
+  printf '本次更新渠道：%s（测试渠道需每次显式指定 --test）\n' "$channel"
+  printf '正在检查 GitHub 上的代码…\n'
   curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 180 --retry 2 --max-filesize 1048576 \
-    --output "$work_dir/ref.json" 'https://api.github.com/repos/SmallCream/ai-memory-collector/git/ref/heads/main' || fail '无法检查 GitHub 版本；原插件未修改。请检查网络或稍后重试。'
+    --output "$work_dir/ref.json" "https://api.github.com/repos/SmallCream/ai-memory-collector/git/ref/heads/$source_ref" || fail '无法检查 GitHub 版本；原插件未修改。请检查网络或稍后重试。'
   commit_sha=$(json_value sha "$(cat "$work_dir/ref.json")") || fail 'GitHub 返回的版本信息无效；原插件未修改。'
   printf '正在下载代码版本 %.12s…\n' "$commit_sha"
   curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 180 --retry 2 --max-filesize 52428800 \

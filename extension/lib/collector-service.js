@@ -625,6 +625,9 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
       }
       case 'collector:start': {
         const { account, tab, config } = await context(tabId, true);
+        if (message.mode === 'full' && message.expectedAccountKey !== undefined && message.expectedAccountKey !== account?.accountKey) {
+          throw collectorError('ACCOUNT_CHANGED', '当前账号与确认全量补采时不同，请重新确认。');
+        }
         if (!account?.enabled || !config.setupComplete) throw collectorError('SETUP_INCOMPLETE', '请先完成配置并启用此账号。');
         if (stoppingAccounts.has(account.accountKey)) throw collectorError('BUSY', '正在停止本轮采集，请稍后重新开始。');
         if (!(await directoryState()).granted) throw collectorError('DIRECTORY_PERMISSION', '请在设置中恢复保存目录权限。');

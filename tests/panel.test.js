@@ -904,3 +904,17 @@ test('diagnostic read export and clear work offline without account probing and 
   assert.equal(f.store.get('activity:v1:other:collection').recent.length, 1);
   assert.equal(f.calls.lists, 0); assert.equal(f.calls.saves.length, 0);
 });
+
+
+test('full capture confirmation is checked against freshly identified account before starting a job', async () => {
+  const f = fixture(), otherKey = 'acct-' + 'b'.repeat(24);
+  await f.service.state(1);
+  f.store.set('collectorConfigV2', { ...f.config(), accounts: { ...f.config().accounts,
+    [otherKey]: { ...account, accountKey: otherKey, storageKey: otherKey } } });
+  f.identities.set(1, { platform: 'chatgpt', accountKey: otherKey, displayName: 'Other' });
+  await assert.rejects(f.service.command({ type: 'collector:start', mode: 'full', expectedAccountKey: accountKey }, 1), { code: 'ACCOUNT_CHANGED' });
+  assert.equal(await f.service.engine.getState(otherKey), null);
+  assert.equal(f.calls.lists, 0); assert.equal(f.calls.saves.length, 0);
+  await f.service.command({ type: 'collector:start', mode: 'full', expectedAccountKey: otherKey }, 1);
+  assert.equal((await f.service.engine.getState(otherKey)).mode, 'full');
+});

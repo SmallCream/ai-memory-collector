@@ -7,6 +7,7 @@ const setupPage = new URL(location.href).searchParams.get('setup') === '1';
 const sourceParameter = new URL(location.href).searchParams.get('tab');
 const sourceTabId = sourceParameter !== null && /^\d+$/.test(sourceParameter) ? Number(sourceParameter) : null;
 let current = null;
+let fullCaptureAccount = null;
 let directory = null;
 let screen = 'home';
 let step = 0;
@@ -345,7 +346,7 @@ function renderDetailedProgress() {
   if (job?.status === 'running' && !liveCollection && Number(job?.nextRetryAt) > Date.now()) text('collection-details-status', '等待重试');
   text('collection-wait', collectionWait);
   show('run-summary', Boolean(job));
-  text('run-summary', job ? `本轮发现 ${count(job.discovered)} 条对话；未变化跳过 ${count(job.skipped)} 条，已新增 ${count(job.added)} 条、更新 ${count(job.updated)} 条，待处理 ${count(diagnostics.remaining ?? Math.max(0, (job.discovered || 0) - (job.processed || 0)))} 条。附件与 GitHub 结果分别显示。` : '');
+  text('run-summary', job ? `本轮发现 ${count(job.discovered)} 条对话；未变化跳过 ${count(job.skipped)} 条，已新增 ${count(job.added)} 条、更新 ${count(job.updated)} 条，待处理 ${count(diagnostics.remaining ?? Math.max(0, (job.discovered || 0) - (job.processed || 0)))} 条。` : '');
   text('collection-read-counts', job?.statistics ? `列表读取 ${count(job.statistics.listReads)} 次；正文读取 ${count(job.statistics.detailConversations)} 条／${count(job.statistics.detailReads)} 次（含重复尝试）。一次正文读取可能包含多页网络请求。` : job ? '此任务创建于旧版本，未记录完整读取次数；下一轮新建任务开始统计。' : '');
   text('collection-detail-counts', job ? `已发现 ${count(job.discovered)} 条 · 已处理 ${count(job.processed)} 条 · 未变化已跳过 ${count(diagnostics.skipped ?? job.skipped)} 条 · 待处理 ${count(diagnostics.remaining ?? Math.max(0, (job.discovered || 0) - (job.processed || 0)))} 条 · 失败／重试 ${count(diagnostics.failed !== undefined ? Number(diagnostics.failed) + Number(diagnostics.retrying || 0) : job.failed)} 条${job.pages ? ` · 已读 ${count(job.pages)} 页列表` : ''}` : '');
   const messages = job?.messageProgress;
@@ -481,7 +482,7 @@ function render() {
   const interval = config.intervalMinutes || 30;
   text('home-heading', isRunning ?
     job.mode === 'full' ? '正在全量补采' : job.mode === 'initial' ? '正在初始化采集' : '正在检查新增与更新' :
-    isStopped ? '本轮采集已停止' : isPartial ? '部分采集已完成' : isPaused ? '采集已暂停' : !account?.initialized ? '准备好首次采集' : config.autoEnabled === false ? '对话归档已就绪' : '对话正在自动归档');
+    isStopped ? '本轮采集已停止' : isPartial ? '部分采集已完成' : isPaused ? '采集已暂停' : !account?.initialized ? '准备好首次备份' : job?.status === 'completed' ? '本轮对话检查完成' : '对话归档已就绪');
   text('schedule-status', isStopped ? '当前账号自动采集和自动附件下载已停止；重新开始后按设置恢复，手动补齐仍可使用。' : config.autoEnabled === false ? '自动采集已暂停，可以手动采集。' :
     isRunning ? `每 ${interval} 分钟自动检查 · 当前任务完成后继续调度` :
     current.nextRunAt ? `自动采集已开启 · 下次检查 ${time(current.nextRunAt)}` : `自动采集已开启 · 每 ${interval} 分钟检查`);
@@ -499,7 +500,7 @@ function render() {
   const error = (!isStopped && jobError(job)) || (hasIdentity ? current.error?.message : '');
   show('job-error', Boolean(error)); text('job-error', safeMessage(error || ''));
   show('start-capture', !isRunning && !isPaused);
-  text('start-capture', account?.initialized ? '立即检查更新' : '开始初始化采集');
+  text('start-capture', account?.initialized ? '检查更新' : '开始首次备份');
   show('full-capture', Boolean(account?.initialized) && !isRunning && (!isPaused || isPartial));
   show('pause-capture', isRunning);
   show('stop-capture', isRunning || isPaused);
@@ -507,6 +508,7 @@ function render() {
   text('resume-capture', isPartial ? '重试未完成项' : '继续采集');
   const directoryName = current.directory?.name || directory?.name || '尚未选择';
   const granted = current.directory?.granted === true;
+  show('reading-help', Boolean(account?.initialized && granted));
   text('directory-name', directoryName);
   text('directory-status', granted ? '自动保存' : current.directory?.name ? '需要授权' : '未设置');
   show('restore-directory', !granted && Boolean(current.directory?.name || directory));
@@ -540,6 +542,29 @@ function render() {
   if (internalMissing > 0) assetParts.push(`内部附件未下载 ${count(internalMissing)}`);
   if (Number(diagnostics?.unsupported ?? assets.unsupported) > 0) assetParts.push(`暂不支持 ${count(diagnostics?.unsupported ?? assets.unsupported)}`);
   text('asset-summary-text', assetParts.join(' · ')); show('asset-summary', assetParts.length > 0);
+  text('overview-attachments', assetParts.length ? `附件累计：${assetParts.join(' · ')}。` : '附件：尚无可显示的统计，不能据此确认全部附件已保存。');
+  show('overview-cloud', cloud.upload || cloud.restore);
+  text('overview-cloud', cloud.upload ? `GitHub 对话备份：${githubDescription}。附件仅保存在本地。` : 'GitHub 恢复状态请在传输详情中查看；附件需单独补齐。');
+  const attention = [];
+  if (Number(job?.failed) > 0) attention.push(`对话失败／重试 ${count(job.failed)} 条`);
+  else if (job?.status === 'blocked' || job?.status === 'partial') attention.push('对话检查尚未完成');
+  if (failedImages > 0) attention.push(`附件失败 ${count(failedImages)} 个`);
+  if (internalMissing > 0) attention.push(`内部附件未下载 ${count(internalMissing)} 个`);
+  if (!granted) attention.push('保存目录需要选择或授权');
+  if (cloud.upload && (githubError || current.githubStatus?.status === 'conflicts')) attention.push('GitHub 备份需要处理');
+  text('overview-problems', attention.join(' · ')); show('overview-problems', attention.length > 0);
+  const maintenance = current.maintenanceStatus;
+  const localMissing = Number(maintenance?.missingConversationCount ?? (Array.isArray(maintenance?.missingConversations) ? maintenance.missingConversations.length : maintenance?.missingConversations)) > 0 ||
+    Number(maintenance?.missingAttachments ?? maintenance?.missingAssets) > 0;
+  show('repair-recommended', localMissing);
+  show('task-action-help', isRunning || isPaused || isStopped);
+  text('task-action-help', '暂停可继续原队列；停止本轮后，下次检查重新扫描。已保存文件保留，GitHub 备份和手动附件任务独立运行。');
+  if (!account?.enabled || fullCaptureAccount !== account.accountKey || isRunning || current.identityChecking) fullCaptureAccount = null;
+  show('full-capture-confirmation', Boolean(fullCaptureAccount));
+  text('full-capture-explanation', `将为“${selectedName}”重新读取全部可枚举对话，可能耗时较长。已有归档和文件保护规则继续生效。日常检查只需“检查更新”。`);
+  const manifest = chrome.runtime.getManifest?.();
+  text('extension-version', manifest ? `AI Memory Collector ${manifest.version_name || manifest.version}` : 'AI Memory Collector');
+
   show('local-assets-policy', config.localAssetsEnabled === false);
   text('local-assets-policy', '附件自动下载已关闭，未执行的下载按设置暂停。已保存的文件保留，点击“补齐缺失”可手动处理。');
   renderCompleteness(diagnostics);
@@ -613,6 +638,8 @@ function render() {
   $('start-capture').disabled = busy || !account?.enabled || !granted;
   $('full-capture').disabled = busy || !account?.enabled || !granted;
   $('repair-local').disabled = busy || !account?.enabled || !granted || ['requested', 'running'].includes(current.maintenanceStatus?.status);
+  $('repair-recommended').disabled = $('repair-local').disabled;
+  $('confirm-full-capture').disabled = busy || !fullCaptureAccount || !granted || isRunning || !account?.enabled;
   $('resume-capture').disabled = busy || !account?.enabled || !granted;
   $('stop-capture').disabled = busy || !account?.accountKey;
   $('retry-images').disabled = busy || failedImages <= 0 || !account?.enabled || !granted || !hasIdentity ||
@@ -625,7 +652,7 @@ function render() {
   $('grant-external-images').disabled = busy || externalImagePermission;
   if (current.identityChecking === true) {
     for (const id of ['wizard-bind', 'bind-account', 'wizard-finish', 'start-capture', 'full-capture', 'pause-capture',
-      'resume-capture', 'repair-local', 'retry-images', 'retry-internal-images', 'retry-github', 'backup-github-now']) $(id).disabled = true;
+      'resume-capture', 'repair-local', 'repair-recommended', 'confirm-full-capture', 'retry-images', 'retry-internal-images', 'retry-github', 'backup-github-now']) $(id).disabled = true;
   }
   if (!started) { started = true; window.dispatchEvent(new Event('collector:ready')); }
 }
@@ -861,7 +888,13 @@ action('wizard-finish', async () => {
   screen = 'home';
 });
 action('start-capture', () => send('collector:start', { mode: current?.account?.initialized ? 'incremental' : 'initial' }));
-action('full-capture', () => send('collector:start', { mode: 'full' }));
+action('full-capture', () => { fullCaptureAccount = current?.account?.accountKey || null; });
+action('cancel-full-capture', () => { fullCaptureAccount = null; });
+action('confirm-full-capture', async () => {
+  if (!fullCaptureAccount || fullCaptureAccount !== current?.account?.accountKey || current?.identityChecking) throw new Error('账号或任务状态已变化，请重新选择全量补采。');
+  await send('collector:start', { mode: 'full', expectedAccountKey: fullCaptureAccount }); fullCaptureAccount = null;
+});
+action('repair-recommended', () => send('collector:repair-local'));
 action('repair-local', () => send('collector:repair-local'));
 action('pause-capture', () => send('collector:pause'));
 action('stop-capture', () => send('collector:stop', { accountKey: current?.account?.accountKey }));

@@ -23,11 +23,14 @@ jobs:
       - name: Updater syntax
         run: bash -n update-macos.command
       - name: Package extension
-        run: npm run package
+        run: npm run package -- --channel test
       - name: Upload test build
         uses: actions/upload-artifact@v4
         with:
-          name: ai-memory-collector-test-build
-          path: dist/*.zip
+          name: ai-memory-collector-test-${{ github.sha }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+            dist/*.json
           if-no-files-found: error
           retention-days: 7

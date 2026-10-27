@@ -56,7 +56,7 @@ function fixture(t, { installed = '0.1.3', remote = '0.1.4', remoteKey, installe
     fs.appendFileSync(process.env.AMC_TEST_LOG, args[args.length - 1] + '\\n');
     if (process.env.AMC_TEST_NETWORK_FAIL) process.exit(22);
     const destination = args[args.indexOf('--output') + 1], url = args[args.length - 1];
-    if (url === 'https://api.github.com/repos/SmallCream/ai-memory-collector/git/ref/heads/main') fs.writeFileSync(destination, JSON.stringify({object: {sha: '${sha}'}}));
+    if (url === 'https://api.github.com/repos/SmallCream/ai-memory-collector/git/ref/heads/' + (process.env.AMC_TEST_REF || 'main')) fs.writeFileSync(destination, JSON.stringify({object: {sha: '${sha}'}}));
     else if (url === 'https://codeload.github.com/SmallCream/ai-memory-collector/zip/${sha}') fs.copyFileSync(process.env.AMC_TEST_ZIP, destination);
     else throw Error('Unexpected network endpoint: ' + url);
   `);
@@ -226,4 +226,28 @@ test('removing the retired LFS module preserves it in the rollback backup', t =>
   assert.equal(rollback.status, 0, rollback.stderr + rollback.stdout);
   assert.equal(f.version(), '0.3.23');
   assert.equal(readFileSync(join(f.target, 'lib/lfs.js'), 'utf8'), '// old LFS implementation');
+});
+
+
+test('test channel is explicit per run and fetches an immutable source commit', t => {
+  const f = fixture(t);
+  const result = f.run(['--test', '--choose'], { AMC_TEST_REF: 'feat/automatic-collector-v2' });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  assert.equal(f.version(), '0.1.4');
+  let calls = readFileSync(f.log, 'utf8').trim().split('\n');
+  assert.equal(calls[0], 'https://api.github.com/repos/SmallCream/ai-memory-collector/git/ref/heads/feat/automatic-collector-v2');
+  assert.equal(calls[1], `https://codeload.github.com/SmallCream/ai-memory-collector/zip/${sha}`);
+  assert.equal(f.run().status, 0);
+  calls = readFileSync(f.log, 'utf8').trim().split('\n');
+  assert.match(calls[2], /heads\/main$/);
+});
+
+test('older remote version and incompatible channel flags preserve installation', t => {
+  const f = fixture(t, { installed: '0.4.10', remote: '0.4.9' });
+  const before = readFileSync(join(f.target, 'manifest.json'), 'utf8');
+  assert.notEqual(f.run().status, 0);
+  assert.notEqual(f.run(['--test', '--rollback']).status, 0);
+  assert.notEqual(f.run(['--choose', '--rollback']).status, 0);
+  assert.equal(readFileSync(join(f.target, 'manifest.json'), 'utf8'), before);
+  assert.equal(f.backups().length, 0);
 });
