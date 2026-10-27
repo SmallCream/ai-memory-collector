@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
 import { createCollectorService } from '../extension/lib/collector-service.js';
+import { adapterForUrl } from '../extension/adapters/index.js';
 import { safeError } from '../extension/lib/config.js';
 
 const raw = await readFile(new URL('../extension/background.js', import.meta.url), 'utf8');
@@ -45,9 +46,10 @@ function background({ command, open } = {}) {
   };
   const noop = () => {};
   vm.runInNewContext(source, { chrome, URL, Promise, console,
-    createCollectorService: () => service, getAdapter: () => ({}), safeError, ALARM_NAME: 'collector-work',
+    createCollectorService: () => service, getAdapter: () => ({}), createPlatformAdapter: () => ({}), adapterForUrl, safeError, ALARM_NAME: 'collector-work',
     getSetting: noop, setSetting: noop, getSettingsByPrefix: noop, createCollectorEngine: noop,
-    createChatGPTAssetResolver: () => ({ resolve: noop }),
+    createChatGPTAssetResolver: () => ({ resolve: noop, cancel: noop }),
+    createDoubaoAssetResolver: () => ({ resolve: noop, cancel: noop }),
     createAssetService: () => ({ save: noop, reconcileRestoredAssets: noop }), createRestoreService: () => ({}),
     createLocalMaintenance: () => ({}), readConversationArchive: noop, repairMissingMarkdown: noop,
     fetchRepositorySnapshot: noop, downloadRepositoryFile: noop,
@@ -69,6 +71,14 @@ test('ChatGPT content bridge permits only opening panel and a redacted status', 
   assert.deepEqual(app.calls, [['contentState', 5]]);
   assert.deepEqual(response.replies, [{ ok: true, status: 'idle', label: '采集器' }]);
   assert.ok(!JSON.stringify(response.replies).includes('token'));
+});
+
+test('Doubao content bridge exposes only the same bounded status and panel entry', async () => {
+  const app = background(), sender = { ...PAGE, url: 'https://www.doubao.com/chat/123' };
+  const status = app.message({ type: 'collector:content-state' }, sender); await tick();
+  assert.equal(status.replies[0].ok, true);
+  assert.equal(app.message({ type: 'collector:start' }, sender).replies[0].error.code, 'FORBIDDEN');
+  assert.equal(app.message({ type: 'collector:content-state' }, { ...sender, url: 'https://www.doubao.com.evil.test/' }).keepAlive, false);
 });
 
 test('content script cannot configure, bind, capture, sync, or fetch private UI state', async () => {
@@ -203,7 +213,7 @@ test('manifest exposes no external messages, executable remote code or web-acces
   assert.equal(manifest.web_accessible_resources, undefined);
   assert.deepEqual([...manifest.optional_host_permissions].sort(), [
     'https://chatgpt.com/*', 'https://*.oaiusercontent.com/*', 'https://*/*',
-    'https://api.github.com/*',
+    'https://api.github.com/*', 'https://www.doubao.com/*', 'https://*.byteimg.com/*',
   ].sort());
   assert.equal(manifest.host_permissions, undefined, 'All site access remains optional and gesture-authorized');
   assert.equal(manifest.content_scripts, undefined);

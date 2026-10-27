@@ -85,6 +85,22 @@ async function complete(engine, target = account) {
   throw new Error('Task did not finish');
 }
 
+test('Doubao descending list cursor survives a worker restart and stays isolated from ChatGPT jobs', async () => {
+  const f = setup({ list: async offset => ({ items: [source(offset === 0 ? '11' : '12')],
+    nextOffset: offset === 0 ? '1792227233738638' : null, total: null }) });
+  const target = { ...account, platform: 'doubao' };
+  f.dependencies.adapter.identify = async () => ({ accountKey: target.accountKey, platform: 'doubao' });
+  const detail = f.dependencies.adapter.detail;
+  f.dependencies.adapter.detail = async (...args) => { const value = await detail(...args); value.identity.platform = 'doubao'; return value; };
+  await f.engine.start({ account: target, tabId: 1 }); await f.engine.tick({ account: target, tabId: 1 });
+  assert.equal(f.store.get(key('Job')).offset, '1792227233738638');
+  const restarted = createCollectorEngine(f.dependencies);
+  await assert.rejects(restarted.tick({ account, tabId: 1 }), { code: 'ACCOUNT_CHANGED' });
+  const result = await complete(restarted, target);
+  assert.equal(result.status, 'completed'); assert.deepEqual(f.calls.pages, [0, '1792227233738638']);
+  assert.deepEqual(f.calls.saves.sort(), ['11', '12']);
+});
+
 test('detail reason survives a retry checkpoint and restart without saving an incomplete archive', async () => {
   const f = setup();
   f.dependencies.adapter.detail = async () => {

@@ -66,12 +66,12 @@ function assetFailureCode(value) { return typeof value === 'string' && /^[A-Z][A
 function assetFailureMessage(code) {
   // Error strings can originate in network/extension APIs. Only fixed messages
   // reach this diagnostic view; response bodies, signed URLs and tokens do not.
-  if (/^(?:HTTP_401|HTTP_403|IDENTITY)$/.test(code)) return '请确认 ChatGPT 已登录，且当前账号可以打开原始附件。';
+  if (/^(?:HTTP_401|HTTP_403|IDENTITY)$/.test(code)) return '请确认来源平台已登录，且当前账号可以打开原始附件。';
   if (code === 'HTTP_404') return '请求的附件入口返回 404。可能是来源已失效或下载入口不匹配，尚不能据此判断文件已删除。';
   if (code === 'HTTP_429') return '附件请求受到限流，请稍后重试。';
   if (/^HTTP_5\d\d$/.test(code)) return '附件服务暂时不可用，请稍后重试。';
   if (code === 'ACCOUNT_CHANGED') return '账号已切换，已停止处理。请回到附件所属账号后重试。';
-  if (/^(?:TAB_|ORIGIN)/.test(code)) return '请打开所属账号的 ChatGPT 标签页，并确认站点访问权限。';
+  if (/^(?:TAB_|ORIGIN)/.test(code)) return '请打开所属账号的来源平台标签页，并确认站点访问权限。';
   if (code === 'ASSET_PENDING') return '尚未取得可确认归属的原始附件。可打开对应对话和附件后重试；部分资源仍需适配。';
   if (code === 'ASSET_SOURCE_MISSING') return '最新对话中未找到此附件，已有文件和任务已保留。请打开对应对话检查后重试。';
   if (code === 'INCOMPLETE_DETAIL') return '本次返回的对话详情不完整，未覆盖已保存数据。请稍后重试。';
@@ -395,7 +395,7 @@ function renderSummary() {
   const target = $('wizard-summary');
   target.replaceChildren();
   const values = [
-    `ChatGPT · ${current.account?.alias || current.identity?.displayName || '尚未绑定'}`,
+    `${current.siteLabel || 'ChatGPT'} · ${current.account?.alias || current.identity?.displayName || '尚未绑定'}`,
     `保存到 ${current.directory?.name || directory?.name || '尚未选择'}`,
     '默认保存 JSON 与 Markdown',
     $('wizard-local-assets-enabled').checked ? '自动下载图片和附件到本地' : '附件保留来源，需要时手动下载',
@@ -449,7 +449,7 @@ function render() {
   const selectedName = account?.alias || identity?.displayName || '尚未识别账号';
   text('account-name', selectedName);
   text('account-avatar', identity ? Array.from(selectedName).slice(0, 2).join('').toUpperCase() : 'AI');
-  text('account-context', identity ? 'ChatGPT · 普通对话' : '打开并登录 ChatGPT 后自动识别');
+  text('account-context', identity ? `${current.siteLabel || 'ChatGPT'} · 普通对话` : '打开并登录 ChatGPT 或豆包后自动识别');
   text('account-badge', current.identityChecking ? '核验中' : !identity ? '等待登录' : account?.enabled ? '已启用' : '未启用');
   show('identity-checking-note', current.identityChecking === true);
   const hasIdentity = Boolean(identity?.accountKey);
@@ -460,8 +460,11 @@ function render() {
   const requiresPermission = !current.error || ['SITE_PERMISSION_DENIED', 'SITE_PERMISSION', 'SITE_PERMISSION_REQUIRED', 'PERMISSION_REQUIRED'].includes(current.error?.code);
   show('home-grant', !hasIdentity && requiresPermission);
   show('home-open-chatgpt', !hasIdentity && !requiresPermission);
+  show('home-open-doubao', !hasIdentity);
+  text('home-grant', `授权 ${current.siteLabel || 'ChatGPT'}`);
+  show('grant-doubao-images', current.platform === 'doubao');
   text('account-alert-text', hasIdentity ? '当前账号尚未启用。确认后会保存到它自己的目录。' :
-    safeMessage(current.error?.message || '请打开并登录 ChatGPT。页面会自动更新，无需手动选择标签页。'));
+    safeMessage(current.error?.message || '请打开并登录 ChatGPT 或豆包。页面会自动更新，无需手动选择标签页。'));
   if (activeAliasKey !== identity?.accountKey) {
     activeAliasKey = identity?.accountKey || null;
     $('account-alias').value = account?.alias || identity?.displayName || '';
@@ -573,7 +576,7 @@ function render() {
     text('count-unchanged', count(result.unchanged)); text('count-failed', count(result.failed));
     text('last-result-time', time(result.completedAt || result.finishedAt || result.updatedAt));
   }
-  text('settings-account', hasIdentity ? `ChatGPT · ${selectedName}` : '尚未识别当前账号');
+  text('settings-account', hasIdentity ? `${current.siteLabel || 'ChatGPT'} · ${selectedName}` : '尚未识别当前账号');
   if (screen === 'settings' && !settingsLoaded) fillSettings();
   if (isWizard) {
     if (!wizardLocalLoaded) {
@@ -587,8 +590,9 @@ function render() {
       item.classList.toggle('current', index === step); item.classList.toggle('done', index < step);
       if (index === step) item.setAttribute('aria-current', 'step'); else item.removeAttribute('aria-current');
     }
-    text('wizard-identity', identity ? `已识别：${selectedName}` : safeMessage(current.error?.message || '打开 ChatGPT 并完成授权后自动识别。'));
+    text('wizard-identity', identity ? `已识别：${selectedName}` : safeMessage(current.error?.message || '打开 ChatGPT 或豆包并完成授权后自动识别。'));
     show('grant-chatgpt', !identity); show('open-chatgpt', !identity);
+    show('grant-doubao', !identity); show('open-doubao', !identity);
     text('wizard-directory', directoryName); text('wizard-directory-permission', granted ? '读写权限已确认' : '需要选择或恢复写入权限');
     show('wizard-restore-directory', !granted && Boolean(current.directory?.name || directory));
     if (step === 3) renderSummary();
@@ -669,6 +673,10 @@ async function grantChatGPT() {
   if (!granted) throw new Error('未获得 ChatGPT 访问权限。需要时可再次授权。');
   await send('collector:permissions-changed');
 }
+async function grantDoubao() {
+  if (!await chrome.permissions.request({ origins: ['https://www.doubao.com/*'] })) throw new Error('未获得豆包访问权限。');
+  await send('collector:permissions-changed');
+}
 async function chooseDirectory() {
   if (!window.showDirectoryPicker) throw new Error('当前环境不支持选择真实目录，请使用桌面 Chrome 或 Edge。');
   const selected = await window.showDirectoryPicker({ mode: 'readwrite', id: 'ai-memory-collector-p0' });
@@ -727,7 +735,15 @@ async function closePanel(hide = false) {
   if (!setupPage) window.close();
 }
 action('grant-chatgpt', grantChatGPT);
-action('home-grant', grantChatGPT);
+action('home-grant', () => current.platform === 'doubao' ? grantDoubao() : grantChatGPT());
+action('grant-doubao', grantDoubao);
+action('settings-grant-doubao', grantDoubao);
+action('settings-grant-chatgpt', grantChatGPT);
+action('grant-doubao-images', async () => {
+  if (!await chrome.permissions.request({ origins: ['https://*.byteimg.com/*'] })) throw new Error('未获得豆包图片域名权限。');
+  await send('collector:permissions-changed');
+});
+for (const id of ['open-doubao', 'home-open-doubao']) action(id, () => chrome.tabs.create({ url: 'https://www.doubao.com/chat/' }));
 for (const id of ['open-chatgpt', 'home-open-chatgpt']) action(id, () => chrome.tabs.create({ url: 'https://chatgpt.com/' }));
 action('wizard-bind', async () => { await send('collector:bind', { alias: $('account-alias').value.trim() }); step = 1; });
 action('bind-account', () => send('collector:bind', { alias: $('new-account-alias').value.trim() }));

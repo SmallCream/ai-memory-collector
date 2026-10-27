@@ -1,3 +1,4 @@
+import { validateDoubaoConversation, DOUBAO_RENDERER_VERSION } from './doubao-format.js';
 import { buildArchive, RENDERER_VERSION } from './archive.js';
 import { analyzeAssets, reconcileAssetCapturePolicy } from './assets.js';
 import { getSetting, setSetting } from './storage.js';
@@ -15,6 +16,11 @@ const json = value => `${JSON.stringify(value, null, 2)}\n`;
 export function needsMarkdownRefresh(entry) {
   if (!entry) return false;
   if (entry.rendererVersion == null) return true;
+  if (entry.sourceFormat === 'doubao-web-chain') {
+    if (/^rich-/.test(entry.rendererVersion)) return true;
+    const previous = /^doubao-([1-9][0-9]*)$/.exec(entry.rendererVersion);
+    return Boolean(previous && Number(previous[1]) < Number(DOUBAO_RENDERER_VERSION.split('-')[1]));
+  }
   const previous = /^rich-([1-9][0-9]*)$/.exec(entry.rendererVersion);
   const current = /^rich-([1-9][0-9]*)$/.exec(RENDERER_VERSION);
   return Boolean(previous && current && Number(previous[1]) < Number(current[1]));
@@ -29,10 +35,10 @@ function safeSegment(value, maximum = 120) {
     !/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(value);
 }
 export function accountPrefix(account) {
-  if (account?.platform !== 'chatgpt' || !safeSegment(account.accountKey) || !safeSegment(account.storageKey)) {
+  if (!['chatgpt', 'doubao'].includes(account?.platform) || !safeSegment(account.accountKey) || !safeSegment(account.storageKey)) {
     fail('ACCOUNT_INVALID', '账号归档标识无效，未写入文件。');
   }
-  return `data/web/chatgpt/${account.storageKey}`;
+  return `data/web/${account.platform}/${account.storageKey}`;
 }
 function validatePath(path, prefix) {
   if (typeof path !== 'string' || !path.startsWith(`${prefix}/`) || path.length > 1024 ||
@@ -61,6 +67,7 @@ function sourceTime(value) {
 const hasTree = native => record(native?.mapping) && Object.keys(native.mapping).length > 0;
 
 function assertNativeNotPartial(native) {
+  if (native?.platform === 'doubao') return validateDoubaoConversation(native);
   if (!record(native)) return; // The archive builder reports malformed outer data.
   const partial = () => fail('PARTIAL_DETAIL', '原始详情仍有未读取内容或尚不能确认已结束的消息，已有归档保持不变。');
   if (['is_incomplete', 'has_more', 'has_more_messages', 'has_next_page', 'has_previous_page'].some(key => native[key] === true) ||
@@ -328,7 +335,7 @@ export function createArchiveStore({ get = getSetting, set = setSetting } = {}) 
   }
   async function saveUnlocked({ directory, account, detail, preferredEntry, assets, remoteMessageSync, preserveNativeHash }) {
     const prefix = accountPrefix(account);
-    if (!detail?.identity || detail.identity.accountKey !== account.accountKey) {
+    if (!detail?.identity || detail.identity.accountKey !== account.accountKey || (detail.identity.platform && detail.identity.platform !== account.platform) || (account.platform === 'doubao') !== (detail.payload?.platform === 'doubao')) {
       fail('ACCOUNT_MISMATCH', '采集结果与任务账号不一致，未写入文件。');
     }
     await ensurePermission(directory);

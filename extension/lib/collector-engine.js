@@ -20,20 +20,20 @@ const manualFailure = code => ['FORMAT', 'SIZE', 'ARCHIVE_FORMAT', 'ARCHIVE_SIZE
 const sourceVersion = item => JSON.stringify([item.listUpdateTime ?? null, item.title || '']);
 const ERROR_MESSAGES = {
   ACCOUNT_CHANGED: '采集所用会话已切换账号，原任务已暂停。',
-  IDENTITY: '无法确认登录身份，请在 ChatGPT 完成登录后继续。',
-  HTTP_401: 'ChatGPT 登录已过期，请重新登录后继续。',
-  HTTP_403: '网站需要验证或拒绝访问，请在 ChatGPT 页面处理后继续。',
+  IDENTITY: '无法确认登录身份，请在 来源平台 完成登录后继续。',
+  HTTP_401: '来源平台 登录已过期，请重新登录后继续。',
+  HTTP_403: '网站需要验证或拒绝访问，请在 来源平台 页面处理后继续。',
   HTTP_429: '平台暂时限流，已保留进度，稍后重试。',
   HTTP_404: '此对话暂时无法访问，已有归档保持不变。',
   DIRECTORY_PERMISSION: '需要恢复本地目录的读写权限。',
   NO_DIRECTORY: '尚未配置本地保存目录。',
   DIRECTORY_REQUIRED: '尚未配置本地保存目录。',
   DIRECTORY_CHANGED: '保存目录与未完成任务不一致，请恢复原目录后继续。',
-  SOURCE_UNAVAILABLE: 'ChatGPT 标签页不可用，重新打开并登录后继续。',
-  TAB_REQUIRED: '请打开已登录的 ChatGPT 标签页后继续。',
-  TAB_CLOSED: 'ChatGPT 标签页已关闭，重新打开后可继续采集。',
-  TAB_CHANGED: '采集标签页已离开 ChatGPT，重新打开后可继续采集。',
-  TAB_UNAVAILABLE: '暂时无法读取 ChatGPT，请检查网站权限和登录状态后继续。',
+  SOURCE_UNAVAILABLE: '来源平台 标签页不可用，重新打开并登录后继续。',
+  TAB_REQUIRED: '请打开已登录的 来源平台 标签页后继续。',
+  TAB_CLOSED: '来源平台 标签页已关闭，重新打开后可继续采集。',
+  TAB_CHANGED: '采集标签页已离开 来源平台，重新打开后可继续采集。',
+  TAB_UNAVAILABLE: '暂时无法读取 来源平台，请检查网站权限和登录状态后继续。',
   PARTIAL_DETAIL: '详情尚未完整取得或有消息尚不能确认已结束，已有归档保持不变。',
   INCOMPLETE_DETAIL: '详情尚未完整取得，已有归档保持不变。',
   STALE_DETAIL: '线上返回的版本较旧，未覆盖已有归档。',
@@ -113,7 +113,7 @@ function baselines(manifest, index, unfinished = []) {
 }
 
 function validateAccount(account) {
-  if (!account || account.enabled !== true || account.platform !== 'chatgpt' ||
+  if (!account || account.enabled !== true || !['chatgpt', 'doubao'].includes(account.platform) ||
       !/^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/.test(account.accountKey || '') ||
       !/^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/.test(account.storageKey || '')) {
     throw fail('ACCOUNT_NOT_ENABLED', '请先为当前账号启用采集。');
@@ -341,9 +341,11 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
   async function canSkip(job, account, directory, item) {
     if (job.mode === 'full' || item.listUpdateTime === null || !own(job.known, item.id)) return false;
     const known = job.known[item.id];
+    // Re-read the early Doubao build that missed serialized content resources.
+    if (account.platform === 'doubao' && (!known.rendererVersion || /^rich-/.test(known.rendererVersion))) return false;
     // Old persisted jobs have no complete baseline. Continue their original
     // pending queue safely; the next newly started scan uses the new policy.
-    if (needsMessageFullCheck(known, now()) || known.sourceCompleteness !== 'complete' ||
+    if ((account.platform === 'chatgpt' && needsMessageFullCheck(known, now())) || known.sourceCompleteness !== 'complete' ||
         (known.listUpdateTime !== item.listUpdateTime && known.sourceUpdatedAt !== item.listUpdateTime) ||
         (typeof known.title === 'string' && known.title.slice(0, 200) !== item.title)) return false;
     return hasConversationFiles(directory, account, known);
@@ -423,7 +425,9 @@ export function createCollectorEngine({ getSetting, setSetting, getDirectory, re
   async function listStep(job, account, tabId, directory) {
     const page = await adapter.list(tabId, { accountKey: account.accountKey, offset: job.offset });
     if (!page || !Array.isArray(page.items) || page.items.some(item => !/^[A-Za-z0-9_-]{1,160}$/.test(item?.id || ''))) throw fail('FORMAT');
-    if (!(page.nextOffset === null || Number.isSafeInteger(page.nextOffset) && page.nextOffset > job.offset)) throw fail('PAGINATION_STALLED');
+    if (!(page.nextOffset === null || (account.platform === 'doubao'
+      ? typeof page.nextOffset === 'string' && /^[0-9]{1,20}$/.test(page.nextOffset) && BigInt(page.nextOffset) > 0n && (job.offset === 0 || BigInt(page.nextOffset) < BigInt(job.offset))
+      : Number.isSafeInteger(page.nextOffset) && page.nextOffset > job.offset))) throw fail('PAGINATION_STALLED');
     if (page.items.length === 0 && page.nextOffset !== null) throw fail('PAGINATION_STALLED');
     if (job.pages >= MAX_PAGES || job.discovered + page.items.length > MAX_ITEMS) throw fail('ENUMERATION_INCOMPLETE');
     const seen = new Map(job.queue.map(item => [item.id, item]));

@@ -58,9 +58,9 @@ function configMatches(job, config) {
 function validateMetadata(accountText, manifestText, prefix, blobs) {
   const raw = parse(accountText), manifest = parse(manifestText);
   const storageKey = prefix.split('/').at(-1);
-  if (!record(raw) || raw.schemaVersion !== 1 || raw.platform !== 'chatgpt' || !safeSegment(raw.accountKey) ||
+  if (!record(raw) || raw.schemaVersion !== 1 || !['chatgpt', 'doubao'].includes(raw.platform) || !safeSegment(raw.accountKey) ||
       !safeSegment(storageKey) || raw.storageKey !== storageKey || raw.dataPath !== prefix) throw fail('RESTORE_METADATA');
-  const account = { platform: 'chatgpt', accountKey: raw.accountKey, storageKey,
+  const account = { platform: raw.platform, accountKey: raw.accountKey, storageKey,
     alias: typeof raw.alias === 'string' ? raw.alias.slice(0, 200) : storageKey,
     displayName: typeof raw.displayName === 'string' ? raw.displayName.slice(0, 200) : storageKey };
   if (accountPrefix(account) !== prefix || !record(manifest) || manifest.schemaVersion !== 1 ||
@@ -206,8 +206,8 @@ export function createRestoreService({ getSetting, setSetting, fetchRepositorySn
       for (const entry of snapshot.entries) {
         if (!validPath(entry?.path) || seen.has(entry.path)) throw fail('RESTORE_PATH');
         seen.add(entry.path);
-        const match = /^data\/web\/chatgpt\/([^/]+)\/(?:account\.json|archive\/manifest\.json)$/.exec(entry.path);
-        if (match) { if (!safeSegment(match[1])) throw fail('RESTORE_PATH'); prefixes.add(`data/web/chatgpt/${match[1]}`); }
+        const match = /^data\/web\/(chatgpt|doubao)\/([^/]+)\/(?:account\.json|archive\/manifest\.json)$/.exec(entry.path);
+        if (match) { if (!safeSegment(match[2])) throw fail('RESTORE_PATH'); prefixes.add(`data/web/${match[1]}/${match[2]}`); }
       }
       const job = { schemaVersion: 1, repository: snapshot.repository, branch: snapshot.branch,
         commitSha: snapshot.commitSha, treeSha: snapshot.treeSha, entries: snapshot.entries, empty: snapshot.empty,

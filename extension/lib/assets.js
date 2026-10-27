@@ -1,3 +1,4 @@
+import { doubaoResources } from './doubao-format.js';
 import { decodeHTMLEntities, extractRichReferences, referenceFileName, safePublicURL } from './rich-content.js';
 
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -77,6 +78,21 @@ export async function extractAssets(conversation) {
 
 /** Also identify legacy descriptors proven to be interface icons or ordinary file-viewer links by native context. */
 export async function analyzeAssets(conversation) {
+  if (conversation?.platform === 'doubao') {
+    const result = new Map();
+    for (const resource of doubaoResources(conversation)) {
+      const classified = classifyAssetReference(resource.sourceRef);
+      const sourceRef = classified.sourceRef;
+      const id = await sha256(`doubao:${resource.messageId}:${sourceRef}`);
+      if (result.has(id)) continue;
+      const asset = { id, sourceRef, sourceType: resource.managed ? 'platform' : classified.sourceType,
+        status: 'pending', kind: resource.kind, messageId: resource.messageId, fileName: resource.fileName,
+        references: [sourceRef], occurrences: [{ messageId: resource.messageId, path: resource.path, kind: resource.kind }] };
+      Object.defineProperty(asset, 'retrieval', { value: { url: resource.url, sourceRef: resource.url }, enumerable: false });
+      result.set(id, asset);
+    }
+    return { assets: [...result.values()], interfaceIconIds: [], ordinaryLinkIds: [] };
+  }
   const candidates = [];
   const fileContentReferences = new WeakSet();
   const add = (ref, info) => { if (typeof ref === 'string' && ref.trim()) candidates.push({ ref, ...info }); };

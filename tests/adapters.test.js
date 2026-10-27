@@ -14,8 +14,10 @@ function fixture(result, tabs = [{ url: 'https://chatgpt.com/c/demo' }, { url: '
   };
   return { adapter: createChatGPTAdapter(browser), calls };
 }
-test('registry supports only packaged ChatGPT adapter and exact HTTPS origin', () => {
-  assert.deepEqual(supportedPlatforms, ['chatgpt']);
+test('registry supports packaged ChatGPT and Doubao adapters with exact HTTPS origins', () => {
+  assert.deepEqual(supportedPlatforms, ['chatgpt', 'doubao']);
+  assert.equal(adapterForUrl('https://www.doubao.com/chat/123'), getAdapter('doubao'));
+  assert.equal(adapterForUrl('https://www.doubao.com.evil.test/'), null);
   assert.equal(adapterForUrl('https://chatgpt.com/c/demo'), getAdapter('chatgpt'));
   for (const url of ['http://chatgpt.com', 'https://chatgpt.com.example.test', 'https://example.test/?url=https://chatgpt.com', 'not-a-url']) {
     assert.equal(isChatGPTUrl(url), false); assert.equal(adapterForUrl(url), null);

@@ -44,7 +44,7 @@ export function cancelChatGPTRequests(request) {
 
 let requestSequence = 0;
 /** Cancellation races the browser reply as well as aborting the source fetch. */
-export function createRequestControl(browser) {
+export function createRequestControl(browser, cancelRequests = cancelChatGPTRequests) {
   const active = new Map();
   const api = () => typeof browser === 'function' ? browser() : browser;
   return {
@@ -78,7 +78,7 @@ export function createRequestControl(browser) {
       if (ids.length) {
         try {
           Promise.resolve(api()?.scripting.executeScript({ target: { tabId, frameIds: [0] }, world: 'ISOLATED',
-            func: cancelChatGPTRequests, args: [{ ids, ...(accountKey ? { accountKey } : {}) }] })).catch(() => {});
+            func: cancelRequests, args: [{ ids, ...(accountKey ? { accountKey } : {}) }] })).catch(() => {});
         } catch { /* Extension-side cancellation still rejects late replies. */ }
       }
       return { cancelled: ids.length };

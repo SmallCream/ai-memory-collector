@@ -1,10 +1,10 @@
+import { platformSites } from '../adapters/index.js';
 import { createConfigStore, publicConfig, cleanAlias, collectorError, safeError, INTERVALS } from './config.js';
 import { createActivityLog } from './activity-log.js';
 import { createLocalUploadQueue } from './local-upload-queue.js';
 export const ALARM_NAME = 'collector-work';
-const ORIGIN = 'https://chatgpt.com/*';
-const SCRIPT_ID = 'collector-chatgpt-entry';
-const matches = value => { try { return new URL(value).origin === 'https://chatgpt.com'; } catch { return false; } };
+const siteFor = value => { try { return platformSites.find(site => site.origin === new URL(value).origin); } catch { return null; } };
+const matches = value => Boolean(siteFor(value));
 
 export function createCollectorService({ browser, getSetting, setSetting, getSettingsByPrefix, adapter, createEngine,
   readAccountManifest, hasConversationFiles, readConversationBaseline, saveConversation, applyRemoteFiles, syncArchives, probeRepository,
@@ -63,11 +63,11 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
   async function sourceTab(preferred) {
     if (Number.isInteger(preferred)) {
       try { const tab = await browser.tabs.get(preferred); if (matches(tab.url)) return tab; } catch { /* closed */ }
-      throw collectorError('TAB_UNAVAILABLE', '当前 ChatGPT 标签页已关闭或离开网站，请重新打开。');
+      throw collectorError('TAB_UNAVAILABLE', '当前 ChatGPT 或豆包 标签页已关闭或离开网站，请重新打开。');
     }
     const active = await browser.tabs.query({ active: true, lastFocusedWindow: true });
     if (active[0] && matches(active[0].url)) return active[0];
-    return (await browser.tabs.query({ url: ORIGIN })).sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0] || null;
+    return (await Promise.all(platformSites.map(site => browser.tabs.query({ url: `${site.origin}/*` })))).flat().sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0] || null;
   }
   async function identify(tab, force = false, waitForPause = true) {
     if (!tab) return null;
@@ -97,17 +97,19 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
   }
   async function context(tabId, force = false) {
     const tab = await sourceTab(tabId);
-    if (!tab) throw collectorError('TAB_UNAVAILABLE', '请打开并登录 ChatGPT，插件会自动识别。');
+    if (!tab) throw collectorError('TAB_UNAVAILABLE', '请打开并登录 ChatGPT 或豆包，插件会自动识别。');
     const identity = await identify(tab, force), config = await settings.read();
     return { tab, identity, account: config.accounts[identity.accountKey], config };
   }
   async function state(tabId) {
     const config = await settings.read();
     let current = null, error = startupError;
-    if (await browser.permissions.contains({ origins: [ORIGIN] })) {
+    const selectedTab = await sourceTab(tabId).catch(() => null);
+    const site = siteFor(selectedTab?.url) || platformSites[0];
+    if (await browser.permissions.contains({ origins: [`${site.origin}/*`] })) {
       try {
-        const tab = await sourceTab(tabId);
-        if (!tab) throw collectorError('TAB_UNAVAILABLE', '请打开并登录 ChatGPT，插件会自动识别。');
+        const tab = selectedTab;
+        if (!tab) throw collectorError('TAB_UNAVAILABLE', '请打开并登录 ChatGPT 或豆包，插件会自动识别。');
         const cached = identities.get(tab.id);
         if (cached && (now() - cached.at >= 10000 || identityReads.has(tab.id))) {
           // Polling remains observable while identity verification or an older
@@ -123,9 +125,9 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
           current = { tab, identity, account: config.accounts[identity.accountKey] };
         }
       } catch (e) { error = safeError(e); }
-    } else error = { code: 'SITE_PERMISSION_REQUIRED', message: '请先授权访问 ChatGPT，之后会自动识别当前账号。' };
+    } else error = { code: 'SITE_PERMISSION_REQUIRED', message: '请先授权访问 ChatGPT 或豆包，之后会自动识别当前账号。' };
     const account = current?.account || null, directory = await directoryState();
-    return { config: publicConfig(config), directory,
+    return { config: publicConfig(config), directory, platform: site.platform, siteOrigin: site.origin, siteLabel: site.label,
       identity: current?.identity || null, identityChecking: current?.identityChecking === true, account,
       job: account ? await engine.getState(account.accountKey) : null,
       lastResult: account?.lastResult || null,
@@ -147,7 +149,7 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
     const { identity } = await context(tabId, true);
     await settings.change(config => {
       const old = config.accounts[identity.accountKey];
-      config.accounts[identity.accountKey] = { ...old, platform: 'chatgpt', accountKey: identity.accountKey,
+      config.accounts[identity.accountKey] = { ...old, platform: identity.platform, accountKey: identity.accountKey,
         displayName: identity.displayName, alias: old?.alias || cleanAlias(alias, identity.displayName),
         storageKey: old?.storageKey || identity.accountKey, enabled: true,
         initialized: old?.initialized || false, nextRunAt: old?.nextRunAt || now() };
@@ -468,8 +470,8 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
       if (changingDirectory) return [];
       if (restoring) return [restoring];
       const seen = new Set(), work = [];
-      if (await browser.permissions.contains({ origins: [ORIGIN] })) {
-        const tabs = await browser.tabs.query({ url: ORIGIN });
+      for (const site of platformSites) if (await browser.permissions.contains({ origins: [`${site.origin}/*`] })) {
+        const tabs = await browser.tabs.query({ url: `${site.origin}/*` });
         await Promise.allSettled(tabs.sort((a, b) => Number(b.active) - Number(a.active)).map(async tab => {
           const identity = await identify(tab);
           if (seen.has(identity.accountKey)) return;
@@ -497,28 +499,33 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
       ...(matches(tab.url) ? { path: `panel.html?tab=${tab.id}` } : {}) });
   }
   async function registerContent() {
-    if (!await browser.permissions.contains({ origins: [ORIGIN] })) {
-      const scripts = await browser.scripting.getRegisteredContentScripts({ ids: [SCRIPT_ID] });
-      if (scripts.length) await browser.scripting.unregisterContentScripts({ ids: [SCRIPT_ID] });
-      // tabs.query without host access still exposes tab IDs; no reading of page
-      // content or broad host permission is needed to hide our own UI.
-      for (const tab of await browser.tabs.query({})) {
-        await browser.sidePanel.setOptions({ tabId: tab.id, enabled: false });
-        try { await browser.tabs.sendMessage(tab.id, { type: 'collector:hide-entry' }); } catch { /* no content entry */ }
+    for (const site of platformSites) {
+      const origin = `${site.origin}/*`, scriptId = site.scriptId;
+      const scripts = await browser.scripting.getRegisteredContentScripts({ ids: [scriptId] });
+      const registered = scripts.some(script => script.id === scriptId);
+      if (!await browser.permissions.contains({ origins: [origin] })) {
+        if (registered) await browser.scripting.unregisterContentScripts({ ids: [scriptId] });
+        for (const tab of await browser.tabs.query({})) {
+          // Without host access tab.url may be unavailable. Hide only the revoked
+          // platform's known tab, never the other platform's active panel.
+          const cached = identities.get(tab.id);
+          if (siteFor(tab.url)?.platform !== site.platform && cached?.identity.platform !== site.platform) continue;
+          await browser.sidePanel.setOptions({ tabId: tab.id, enabled: false });
+          try { await browser.tabs.sendMessage(tab.id, { type: 'collector:hide-entry' }); } catch { /* no entry */ }
+        }
+        for (const [tabId, cached] of identities) if (cached.identity.platform === site.platform) {
+          const interrupted = (await engine.getState(cached.identity.accountKey))?.status === 'running';
+          await cancelSource(tabId, cached.identity.accountKey);
+          await engine.suspend(cached.identity.accountKey, 'SITE_PERMISSION_DENIED', { interrupted });
+          identities.delete(tabId);
+        }
+        continue;
       }
-      for (const [tabId, cached] of identities) {
-        const interrupted = (await engine.getState(cached.identity.accountKey))?.status === 'running';
-        await cancelSource(tabId, cached.identity.accountKey);
-        await engine.suspend(cached.identity.accountKey, 'SITE_PERMISSION_DENIED', { interrupted });
+      if (!registered) await browser.scripting.registerContentScripts([{ id: scriptId, matches: [origin], js: ['content.js'], runAt: 'document_idle', persistAcrossSessions: true }]);
+      for (const tab of await browser.tabs.query({ url: origin })) {
+        await enableTab(tab);
+        try { await browser.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] }); } catch { /* navigating */ }
       }
-      identities.clear();
-      return;
-    }
-    const scripts = await browser.scripting.getRegisteredContentScripts({ ids: [SCRIPT_ID] });
-    if (!scripts.length) await browser.scripting.registerContentScripts([{ id: SCRIPT_ID, matches: [ORIGIN], js: ['content.js'], runAt: 'document_idle', persistAcrossSessions: true }]);
-    for (const tab of await browser.tabs.query({ url: ORIGIN })) {
-      await enableTab(tab);
-      try { await browser.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] }); } catch { /* navigating */ }
     }
   }
   async function initialize() {
@@ -562,8 +569,9 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
       case 'collector:permissions-changed': await registerContent(); break;
       case 'collector:retry-images': {
         if (!assetService?.retryFailed) throw collectorError('ASSET_UNAVAILABLE', '当前版本不支持附件补采。');
-        if (!await browser.permissions.contains({ origins: [ORIGIN] })) throw collectorError('SITE_PERMISSION_REQUIRED', '请先恢复 ChatGPT 站点访问权限。');
-        const { account } = await context(tabId, true);
+        const tab = await sourceTab(tabId), site = siteFor(tab?.url);
+        if (!site || !await browser.permissions.contains({ origins: [site.origin + '/*'] })) throw collectorError('SITE_PERMISSION_REQUIRED', '请先恢复当前平台的站点访问权限。');
+        const { account } = await context(tab.id, true);
         if (!account?.enabled) throw collectorError('ACCOUNT_DISABLED', '请先启用当前账号。');
         if (!(await directoryState()).granted) throw collectorError('DIRECTORY_PERMISSION', '请在设置中恢复保存目录权限。');
         await queueAccount(account.accountKey, () => assetService.retryFailed({ account,

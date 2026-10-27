@@ -10,7 +10,7 @@ const pkg = JSON.parse(await readFile(resolve(root, 'package.json'), 'utf8'));
 assert.equal(manifest.manifest_version, 3);
 assert.equal(manifest.version, pkg.version, 'Package and extension versions differ');
 assert.deepEqual([...manifest.permissions].sort(), ['activeTab', 'alarms', 'scripting', 'sidePanel']);
-assert.deepEqual(manifest.optional_host_permissions, ['https://chatgpt.com/*', 'https://api.github.com/*', 'https://*.oaiusercontent.com/*', 'https://*/*']);
+assert.deepEqual(manifest.optional_host_permissions, ['https://chatgpt.com/*', 'https://www.doubao.com/*', 'https://api.github.com/*', 'https://*.oaiusercontent.com/*', 'https://*.byteimg.com/*', 'https://*/*']);
 assert.equal(manifest.host_permissions, undefined, 'Site access must remain optional');
 assert.equal(manifest.content_scripts, undefined, 'Content entry is registered only after site authorization');
 assert.equal(manifest.externally_connectable, undefined);

@@ -34,7 +34,7 @@ function fixture(options = {}) {
   const browser = {
     permissions: { contains: async ({ origins }) => origins.every(origin => permissions.has(origin)) },
     tabs: { get: async id => { const tab = tabs.find(t => t.id === id); if (!tab) throw issue('TAB_CLOSED'); return tab; },
-      query: async query => tabs.filter(t => (!query.active || t.active) && (!query.url || t.url.startsWith('https://chatgpt.com/'))),
+      query: async query => tabs.filter(t => (!query.active || t.active) && (!query.url || t.url.startsWith(query.url.replace('*', '')))),
       sendMessage: async (id, message) => calls.messages.push({ id, message }) },
     sidePanel: { setOptions: async value => calls.panels.push(value) },
     scripting: { getRegisteredContentScripts: async () => [...scripts.values()],
@@ -89,6 +89,25 @@ async function complete(f) {
   }
   throw new Error('Job did not complete');
 }
+
+test('Doubao permissions and binding are independent; revocation keeps ChatGPT available', async () => {
+  const f = fixture(), doubaoKey = 'acct-' + 'd'.repeat(24);
+  f.tabs.push({ id: 2, url: 'https://www.doubao.com/chat/123', active: false });
+  f.identities.set(2, { platform: 'doubao', accountKey: doubaoKey, displayName: 'Synthetic Doubao' });
+  assert.equal((await f.service.state(2)).error.code, 'SITE_PERMISSION_REQUIRED');
+  f.permissions.add('https://www.doubao.com/*');
+  await f.service.command({ type: 'collector:permissions-changed' }, 2);
+  await f.service.command({ type: 'collector:bind', alias: '豆包测试' }, 2);
+  assert.equal(f.config().accounts[doubaoKey].platform, 'doubao');
+  assert.equal(f.config().accounts[accountKey].platform, 'chatgpt');
+  assert.equal(f.scripts.size, 2); assert.equal((await f.service.state(2)).platform, 'doubao');
+  f.calls.panels.length = 0; f.permissions.delete('https://www.doubao.com/*');
+  await f.service.command({ type: 'collector:permissions-changed' }, 1);
+  assert.equal(f.scripts.has('collector-doubao-entry'), false);
+  assert.equal(f.scripts.has('collector-chatgpt-entry'), true);
+  assert.ok(!f.calls.panels.some(p => p.tabId === 1 && p.enabled === false));
+  assert.equal((await f.service.state(1)).identity.accountKey, accountKey);
+});
 
 test('pause reaches an in-flight detail between pages without waiting for the filesystem lock; resume retries it', async () => {
   const f = fixture(), started = deferred(), page = deferred();

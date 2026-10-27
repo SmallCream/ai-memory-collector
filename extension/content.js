@@ -1,5 +1,5 @@
 (() => {
-  if (location.origin !== 'https://chatgpt.com' || window.top !== window) return;
+  if (!['https://chatgpt.com', 'https://www.doubao.com'].includes(location.origin) || window.top !== window) return;
   const HOST_ID = 'ai-memory-collector-entry';
   if (document.getElementById(HOST_ID)) return;
   const host = document.createElement('div');

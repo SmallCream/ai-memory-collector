@@ -1,3 +1,4 @@
+import { validateDoubaoConversation, redactDoubaoMetadata, renderDoubaoMessages, DOUBAO_RENDERER_VERSION } from './doubao-format.js';
 /** Native web-detail JSON is authoritative; Markdown is derived from the same snapshot. */
 import { renderRichText } from './rich-content.js';
 import { createAssetResolver, sanitizeAssetRecords, extractAssets } from './assets.js';
@@ -204,11 +205,11 @@ function selectedBranch(conversation) {
   return { nodes, warnings, partial: warnings.length > 0, mode: 'current-branch' };
 }
 
-function checkedManifest(existingManifest, prefix, accountKey) {
+function checkedManifest(existingManifest, prefix, accountKey, platform = PLATFORM) {
   if (existingManifest === undefined || existingManifest === null) {
-    return { schemaVersion: 1, platform: PLATFORM, accountKey, conversations: {} };
+    return { schemaVersion: 1, platform, accountKey, conversations: {} };
   }
-  if (!isRecord(existingManifest) || existingManifest.schemaVersion !== 1 || existingManifest.platform !== PLATFORM ||
+  if (!isRecord(existingManifest) || existingManifest.schemaVersion !== 1 || existingManifest.platform !== platform ||
       existingManifest.accountKey !== accountKey || !isRecord(existingManifest.conversations)) {
     throw new Error('现有归档清单格式或账号归属不匹配，未覆盖。');
   }
@@ -234,6 +235,9 @@ function checkedManifest(existingManifest, prefix, accountKey) {
  * Filesystem callers must independently verify ownership and external edits before writing.
  */
 export async function buildArchive({ conversation, identity, capturedAt, existingManifest, productionPrefix, assets } = {}) {
+  const platform = conversation?.platform === 'doubao' ? 'doubao' : PLATFORM;
+  if (platform === 'doubao') validateDoubaoConversation(conversation);
+  if (identity?.platform && identity.platform !== platform) throw new Error('平台归属不匹配。');
   const hasMapping = isRecord(conversation?.mapping) && Object.keys(conversation.mapping).length > 0;
   const hasMessages = Array.isArray(conversation?.messages);
   if (!isRecord(conversation) || (!hasMapping && !hasMessages)) {
@@ -250,23 +254,23 @@ export async function buildArchive({ conversation, identity, capturedAt, existin
   const captureTime = dateValue(capturedAt);
   if (!captureTime) throw new Error('capturedAt 必须是有效时间。');
   if (productionPrefix !== undefined && (typeof productionPrefix !== 'string' ||
-      !/^data\/web\/chatgpt\/[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/.test(productionPrefix) ||
+      !new RegExp(`^data/web/${platform}/[A-Za-z0-9][A-Za-z0-9_-]{0,119}$`).test(productionPrefix) ||
       /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(productionPrefix.split('/').at(-1)))) {
     throw new Error('正式归档目录不合法。');
   }
-  const prefix = productionPrefix ?? `p0-captures/${PLATFORM}/${accountKey}`;
-  const manifest = checkedManifest(existingManifest, prefix, accountKey);
+  const prefix = productionPrefix ?? `p0-captures/${platform}/${accountKey}`;
+  const manifest = checkedManifest(existingManifest, prefix, accountKey, platform);
   const previous = own(manifest.conversations, id) ? manifest.conversations[id] : null;
   const redactions = [];
-  const native = sanitizedCopy(conversation, '', redactions);
+  const native = sanitizedCopy(platform === 'doubao' ? redactDoubaoMetadata(conversation, redactions) : conversation, '', redactions);
   const content = json(native);
   const contentHash = await hash(content);
-  const branch = selectedBranch(native);
+  const branch = platform === 'doubao' ? { nodes: [], warnings: ['豆包当前消息链已分页读取；重新生成记录和非正文块保留在 JSON，历史分支覆盖范围未验证。'], partial: false, mode: 'doubao-chain' } : selectedBranch(native);
   const warnings = [...branch.warnings];
   const sourcePartial = native.is_incomplete === true || native.page_info?.has_next_page === true || native.page_info?.has_previous_page === true;
   if (sourcePartial) warnings.push('来源提示还有未取得内容，当前档案为部分覆盖。');
   const allNodes = hasMapping ? Object.values(native.mapping) : native.messages.map(item => own(item, 'message') ? item : { message: item });
-  const generation = inspectMessageGeneration(native);
+  const generation = platform === 'doubao' ? { unfinishedCount: 0, historicalUnfinishedCount: 0, unresolvedUnfinishedCount: 0 } : inspectMessageGeneration(native);
   const generationState = generation.unfinishedCount > 0 ? {
     policy: 'closed-descendant-v1', historicalUnfinishedCount: generation.historicalUnfinishedCount,
     unresolvedUnfinishedCount: generation.unresolvedUnfinishedCount,
@@ -310,7 +314,7 @@ export async function buildArchive({ conversation, identity, capturedAt, existin
     }
   }
   const resolveAsset = createAssetResolver(renderRecords, markdownPath);
-  const displayed = selectedMessages.map(({ node, nodeKey }) => displayedMessage(node.message,
+  const displayed = platform === 'doubao' ? renderDoubaoMessages(native, resolveAsset) : selectedMessages.map(({ node, nodeKey }) => displayedMessage(node.message,
     (ref, options) => resolveAsset(ref, { ...options, messageId: String(node.message.id ?? nodeKey) }), assets !== undefined)).filter(Boolean);
   const lines = [`# ${label(title)}`, ''];
   for (const [index, message] of displayed.entries()) {
@@ -319,8 +323,8 @@ export async function buildArchive({ conversation, identity, capturedAt, existin
   }
   const markdown = `${lines.join('\n').trimEnd()}\n`;
   const entry = {
-    conversationId: id, jsonPath, markdownPath, sourceFormat: 'chatgpt-web-detail',
-    contentHash, markdownHash: await hash(markdown), rendererVersion: RENDERER_VERSION,
+    conversationId: id, jsonPath, markdownPath, sourceFormat: platform === 'doubao' ? 'doubao-web-chain' : 'chatgpt-web-detail',
+    contentHash, markdownHash: await hash(markdown), rendererVersion: platform === 'doubao' ? DOUBAO_RENDERER_VERSION : RENDERER_VERSION,
     title, namingTime, pathTimeBasis: previous?.pathTimeBasis || (sourceCreated ? 'source-created' : 'first-observed'),
     firstCapturedAt: previous?.firstCapturedAt || captureTime,
     // Repeated identical capture is byte-stable, including the derived manifest.
@@ -330,7 +334,7 @@ export async function buildArchive({ conversation, identity, capturedAt, existin
     ...(assets !== undefined ? { assets: resourceRecords } : {}),
   };
   Object.defineProperty(manifest.conversations, id, { value: entry, enumerable: true, writable: true, configurable: true });
-  const account = { schemaVersion: 1, platform: PLATFORM, accountKey,
+  const account = { schemaVersion: 1, platform, accountKey,
     displayName: typeof identity?.displayName === 'string' ? identity.displayName : accountKey,
     dataPath: prefix, purpose: productionPrefix ? 'conversation-archive' : 'p0-capture' };
   return {
@@ -339,7 +343,7 @@ export async function buildArchive({ conversation, identity, capturedAt, existin
       { path: `${prefix}/archive/manifest.json`, content: json(manifest) },
       { path: `${prefix}/account.json`, content: json(account) },
     ], manifest,
-    summary: { conversationId: id, title, contentHash, sourceFormat: 'chatgpt-web-detail',
+    summary: { conversationId: id, title, contentHash, sourceFormat: platform === 'doubao' ? 'doubao-web-chain' : 'chatgpt-web-detail',
       nodeCount: allNodes.length, messageCount,
       currentBranchMessageCount: branch.mode === 'current-branch' ? selectedMessages.length : null,
       displayedMessageCount: displayed.length, renderMode: branch.mode,

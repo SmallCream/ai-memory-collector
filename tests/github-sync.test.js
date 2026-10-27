@@ -109,6 +109,24 @@ test('atomic commit stores native JSON, readable Markdown and manifest together,
   assert.equal(server.calls.filter(c => c.method === 'PATCH').length, 1);
 });
 
+test('Doubao and ChatGPT archives can share a repository without sharing platform directories', async () => {
+  const prefix = 'data/web/doubao/demo-dddddddd', accountKey = 'acct-' + 'd'.repeat(24);
+  const archive = await buildArchive({ identity: { platform: 'doubao', accountKey }, productionPrefix: prefix,
+    capturedAt: '2026-10-26T00:00:00Z', conversation: { platform: 'doubao', sourceFormat: 'doubao-web-chain',
+      conversation_id: '123', title: '豆包测试', create_time: 100, update_time: 101,
+      conversation: { conversation_id: '123' }, messages: [{ message_id: '456', conversation_id: '123', index_in_conv: '1',
+        user_type: 1, status: 0, content_status: 0, ext: { is_finish: '1' },
+        content_block: [{ is_finish: true, content: { text_block: { text: '合成正文' } } }] }], has_more: false } });
+  const old = bundle(), server = gitServer({ initial: fileMap(old) });
+  const result = await syncArchives({ config: CONFIG, bundles: [{ accountKey, files: archive.files }], fetchImpl: server.fetchImpl });
+  assert.equal(result.status, 'synced'); assert.equal(result.filesChanged, 4);
+  for (const file of old.files) assert.equal(server.files()[file.path], file.content);
+  assert.equal(JSON.parse(server.files()[prefix + '/account.json']).platform, 'doubao');
+  assert.equal(server.files()[archive.files[0].path], archive.files[0].content);
+  const replay = await syncArchives({ config: CONFIG, bundles: [{ accountKey, files: archive.files }], fetchImpl: server.fetchImpl });
+  assert.equal(replay.status, 'unchanged');
+});
+
 test('an identical replay performs no writes and never leaks the token', async () => {
   const b = bundle(), server = gitServer({ initial: fileMap(b) });
   const r = await syncArchives({ config: CONFIG, bundles: [b], fetchImpl: server.fetchImpl });
