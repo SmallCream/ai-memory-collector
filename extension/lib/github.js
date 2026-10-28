@@ -206,3 +206,6 @@ export async function commitProbe(input) {
   }
   return result('created', written.data.commit.sha, true);
 }
+
+// Shared transport for production archive sync. Credentials remain in this client.
+export { client as createGitHubClient, inspectRepository as inspectGitHubRepository };

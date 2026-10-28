@@ -1,0 +1,227 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { assetFailureReason, assetFailureDiagnosticMessage, sanitizeAssetFailureDiagnostics,
+  assetFailureAttemptSummaries, externalAssetFailure } from '../extension/lib/asset-failure.js';
+
+test('external verification failures retain distinct safe causes through storage and UI lookup', () => {
+  const cases = [
+    ['permission-required', 'external_permission_required'],
+    ['redirect', 'external_redirect_unresolved'],
+    ['authentication-required', 'external_authentication_required'],
+    ['http-error', 'external_http_error'],
+    ['html-response', 'external_html_response'],
+    ['unsupported-content', 'external_content_unsupported'],
+    ['content-mismatch', 'external_content_mismatch'],
+    ['timeout', 'external_timeout'],
+    ['network-or-cors', 'external_network_or_cors'],
+    ['too-large', 'external_too_large'],
+    ['empty-content', 'external_empty_content'],
+    ['stream-unavailable', 'external_stream_unavailable'],
+    ['temporary-url', 'external_temporary_url'],
+    ['invalid-url', 'external_invalid_url'],
+    ['unsupported-url', 'external_unsupported_url'],
+    ['non-public-host', 'external_non_public_host'],
+    ['invalid-limit', 'external_invalid_limit'],
+  ];
+  const messages = new Set();
+  for (const [sourceReason, reason] of cases) {
+    const failure = externalAssetFailure({ status: 'unknown', reason: sourceReason });
+    assert.equal(failure.code, 'ASSET_LINK_UNKNOWN');
+    assert.deepEqual(assetFailureReason(failure), { reason, message: failure.message });
+    assert.equal(assetFailureDiagnosticMessage({ code: failure.code, reason }), failure.message);
+    assert.equal(assetFailureDiagnosticMessage({ code: 'HTTP_404', reason }), null);
+    messages.add(failure.message);
+  }
+  assert.equal(messages.size, cases.length);
+});
+
+test('external HTTP 404 is reported only from an exact observed numeric status', () => {
+  const notFound = externalAssetFailure({ reason: 'http-error', httpStatus: 404 });
+  assert.equal(assetFailureReason(notFound).reason, 'external_http_not_found');
+  assert.match(notFound.message, /不能据此判断/);
+  for (const value of ['404', -404, 404.5, Infinity, NaN, {}, 999, undefined]) {
+    const failure = externalAssetFailure({ reason: 'http-error', httpStatus: value });
+    assert.equal(assetFailureReason(failure).reason, 'external_http_error');
+  }
+  assert.equal(assetFailureReason(externalAssetFailure({ reason: 'redirect', httpStatus: 404 })).reason,
+    'external_redirect_unresolved');
+});
+
+test('external failure conversion never copies URL, raw response text or unrecognized reason values', () => {
+  const secret = 'https://example.test/private?token=synthetic-secret Bearer synthetic-secret <html>private</html>';
+  const baseline = externalAssetFailure({ reason: 'unknown' });
+  for (const result of [null, undefined, {}, secret,
+    { reason: secret, message: secret, body: secret, url: secret, httpStatus: secret },
+    { reason: '__proto__' }, { reason: 'constructor' }, { reason: { toString: () => 'permission-required' } },
+  ]) assert.deepEqual(externalAssetFailure(result), baseline);
+  for (const reason of ['redirect', 'permission-required', 'authentication-required', 'http-error']) {
+    const failure = externalAssetFailure({ reason, message: secret, body: secret, url: secret,
+      headers: { authorization: secret }, httpStatus: 404 });
+    assert.doesNotMatch(JSON.stringify(failure), /synthetic-secret|https:|Bearer|<html>|headers|authorization/);
+    assert.equal(assetFailureReason({ ...failure, message: failure.message + secret }), null);
+  }
+  baseline.message = secret;
+  assert.doesNotMatch(externalAssetFailure({ reason: 'unknown' }).message, /synthetic-secret/);
+});
+
+test('legacy external errors retain only the facts the older verifier recorded', () => {
+  assert.equal(assetFailureReason({ code: 'ASSET_LINK_UNKNOWN', message: '请在设置中允许检测外链附件；链接已保留。' }).reason,
+    'external_permission_required');
+  assert.equal(assetFailureReason({ code: 'ASSET_LINK_UNKNOWN', message: '外链暂时无法匿名验证，链接已保留，未自动上传。' }).reason,
+    'external_unknown');
+});
+
+test('known format failures retain distinct bounded explanations, including both HTML rejection paths', () => {
+  const cases = [
+    ['附件请求返回了网页，未作为附件保存。', 'format_html_response'],
+    ['附件请求返回了网页，未保存。', 'format_html_response'],
+    ['附件类型或文件头无法确认，未保存为原图。', 'format_image_unconfirmed'],
+    ['附件类型与来源信息不一致，未保存。', 'format_response_unconfirmed'],
+    ['附件类型或文件内容无法确认，未保存。', 'format_content_validation_failed'],
+    ['返回内容不是受支持的原始附件，已保留来源等待补采。', 'format_content_unsupported'],
+    ['内嵌附件格式不正确。', 'format_embedded_encoding_invalid'],
+  ];
+  for (const [message, reason] of cases) {
+    const diagnostic = assetFailureReason({ code: 'ASSET_FORMAT', message });
+    assert.equal(diagnostic.reason, reason);
+    assert.equal(assetFailureDiagnosticMessage({ code: 'ASSET_FORMAT', reason }), diagnostic.message);
+  }
+  assert.match(assetFailureDiagnosticMessage({ code: 'ASSET_FORMAT', reason: 'format_image_unconfirmed' }), /或/);
+  assert.match(assetFailureDiagnosticMessage({ code: 'ASSET_FORMAT', reason: 'format_response_unconfirmed' }), /为空/);
+});
+
+test('known input failures identify only the exact validation that reported them', () => {
+  const cases = [
+    ['缺少附件来源信息。', 'input_source_missing'],
+    ['附件来源消息标识不合法。', 'input_message_invalid'],
+    ['附件来源标识不合法或不一致。', 'input_source_invalid'],
+    ['附件哈希格式无效。', 'input_hash_invalid'],
+    ['附件大小上限必须介于 1 字节和 16 MiB。', 'input_limit_invalid'],
+    ['附件所属对话标识不合法。', 'input_conversation_invalid'],
+    ['附件请求缺少有效账号和资源信息。', 'input_context_invalid'],
+    ['附件请求参数不合法。', 'input_parameters_invalid'],
+  ];
+  for (const [message, reason] of cases) {
+    assert.equal(assetFailureReason({ code: 'ASSET_INPUT', message }).reason, reason);
+    assert.equal(assetFailureDiagnosticMessage({ code: 'ASSET_FORMAT', reason }), null);
+  }
+});
+
+test('pre-0.3.15 image wording in existing queued errors receives the same safe reasons', () => {
+  const cases = [
+    ['ASSET_FORMAT', '图片请求返回了网页，未作为图片保存。', 'format_html_response'],
+    ['ASSET_FORMAT', '图片类型或文件头无法确认，未保存为原图。', 'format_image_unconfirmed'],
+    ['ASSET_FORMAT', '内嵌图片格式不正确。', 'format_embedded_encoding_invalid'],
+    ['ASSET_INPUT', '缺少图片来源信息。', 'input_source_missing'],
+    ['ASSET_INPUT', '图片来源标识不合法或不一致。', 'input_source_invalid'],
+    ['ASSET_INPUT', '图片哈希格式无效。', 'input_hash_invalid'],
+    ['ASSET_INPUT', '图片大小上限必须介于 1 字节和 16 MiB。', 'input_limit_invalid'],
+    ['ASSET_INPUT', '图片所属对话标识不合法。', 'input_conversation_invalid'],
+    ['ASSET_INPUT', '图片请求缺少有效账号和资源信息。', 'input_context_invalid'],
+    ['ASSET_INPUT', '图片请求参数不合法。', 'input_parameters_invalid'],
+  ];
+  for (const [code, message, reason] of cases) {
+    assert.deepEqual(assetFailureReason({ code, message }), { reason, message: assetFailureDiagnosticMessage({ code, reason }) });
+    assert.equal(assetFailureReason({ code, message: `${message} https://example.com/?token=private` }), null);
+  }
+});
+
+test('unknown, contaminated and mismatched messages never become diagnostic text', () => {
+  const known = '附件请求返回了网页，未保存。';
+  const sensitive = ' https://chatgpt.com/backend-api/estuary/content?sig=secret Bearer private <html>private body</html>';
+  for (const error of [
+    null, undefined, {}, 'ASSET_FORMAT',
+    { code: 'ASSET_FORMAT', message: sensitive },
+    { code: 'ASSET_FORMAT', message: known + sensitive },
+    { code: 'ASSET_FORMAT', message: ` ${known}` },
+    { code: 'ASSET_INPUT', message: known },
+    { code: 'HTTP_403', message: known },
+    { code: 'ASSET_FORMAT', message: { toString: () => known } },
+    { code: { toString: () => 'ASSET_FORMAT' }, message: known },
+  ]) assert.equal(assetFailureReason(error), null);
+  for (const reason of [null, undefined, {}, '__proto__', 'constructor', sensitive, 'format_html_response ']) {
+    assert.equal(assetFailureDiagnosticMessage({ code: 'ASSET_FORMAT', reason, message: sensitive }), null);
+  }
+  assert.equal(assetFailureDiagnosticMessage({ code: 'HTTP_403', reason: 'format_html_response' }), null);
+  assert.equal(assetFailureDiagnosticMessage(null), null);
+  assert.equal(assetFailureDiagnosticMessage({ code: 'ASSET_FORMAT', reason: 'format_html_response', message: sensitive }),
+    '下载入口返回了网页内容，未作为附件保存。');
+});
+
+test('callers cannot replace the fixed vocabulary by mutating a previous diagnostic', () => {
+  const error = { code: 'ASSET_FORMAT', message: '附件请求返回了网页，未保存。' };
+  const diagnostic = assetFailureReason(error);
+  diagnostic.message = 'private response'; diagnostic.reason = 'not-approved';
+  assert.deepEqual(assetFailureReason(error), {
+    reason: 'format_html_response', message: '下载入口返回了网页内容，未作为附件保存。',
+  });
+});
+
+test('new image response reasons distinguish unknown bytes, unsupported image types and MIME mismatch', () => {
+  const reasons = [
+    ['format_image_header_unknown', '响应中未识别到受支持的图片文件头，未保存。'],
+    ['format_image_type_unsupported', '响应是当前下载器尚不支持的图片类型，未保存。'],
+    ['format_image_mime_mismatch', '已识别图片文件头，但响应声明的类型与图片内容不一致，未保存。'],
+  ];
+  for (const [reason, message] of reasons) {
+    assert.deepEqual(assetFailureReason({ code: 'ASSET_FORMAT', message }), { reason, message });
+    assert.equal(assetFailureDiagnosticMessage({ code: 'ASSET_FORMAT', reason }), message);
+    assert.equal(assetFailureDiagnosticMessage({ code: 'HTTP_403', reason }), null);
+    assert.equal(assetFailureReason({ code: 'ASSET_FORMAT', message: `${message} private response` }), null);
+  }
+  assert.equal(new Set(reasons.map(([reason]) => assetFailureDiagnosticMessage({ code: 'ASSET_FORMAT', reason }))).size, 3);
+  assert.equal(assetFailureReason({ code: 'ASSET_FORMAT', message: '图片类型或文件头无法确认，未保存为原图。' }).reason,
+    'format_image_unconfirmed');
+});
+
+test('response diagnostics retain only safe bounded source observations and reject secret fields', () => {
+  const secret = 'https://chatgpt.com/backend-api/file?sig=private-token Bearer private-token <html>private-body</html>';
+  const raw = [{ route: 'file-download', code: 'ASSET_FORMAT', reason: 'format_image_mime_mismatch',
+    httpStatus: 200, mimeType: 'image/jpeg', detectedType: 'png', byteLength: 1024,
+    url: secret, headers: { authorization: secret }, body: secret, message: secret },
+  { route: 'visible-image', code: secret, reason: secret, httpStatus: 999,
+    mimeType: `image/png; secret=${secret}`, detectedType: secret, byteLength: 32 * 1024 * 1024 + 1 },
+  { route: secret, code: 'ASSET_FORMAT', mimeType: 'image/png', byteLength: 10 },
+  { route: 'library-download', code: 'HTTP_403', reason: 'format_html_response', httpStatus: 403,
+    mimeType: 'missing', detectedType: 'not-read', byteLength: 0 }];
+  const cleaned = sanitizeAssetFailureDiagnostics(raw);
+  assert.deepEqual(cleaned, [
+    { route: 'file-download', code: 'ASSET_FORMAT', reason: 'format_image_mime_mismatch',
+      httpStatus: 200, mimeType: 'image/jpeg', detectedType: 'png', byteLength: 1024 },
+    { route: 'visible-image', mimeType: 'unknown' },
+    { route: 'library-download', code: 'HTTP_403', httpStatus: 403, mimeType: 'missing', detectedType: 'not-read', byteLength: 0 },
+  ]);
+  assert.doesNotMatch(JSON.stringify(cleaned), /private|https:|Bearer|<html>|headers|body|authorization/);
+  assert.deepEqual(sanitizeAssetFailureDiagnostics(cleaned), cleaned);
+  assert.equal(raw[0].url, secret, 'sanitizing must not mutate the original failure');
+});
+
+test('response diagnostics cap observations at five and reject malformed numbers without coercion', () => {
+  const raw = Array.from({ length: 7 }, (_, index) => ({ route: 'file-download', code: 'HTTP_429',
+    httpStatus: 429, byteLength: index, mimeType: 'application/json', detectedType: 'json' }));
+  const cleaned = sanitizeAssetFailureDiagnostics(raw);
+  assert.equal(cleaned.length, 5);
+  assert.deepEqual(cleaned.map(item => item.byteLength), [0, 1, 2, 3, 4]);
+  for (const bad of [null, undefined, {}, 'private', 10]) assert.deepEqual(sanitizeAssetFailureDiagnostics(bad), []);
+  for (const value of [-1, 200.5, '200', Infinity, NaN, {}]) {
+    const [item] = sanitizeAssetFailureDiagnostics([{ route: 'captured-resource', code: 'ASSET_FORMAT',
+      httpStatus: value, byteLength: value }]);
+    assert.equal(item.httpStatus, undefined);
+    assert.equal(item.byteLength, undefined);
+  }
+  const [maximum] = sanitizeAssetFailureDiagnostics([{ route: 'interpreter-download', code: 'ASSET_FORMAT', byteLength: 32 * 1024 * 1024 }]);
+  assert.equal(maximum.byteLength, 32 * 1024 * 1024);
+});
+
+test('response summaries use Chinese fixed labels and omit unrecognized text at the UI boundary', () => {
+  const lines = assetFailureAttemptSummaries([
+    { route: 'file-download', code: 'ASSET_FORMAT', httpStatus: 200, mimeType: 'image/jpeg', detectedType: 'png', byteLength: 68 },
+    { route: 'library-download', code: 'HTTP_403', httpStatus: 403, mimeType: 'missing', detectedType: 'not-read' },
+    { route: 'visible-image', code: 'ASSET_FORMAT', mimeType: 'private-mime', detectedType: 'avif', byteLength: 0,
+      reason: 'https://example.com/?token=private', body: '<script>private</script>' },
+  ]);
+  assert.equal(lines[0], '文件下载入口 · HTTP 200 · ASSET_FORMAT · 声明：image/jpeg · 文件头：PNG · 68 字节');
+  assert.equal(lines[1], '文件库入口 · HTTP 403 · HTTP_403 · 声明：未声明 · 文件头：未读取');
+  assert.equal(lines[2], '页面原图 · ASSET_FORMAT · 声明：其他类型 · 文件头：AVIF · 0 字节');
+  assert.doesNotMatch(lines.join('\n'), /private|https:|script/);
+});

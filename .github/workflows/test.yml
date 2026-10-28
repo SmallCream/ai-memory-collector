@@ -1,0 +1,36 @@
+name: Extension checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Automated tests (synthetic data only)
+        run: npm test
+      - name: Extension static checks
+        run: npm run check
+      - name: Updater syntax
+        run: bash -n update-macos.command
+      - name: Package extension
+        run: npm run package -- --channel test
+      - name: Upload test build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-memory-collector-test-${{ github.sha }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+            dist/*.json
+          if-no-files-found: error
+          retention-days: 7

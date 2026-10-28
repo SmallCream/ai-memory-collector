@@ -8,6 +8,7 @@ usage() {
 AI Memory Collector — macOS 更新工具
 
 双击此文件：首次选择浏览器原来加载的 extension 文件夹，以后自动沿用。
+  --test      本次从测试渠道更新（不修改默认 main 渠道，可与 --choose 合用）
   --choose    重新选择原安装目录
   --rollback  恢复所选目录最近一次更新前的代码
   --help      显示此说明
@@ -15,19 +16,27 @@ AI Memory Collector — macOS 更新工具
 首次双击若提示没有执行权限，可在终端输入 bash 和一个空格，拖入此文件后按回车。
 无需 sudo、Git、Node 或 Python，不会安装常驻程序。
 更新结束后仍需在 chrome://extensions 或 edge://extensions 点击“重新加载”。
-不要卸载扩展，不要换目录加载。请先保存采集结果并关闭采集台。
+不要卸载扩展，不要换目录加载。关闭采集台不会停止后台任务。
+更新前暂停自动任务；有进行中的对话任务先“停止本轮”，等待独立传输和文件写入结束。
+本工具不读取浏览器任务状态，无法替你确认是否空闲。操作步骤见 docs/macos-update.md。
 HELP
 }
 
 mode=update
-case "${1:-}" in
-  '') ;;
-  --choose) mode=choose ;;
-  --rollback) mode=rollback ;;
-  --help|-h) usage; exit 0 ;;
-  *) usage; exit 2 ;;
-esac
-[ "$#" -le 1 ] || { usage; exit 2; }
+channel=main
+for option in "$@"; do
+  case "$option" in
+    --test) [ "$channel" = main ] || { usage; exit 2; }; channel=test ;;
+    --choose|--rollback)
+      [ "$mode" = update ] || { usage; exit 2; }
+      mode=${option#--} ;;
+    --help|-h) usage; exit 0 ;;
+    *) usage; exit 2 ;;
+  esac
+done
+[ "$mode" != rollback ] || [ "$channel" = main ] || { usage; exit 2; }
+source_ref='main'
+[ "$channel" != test ] || source_ref='feat/automatic-collector-v2'
 
 state_dir=${AMC_UPDATER_STATE_DIR:-"$HOME/Library/Application Support/AI Memory Collector Updater"}
 lock_dir="$state_dir/run.lock"
@@ -94,7 +103,7 @@ function run(a) {
     if (!/^[a-f0-9]{40}$/.test(sha || "")) throw Error("Invalid GitHub commit");
     return sha;
   }
-  if (x.manifest_version !== 3 || x.name !== "AI Memory Collector · P0" ||
+  if (x.manifest_version !== 3 || ["AI Memory Collector · P0", "AI Memory Collector"].indexOf(x.name) < 0 ||
       x.background.service_worker !== "background.js" || x.options_ui.page !== "panel.html")
     throw Error("Not an AI Memory Collector extension");
   if (typeof x.version !== "string" || !/^\d+(\.\d+){0,3}$/.test(x.version) ||
@@ -178,7 +187,7 @@ printf '%s\n' "$target_dir" > "$state_dir/target-path.next"
 mv "$state_dir/target-path.next" "$state_dir/target-path"
 installed_version=${installed_info%%|*}
 printf '\n原安装目录：%s\n当前版本：%s\n' "$target_dir" "$installed_version"
-printf '请确认已保存采集结果并关闭采集台；更新后需要重新加载插件。\n'
+printf '更新前应已暂停自动任务；有进行中的对话任务先“停止本轮”，并等待独立传输和文件写入结束。\n关闭采集台不会停止任务；本工具不读取浏览器状态，无法确认是否空闲。更新后需要重新加载插件。\n'
 
 stage_dir=$(mktemp -d "$parent_dir/.ai-memory-collector-stage.XXXXXX")
 if [ "$mode" = rollback ]; then
@@ -192,9 +201,10 @@ if [ "$mode" = rollback ]; then
   printf '准备恢复备份版本：%s\n' "${source_info%%|*}"
 else
   work_dir=$(mktemp -d "${TMPDIR:-/tmp}/ai-memory-collector-download.XXXXXX")
-  printf '正在检查 GitHub 上的最新代码…\n'
+  printf '本次更新渠道：%s（测试渠道需每次显式指定 --test）\n' "$channel"
+  printf '正在检查 GitHub 上的代码…\n'
   curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 180 --retry 2 --max-filesize 1048576 \
-    --output "$work_dir/ref.json" 'https://api.github.com/repos/SmallCream/ai-memory-collector/git/ref/heads/main' || fail '无法检查 GitHub 版本；原插件未修改。请检查网络或稍后重试。'
+    --output "$work_dir/ref.json" "https://api.github.com/repos/SmallCream/ai-memory-collector/git/ref/heads/$source_ref" || fail '无法检查 GitHub 版本；原插件未修改。请检查网络或稍后重试。'
   commit_sha=$(json_value sha "$(cat "$work_dir/ref.json")") || fail 'GitHub 返回的版本信息无效；原插件未修改。'
   printf '正在下载代码版本 %.12s…\n' "$commit_sha"
   curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 180 --retry 2 --max-filesize 52428800 \
@@ -221,6 +231,8 @@ find "$target_dir" -type f -print0 > "$file_list" || fail '无法完整读取原
 while IFS= read -r -d '' existing_file; do
   relative_file=${existing_file#"$target_dir/"}
   case "$relative_file" in
+    # Removed in 0.3.24; the complete old directory remains in the backup.
+    lib/lfs.js) continue ;;
     manifest.json|background.js|panel.html|panel.js|bootstrap.js|panel.css|lib/archive.js|lib/chatgpt.js|lib/github.js|lib/storage.js|.DS_Store|*/.DS_Store) continue ;;
   esac
   [ -f "$stage_dir/$relative_file" ] || fail '原插件目录包含不属于此更新包的文件。为保护个人数据已停止，请将额外文件移到独立目录后重试。'
@@ -246,4 +258,4 @@ if ! mv "$target_state/last-backup.next" "$target_state/last-backup"; then
   printf '\n代码已更新，但备份位置记录保存失败；请保留这个路径用于手动恢复：%s\n' "$backup_dir" >&2
 fi
 printf '\n完成：%s → %s\n原安装目录保持不变：%s\n原代码备份：%s\n' "$installed_version" "${source_info%%|*}" "$target_dir" "$backup_dir"
-printf '\n接下来：\n1. 打开 chrome://extensions（Edge 使用 edge://extensions）。\n2. 找到 AI Memory Collector，点击“重新加载”。\n3. 关闭旧采集台，再点击扩展图标打开。\n不要卸载或换目录重新安装。此脚本不读取或修改浏览器中的 Token、设置和对话数据。\n'
+printf '\n接下来：\n1. 打开 chrome://extensions（Edge 使用 edge://extensions）。\n2. 找到 AI Memory Collector，点击“重新加载”。\n3. 刷新来源平台页，关闭旧采集台，再点击扩展图标打开。\n4. 核对版本、账号和保存目录，按更新前记录恢复需要的自动开关。已停止的账号需主动“检查更新”开始新一轮。\n不要卸载或换目录重新安装。此脚本不读取或修改浏览器中的 Token、设置和对话数据。\n'

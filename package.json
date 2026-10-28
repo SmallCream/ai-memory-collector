@@ -1,9 +1,9 @@
 {
   "name": "ai-memory-collector",
-  "version": "0.1.5",
+  "version": "0.4.17",
   "private": true,
   "type": "module",
-  "description": "P0 browser extension for user-owned AI conversation archives",
+  "description": "Local-first AI conversation and attachment backups with optional private GitHub sync",
   "scripts": {
     "test": "node --test tests/*.test.js",
     "check": "node scripts/check.mjs",

@@ -1,5 +1,9 @@
-/** P0 archive builder. Native web-detail JSON is authoritative; Markdown is derived. */
-export const RENDERER_VERSION = 'p0-2';
+import { validateDoubaoConversation, redactDoubaoMetadata, renderDoubaoMessages, DOUBAO_RENDERER_VERSION } from './doubao-format.js';
+/** Native web-detail JSON is authoritative; Markdown is derived from the same snapshot. */
+import { renderRichText } from './rich-content.js';
+import { createAssetResolver, sanitizeAssetRecords, extractAssets } from './assets.js';
+import { inspectMessageGeneration } from './message-generation.js';
+export const RENDERER_VERSION = 'rich-3';
 const PLATFORM = 'chatgpt';
 const SECRET_KEYS = new Set(['accesstoken', 'access_token', 'refreshtoken', 'refresh_token',
   'authorization', 'cookie', 'set-cookie', 'sessiontoken', 'session_token',
@@ -75,6 +79,11 @@ function sanitizedCopy(value, path, redactions, ancestors = new Set(), depth = 0
   return copy;
 }
 
+/** Use the same native-data normalization for comparisons and persisted JSON. */
+export function sanitizeNativeConversation(value) {
+  return sanitizedCopy(value, '', []);
+}
+
 function json(value) { return `${JSON.stringify(value, null, 2)}\n`; }
 async function hash(text) {
   const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
@@ -95,80 +104,72 @@ function label(value) {
     .replace(/[\\`*{}[\]()#+.!_|]/g, '\\$&');
 }
 
-function escapeProse(value) {
-  // Keep Markdown formatting, but make raw HTML and image embeds passive text.
-  return value.replace(/</g, '&lt;').replace(/(^|[^\\])((?:\\\\)*)!\[/g, '$1$2\\![');
-}
-
-function readableLine(line) {
-  const runs = [...line.matchAll(/`+/g)];
-  const next = new Map();
-  const closing = new Map();
-  for (let index = runs.length - 1; index >= 0; index--) {
-    closing.set(index, next.get(runs[index][0].length));
-    next.set(runs[index][0].length, index);
+function structuredTable(part, resolveAsset) {
+  const columns = part.columns ?? part.headers, rows = part.rows ?? part.data;
+  if (!Array.isArray(columns) || !columns.length || !Array.isArray(rows)) return null;
+  const headers = columns.map(column => typeof column === 'string' ? column : column?.title ?? column?.label ?? column?.name ?? column?.key ?? '');
+  const cell = value => renderRichText(typeof value === 'string' ? value : value == null ? '' : JSON.stringify(value), { resolveAsset })
+    .replace(/\|/g, '\\|').replace(/\r?\n/g, '<br>');
+  const output = [`| ${headers.map(cell).join(' | ')} |`, `| ${headers.map(() => '---').join(' | ')} |`];
+  for (const row of rows) {
+    if (!Array.isArray(row) && !isRecord(row)) return null;
+    const values = Array.isArray(row) ? columns.map((_, index) => row[index]) : columns.map((column, index) => row[typeof column === 'string' ? column : column?.key ?? column?.name ?? headers[index]]);
+    output.push(`| ${values.map(cell).join(' | ')} |`);
   }
-  let cursor = 0;
-  const pieces = [];
-  for (let index = 0; index < runs.length; index++) {
-    const run = runs[index];
-    const slashes = /\\*$/.exec(line.slice(0, run.index))[0].length;
-    const end = closing.get(index);
-    if (slashes % 2 || end === undefined) continue;
-    const boundary = runs[end].index + runs[end][0].length;
-    pieces.push(escapeProse(line.slice(cursor, run.index)), line.slice(run.index, boundary));
-    cursor = boundary;
-    index = end;
-  }
-  pieces.push(escapeProse(line.slice(cursor)));
-  return pieces.join('');
+  return output.join('\n');
 }
 
-function readableMarkdown(text) {
-  let block = null;
-  const lines = text.split('\n').map(line => {
-    const delimiter = /^( {0,3})(`{3,}|~{3,})(.*)$/.exec(line);
-    if (block) {
-      if (delimiter && delimiter[2][0] === block[0] && delimiter[2].length >= block.length && !delimiter[3].trim()) block = null;
-      return line;
-    }
-    if (delimiter && (delimiter[2][0] !== '`' || !delimiter[3].includes('`'))) {
-      block = delimiter[2];
-      return line;
-    }
-    return readableLine(line);
-  });
-  // A truncated response must not turn the next speaker into part of its code.
-  if (block) lines.push(block);
-  return lines.join('\n').replace(/^\n+|\n+$/g, '');
+function readableMediaPart(part, resolveAsset, withAssets) {
+  const type = part.content_type ?? part.type ?? '';
+  const kind = /image/.test(type) ? '图片' : /audio/.test(type) ? '音频' : /video/.test(type) ? '视频' : '附件';
+  const ref = part.file_id ? `file-service://${part.file_id}` : part.library_file_id ? `library:${part.library_file_id}` :
+    part.asset_pointer ?? part.image_url?.url ?? part.image_url ?? part.url ?? part.download_url;
+  const target = typeof ref === 'string' ? resolveAsset(ref) : null;
+  const name = label(part.name ?? part.file_name ?? part.filename ?? kind);
+  if (target) return `${kind === '图片' ? '!' : ''}[${name}](${target.replace(/\(/g, '%28').replace(/\)/g, '%29')})`;
+  return withAssets ? `〔${kind}，待补采〕` : `〔${kind}〕`;
 }
 
-function readablePart(part) {
-  if (typeof part === 'string') return part;
-  if (!isRecord(part)) return part == null ? '' : '〔非文本内容〕';
+function readablePart(part, resolveAsset, withAssets) {
+  if (typeof part === 'string') return renderRichText(part, { resolveAsset });
+  if (!isRecord(part)) return part == null ? '' : '〔暂未支持的非文本内容，原始数据保留在 JSON〕';
   const type = part.content_type ?? part.type ?? '';
   if (type === 'code' && typeof (part.text ?? part.code) === 'string') {
     const language = typeof part.language === 'string' && /^[A-Za-z0-9_+-]{1,40}$/.test(part.language) ? part.language : 'text';
     return fence(part.text ?? part.code, language);
   }
-  if (typeof part.text === 'string') return part.text;
-  if (typeof part.text?.value === 'string') return part.text.value;
-  if (/image/.test(type)) return '〔图片〕';
-  if (/audio/.test(type)) return '〔音频〕';
-  if (/video/.test(type)) return '〔视频〕';
-  if (/file|attachment/.test(type)) return '〔附件〕';
-  return '〔非文本内容〕';
+  // Explicit internal protocol markers are retained in native JSON only.
+  if (['thoughts', 'reasoning', 'reasoning_recap', 'model_editable_context', 'user_editable_context'].includes(type)) return '';
+  if (typeof part.text === 'string') return renderRichText(part.text, { resolveAsset });
+  if (typeof part.text?.value === 'string') return renderRichText(part.text.value, { resolveAsset });
+  if (typeof part.html === 'string' && /html/.test(type)) return renderRichText(part.html, { resolveAsset });
+  if (/table/.test(type)) return structuredTable(part, resolveAsset) || '〔表格结构暂未支持，原始数据保留在 JSON〕';
+  if (/image|audio|video|file|attachment/.test(type)) return readableMediaPart(part, resolveAsset, withAssets);
+  // Unknown user content is never silently deleted.
+  return `〔暂未支持的${type ? label(type) : '非文本'}内容，原始数据保留在 JSON〕`;
 }
 
-function displayedMessage(message) {
+function displayedMessage(message, resolveAsset, withAssets) {
   if (!isRecord(message)) return null;
   const role = message.author?.role ?? message.role;
-  if (['system', 'developer', 'tool'].includes(role) || message.metadata?.is_visually_hidden_from_conversation === true) return null;
+  if (['system', 'developer'].includes(role) || message.metadata?.is_visually_hidden_from_conversation === true) return null;
+  if (role === 'tool') {
+    // Generated images can be delivered by randomly named tools. The visible
+    // output envelope, not a tool-name allowlist, identifies this native form.
+    // Never render surrounding tool prose, code, reasoning, or metadata files.
+    const body = message.content;
+    if (message.recipient !== 'all' || !['commentary', 'final'].includes(message.channel) ||
+        !isRecord(body) || body.content_type !== 'multimodal_text' || !Array.isArray(body.parts)) return null;
+    const images = body.parts.filter(part => isRecord(part) && part.content_type === 'image_asset_pointer' &&
+      part.metadata?.is_visually_hidden_from_conversation !== true);
+    const text = images.map(part => readableMediaPart(part, resolveAsset, true)).join('\n\n');
+    return text ? { speaker: 'ChatGPT', text } : null;
+  }
   if (role === 'assistant' && (message.channel === 'analysis' ||
       (typeof message.recipient === 'string' && message.recipient && message.recipient !== 'all'))) return null;
   const body = message.content;
   const parts = isRecord(body) && Array.isArray(body.parts) ? body.parts : Array.isArray(body) ? body : [body];
-  const text = readableMarkdown(parts.map(readablePart).filter(Boolean).join('\n\n'));
+  const text = parts.map(part => readablePart(part, resolveAsset, withAssets)).filter(Boolean).join('\n\n');
   if (!text.trim()) return null;
   return { speaker: role === 'user' ? '你' : role === 'assistant' ? 'ChatGPT' : '消息', text };
 }
@@ -204,11 +205,11 @@ function selectedBranch(conversation) {
   return { nodes, warnings, partial: warnings.length > 0, mode: 'current-branch' };
 }
 
-function checkedManifest(existingManifest, prefix, accountKey) {
+function checkedManifest(existingManifest, prefix, accountKey, platform = PLATFORM) {
   if (existingManifest === undefined || existingManifest === null) {
-    return { schemaVersion: 1, platform: PLATFORM, accountKey, conversations: {} };
+    return { schemaVersion: 1, platform, accountKey, conversations: {} };
   }
-  if (!isRecord(existingManifest) || existingManifest.schemaVersion !== 1 || existingManifest.platform !== PLATFORM ||
+  if (!isRecord(existingManifest) || existingManifest.schemaVersion !== 1 || existingManifest.platform !== platform ||
       existingManifest.accountKey !== accountKey || !isRecord(existingManifest.conversations)) {
     throw new Error('现有归档清单格式或账号归属不匹配，未覆盖。');
   }
@@ -230,10 +231,13 @@ function checkedManifest(existingManifest, prefix, accountKey) {
 }
 
 /**
- * Build only P0 capture paths, never the production data/ namespace.
+ * Default paths preserve the P0 format. Production callers opt into a validated account prefix.
  * Filesystem callers must independently verify ownership and external edits before writing.
  */
-export async function buildArchive({ conversation, identity, capturedAt, existingManifest } = {}) {
+export async function buildArchive({ conversation, identity, capturedAt, existingManifest, productionPrefix, assets } = {}) {
+  const platform = conversation?.platform === 'doubao' ? 'doubao' : PLATFORM;
+  if (platform === 'doubao') validateDoubaoConversation(conversation);
+  if (identity?.platform && identity.platform !== platform) throw new Error('平台归属不匹配。');
   const hasMapping = isRecord(conversation?.mapping) && Object.keys(conversation.mapping).length > 0;
   const hasMessages = Array.isArray(conversation?.messages);
   if (!isRecord(conversation) || (!hasMapping && !hasMessages)) {
@@ -249,20 +253,31 @@ export async function buildArchive({ conversation, identity, capturedAt, existin
   }
   const captureTime = dateValue(capturedAt);
   if (!captureTime) throw new Error('capturedAt 必须是有效时间。');
-  const prefix = `p0-captures/${PLATFORM}/${accountKey}`;
-  const manifest = checkedManifest(existingManifest, prefix, accountKey);
+  if (productionPrefix !== undefined && (typeof productionPrefix !== 'string' ||
+      !new RegExp(`^data/web/${platform}/[A-Za-z0-9][A-Za-z0-9_-]{0,119}$`).test(productionPrefix) ||
+      /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(productionPrefix.split('/').at(-1)))) {
+    throw new Error('正式归档目录不合法。');
+  }
+  const prefix = productionPrefix ?? `p0-captures/${platform}/${accountKey}`;
+  const manifest = checkedManifest(existingManifest, prefix, accountKey, platform);
   const previous = own(manifest.conversations, id) ? manifest.conversations[id] : null;
   const redactions = [];
-  const native = sanitizedCopy(conversation, '', redactions);
+  const native = sanitizedCopy(platform === 'doubao' ? redactDoubaoMetadata(conversation, redactions) : conversation, '', redactions);
   const content = json(native);
   const contentHash = await hash(content);
-  const branch = selectedBranch(native);
+  const branch = platform === 'doubao' ? { nodes: [], warnings: ['豆包当前消息链已分页读取；重新生成记录和非正文块保留在 JSON，历史分支覆盖范围未验证。'], partial: false, mode: 'doubao-chain' } : selectedBranch(native);
   const warnings = [...branch.warnings];
   const sourcePartial = native.is_incomplete === true || native.page_info?.has_next_page === true || native.page_info?.has_previous_page === true;
   if (sourcePartial) warnings.push('来源提示还有未取得内容，当前档案为部分覆盖。');
   const allNodes = hasMapping ? Object.values(native.mapping) : native.messages.map(item => own(item, 'message') ? item : { message: item });
-  if (allNodes.some(node => ['in_progress', 'streaming'].includes(node.message?.status))) {
-    warnings.push('存在生成中的消息；该采集不能视为完整稳定版本。');
+  const generation = platform === 'doubao' ? { unfinishedCount: 0, historicalUnfinishedCount: 0, unresolvedUnfinishedCount: 0 } : inspectMessageGeneration(native);
+  const generationState = generation.unfinishedCount > 0 ? {
+    policy: 'closed-descendant-v1', historicalUnfinishedCount: generation.historicalUnfinishedCount,
+    unresolvedUnfinishedCount: generation.unresolvedUnfinishedCount,
+  } : null;
+  if (generation.unresolvedUnfinishedCount > 0) warnings.push('存在尚不能确认已结束的消息；该采集不能视为完整稳定版本。');
+  if (generation.historicalUnfinishedCount > 0) {
+    warnings.push(`已原样保留 ${generation.historicalUnfinishedCount} 条历史未完成状态消息，同一分支存在后续结束记录。`);
   }
   if (redactions.length) warnings.push(`已脱敏 ${redactions.length} 个结构化认证字段或 URL，详情见清单。`);
   const title = typeof native.title === 'string' ? native.title : '未命名对话';
@@ -281,13 +296,26 @@ export async function buildArchive({ conversation, identity, capturedAt, existin
     }
   }
   const coverage = {
-    messages: branch.partial || sourcePartial || warnings.some(warning => warning.includes('生成中')) ? 'partial' : 'unknown',
+    messages: branch.partial || sourcePartial || generation.unresolvedUnfinishedCount > 0 ? 'partial' : 'unknown',
     branches: sourcePartial ? 'partial' : 'unknown',
     attachments: 'references-only',
   };
   const selectedMessages = branch.nodes.filter(({ node }) => node.message !== null && node.message !== undefined);
   const messageCount = allNodes.filter(node => node.message !== null && node.message !== undefined).length;
-  const displayed = selectedMessages.map(({ node }) => displayedMessage(node.message)).filter(Boolean);
+  const resourceRecords = sanitizeAssetRecords(assets);
+  // Reconstruct only ephemeral lookup aliases from source text after a restart.
+  // Native JSON and synchronized descriptors never receive download credentials.
+  const renderRecords = resourceRecords.map(item => ({ ...item }));
+  if (resourceRecords.some(item => item.sourceType === 'embedded')) {
+    const extracted = await extractAssets(native);
+    for (const item of renderRecords) {
+      const original = extracted.find(candidate => candidate.id === item.id);
+      if (original?.retrieval) Object.defineProperty(item, 'retrieval', { value: original.retrieval, enumerable: false });
+    }
+  }
+  const resolveAsset = createAssetResolver(renderRecords, markdownPath);
+  const displayed = platform === 'doubao' ? renderDoubaoMessages(native, resolveAsset) : selectedMessages.map(({ node, nodeKey }) => displayedMessage(node.message,
+    (ref, options) => resolveAsset(ref, { ...options, messageId: String(node.message.id ?? nodeKey) }), assets !== undefined)).filter(Boolean);
   const lines = [`# ${label(title)}`, ''];
   for (const [index, message] of displayed.entries()) {
     if (index) lines.push('---', '');
@@ -295,28 +323,31 @@ export async function buildArchive({ conversation, identity, capturedAt, existin
   }
   const markdown = `${lines.join('\n').trimEnd()}\n`;
   const entry = {
-    conversationId: id, jsonPath, markdownPath, sourceFormat: 'chatgpt-web-detail',
-    contentHash, markdownHash: await hash(markdown), rendererVersion: RENDERER_VERSION,
+    conversationId: id, jsonPath, markdownPath, sourceFormat: platform === 'doubao' ? 'doubao-web-chain' : 'chatgpt-web-detail',
+    contentHash, markdownHash: await hash(markdown), rendererVersion: platform === 'doubao' ? DOUBAO_RENDERER_VERSION : RENDERER_VERSION,
     title, namingTime, pathTimeBasis: previous?.pathTimeBasis || (sourceCreated ? 'source-created' : 'first-observed'),
     firstCapturedAt: previous?.firstCapturedAt || captureTime,
     // Repeated identical capture is byte-stable, including the derived manifest.
     lastChangedAt: previous?.contentHash === contentHash ? previous.lastChangedAt : captureTime,
     coverage, renderMode: branch.mode, redactions, warnings,
+    ...(generationState ? { generationState } : {}),
+    ...(assets !== undefined ? { assets: resourceRecords } : {}),
   };
   Object.defineProperty(manifest.conversations, id, { value: entry, enumerable: true, writable: true, configurable: true });
-  const account = { schemaVersion: 1, platform: PLATFORM, accountKey,
+  const account = { schemaVersion: 1, platform, accountKey,
     displayName: typeof identity?.displayName === 'string' ? identity.displayName : accountKey,
-    dataPath: prefix, purpose: 'p0-capture' };
+    dataPath: prefix, purpose: productionPrefix ? 'conversation-archive' : 'p0-capture' };
   return {
     files: [
       { path: jsonPath, content }, { path: markdownPath, content: markdown },
       { path: `${prefix}/archive/manifest.json`, content: json(manifest) },
       { path: `${prefix}/account.json`, content: json(account) },
     ], manifest,
-    summary: { conversationId: id, title, contentHash, sourceFormat: 'chatgpt-web-detail',
+    summary: { conversationId: id, title, contentHash, sourceFormat: platform === 'doubao' ? 'doubao-web-chain' : 'chatgpt-web-detail',
       nodeCount: allNodes.length, messageCount,
       currentBranchMessageCount: branch.mode === 'current-branch' ? selectedMessages.length : null,
       displayedMessageCount: displayed.length, renderMode: branch.mode,
-      coverage, warnings, redactionCount: redactions.length, jsonPath, markdownPath },
+      coverage, warnings, redactionCount: redactions.length, jsonPath, markdownPath,
+      ...(generationState ? { generationState } : {}) },
   };
 }

@@ -56,6 +56,25 @@ export async function getSetting(key) {
   });
 }
 
+// Recovery guards need journals that have not yet reached an archive manifest.
+export async function getSettingsByPrefix(prefix) {
+  validateKey(prefix);
+  const db = await database();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const request = tx.objectStore(STORE_NAME).openCursor(IDBKeyRange.bound(prefix, prefix + '\uffff'));
+    const entries = [];
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return;
+      entries.push({ key: cursor.key, value: cursor.value });
+      cursor.continue();
+    };
+    tx.oncomplete = () => resolve(entries);
+    tx.onerror = tx.onabort = () => reject(new Error('读取未完成的写入记录失败，目录保持不变。'));
+  });
+}
+
 // FileSystemDirectoryHandle values are supported by IndexedDB structured cloning.
 export async function setSetting(key, value) {
   validateKey(key);

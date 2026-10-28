@@ -1,7 +1,99 @@
-// Serialized by chrome.scripting.executeScript: this function must be self-contained.
-// Experimental, read-only website endpoints. No token leaves this isolated execution.
+// Serialized by chrome.scripting.executeScript: keep this function self-contained.
+// Experimental, read-only website endpoints. Session credentials never leave it.
 export async function probeChatGPT(request) {
-  const fail = (code, message) => { const e = new Error(message); e.code = code; throw e; };
+  // Only failures created here may expose codes, messages or reasons. Native
+  // DOMExceptions carry numeric codes (AbortError uses 20), not our protocol.
+  const failures = new WeakMap();
+  const fail = (code, message, reason, retryAfterMs) => {
+    const error = new Error(message);
+    failures.set(error, { code, message, ...(reason ? { reason } : {}),
+      ...(Number.isFinite(retryAfterMs) ? { retryAfterMs } : {}) });
+    throw error;
+  };
+  const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
+  let registry, scope;
+  const requestId = typeof request?.requestId === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(request.requestId) ? request.requestId : null;
+  const checkCancelled = () => { if (scope?.cancelled) fail('COLLECTION_PAUSED', '采集已暂停，未完成的网络结果不会写入归档。'); };
+  function retryAfter(response) {
+    if (![429, 503].includes(response.status)) return undefined;
+    const raw = response.headers.get('retry-after');
+    if (typeof raw !== 'string' || raw.length > 100) return undefined;
+    const value = raw.trim();
+    const milliseconds = /^\d+$/.test(value) ? Number(value) * 1000 :
+      /^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(value) ? Date.parse(value) - Date.now() : NaN;
+    return Number.isFinite(milliseconds) ? Math.min(86_400_000, Math.max(0, Math.ceil(milliseconds))) : undefined;
+  }
+  // Keep this serialized copy identical to message-generation.js; parity is tested.
+  function inspectMessageGeneration(native) {
+    const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+    const unfinished = message => record(message) && ['pending', 'in_progress', 'streaming'].includes(message.status);
+    const terminal = message => record(message) && message.author?.role === 'assistant' &&
+      message.status === 'finished_successfully' && message.end_turn === true &&
+      [undefined, null, '', 'all'].includes(message.recipient) &&
+      [undefined, null, '', 'final'].includes(message.channel);
+    const result = (unfinishedCount, historicalUnfinishedCount = 0) => ({
+      unfinishedCount,
+      historicalUnfinishedCount,
+      unresolvedUnfinishedCount: unfinishedCount - historicalUnfinishedCount,
+    });
+
+    const mapping = record(native?.mapping) ? native.mapping : null;
+    const nodes = new Map(mapping ? Object.entries(mapping) : []);
+    if (!nodes.size) {
+      const messages = Array.isArray(native?.messages) ? native.messages : [];
+      // A flat response or a single page does not supply verified branch ancestry.
+      return result(messages.filter(item => unfinished(item?.message ?? item)).length);
+    }
+
+    const unfinishedIds = [], terminalIds = [];
+    for (const [id, node] of nodes) {
+      if (unfinished(node?.message)) unfinishedIds.push(id);
+      if (terminal(node?.message)) terminalIds.push(id);
+    }
+    if (!unfinishedIds.length) return result(0);
+
+    const current = native?.current_node;
+    if (typeof current !== 'string' || !nodes.has(current)) return result(unfinishedIds.length);
+
+    // Walk from the selected tip toward its root. A selected-chain message needs
+    // a later ending on that same chain; a completed sibling cannot close it.
+    const currentChain = new Set(), currentClosedAncestors = new Set();
+    let cursor = current, laterTerminal = false;
+    while (cursor !== null && cursor !== undefined) {
+      if (currentChain.has(cursor) || !nodes.has(cursor) || !record(nodes.get(cursor))) {
+        return result(unfinishedIds.length);
+      }
+      const node = nodes.get(cursor);
+      currentChain.add(cursor);
+      if (laterTerminal) currentClosedAncestors.add(cursor);
+      if (terminal(node.message)) laterTerminal = true;
+      cursor = node.parent;
+    }
+
+    // Union the strict ancestors of all explicit endings. Once an ancestor was
+    // visited, its own ancestry was visited too: each node is traversed at most
+    // once across all terminal messages, avoiding repeated long-chain walks.
+    const closedAncestors = new Set();
+    for (const id of terminalIds) {
+      cursor = nodes.get(id)?.parent;
+      while (cursor !== null && cursor !== undefined && !closedAncestors.has(cursor)) {
+        const node = nodes.get(cursor);
+        if (!record(node)) break;
+        closedAncestors.add(cursor);
+        cursor = node.parent;
+      }
+    }
+
+    let historicalUnfinishedCount = 0;
+    for (const id of unfinishedIds) {
+      if (id === current) continue;
+      if (currentChain.has(id) ? currentClosedAncestors.has(id) : closedAncestors.has(id)) {
+        historicalUnfinishedCount++;
+      }
+    }
+    return result(unfinishedIds.length, historicalUnfinishedCount);
+  }
   try {
     if (location.origin !== 'https://chatgpt.com') fail('ORIGIN', '请在 chatgpt.com 的已登录标签页中操作。');
     if (!request || !['identity', 'list', 'detail'].includes(request.kind)) fail('REQUEST', '不支持的采集操作。');
@@ -9,31 +101,54 @@ export async function probeChatGPT(request) {
       fail('IDENTITY', '请先识别当前账号。');
     }
     const limit = 20;
-    if (request.kind === 'list' && (!Number.isInteger(request.offset) || request.offset < 0 || request.offset > 10000)) {
-      fail('REQUEST', '分页位置无效。');
+    if (request.kind === 'list' && (!Number.isInteger(request.offset) || request.offset < 0 || request.offset > 100000)) {
+      fail('REQUEST', '分页位置无效或超过本次采集范围。');
     }
-    if (request.kind === 'detail' && (!/^[a-zA-Z0-9_-]{1,100}$/.test(request.conversationId || '') || !['flat', 'tree'].includes(request.format))) {
+    if (request.kind === 'detail' && (!/^[a-zA-Z0-9_-]{1,100}$/.test(request.conversationId || '') ||
+        !['auto', 'flat', 'tree', 'page'].includes(request.format))) {
       fail('REQUEST', '对话 ID 或详情接口类型无效。');
     }
-    async function getJSON(path, token) {
+    if (request.before !== undefined && (request.kind !== 'detail' || request.format !== 'page' ||
+        typeof request.before !== 'string' || !/^[a-zA-Z0-9_-]{1,160}$/.test(request.before))) {
+      fail('REQUEST', '消息分页游标无效，本次未读取。');
+    }
+    if (request.requireComplete !== undefined && typeof request.requireComplete !== 'boolean') {
+      fail('REQUEST', '详情完整度检查参数无效。');
+    }
+    if (request.requestId !== undefined && !requestId) fail('REQUEST', '采集请求标识无效。');
+    if (requestId) {
+      const key = '__aiMemoryCollectorRequestsV1';
+      registry = globalThis[key] instanceof Map ? globalThis[key] : (globalThis[key] = new Map());
+      scope = { accountKey: request.expectedAccountKey || null, createdAt: Date.now(),
+        cancelled: registry.get(requestId)?.cancelled === true, controller: null };
+      registry.set(requestId, scope);
+      checkCancelled();
+    }
+    async function getJSON(path, token, timeoutMs = 20000) {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 20000);
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      if (scope) scope.controller = controller;
+      const checkDeadline = () => {
+        checkCancelled();
+        if (controller.signal.aborted) fail('TIMEOUT', '请求超时，请稍后重试。');
+      };
       try {
+        checkDeadline();
         const response = await fetch(path, {
           method: 'GET', credentials: 'include', cache: 'no-store', redirect: 'error',
           headers: token ? { Accept: 'application/json', Authorization: `Bearer ${token}` } : { Accept: 'application/json' },
-          signal: controller.signal
+          signal: controller.signal,
         });
+        checkDeadline();
         if (!response.ok) {
           const status = response.status;
-          fail(`HTTP_${status}`, status === 429 ? '平台限流，请稍后手动重试。' :
+          fail(`HTTP_${status}`, status === 429 ? '平台限流，任务会保留进度，稍后重试。' :
             status === 401 ? '登录已失效，请在网站重新登录。' :
             status === 403 ? '网站拒绝访问或需要验证，请回到网站处理。' :
-            status === 404 ? '此接口或对话不可访问；不代表对话已删除。' : `读取失败（HTTP ${status}）。`);
+            status === 404 ? '此接口或对话不可访问；不代表对话已删除。' : `读取失败（HTTP ${status}）。`, undefined, retryAfter(response));
         }
         const contentType = response.headers.get('content-type') || '';
         if (!contentType.includes('application/json')) fail('FORMAT', '网站没有返回 JSON，可能需要登录或完成验证。');
-        // P0 bounds memory. Abort on oversized streamed responses, not after parsing them.
         const reader = response.body?.getReader();
         let text = '';
         if (reader) {
@@ -41,18 +156,25 @@ export async function probeChatGPT(request) {
           const decoder = new TextDecoder();
           while (true) {
             const { done, value } = await reader.read();
+            checkDeadline();
             if (done) break;
             size += value.byteLength;
-            if (size > 8 * 1024 * 1024) { await reader.cancel(); fail('SIZE', '响应超过 P0 的 8 MiB 上限，本次未归档。'); }
+            if (size > 8 * 1024 * 1024) { await reader.cancel(); fail('SIZE', '响应超过 8 MiB 上限，本次未归档。'); }
             text += decoder.decode(value, { stream: true });
           }
           text += decoder.decode();
         } else {
           text = await response.text();
-          if (new TextEncoder().encode(text).length > 8 * 1024 * 1024) fail('SIZE', '响应超过 P0 上限。');
+          checkDeadline();
+          if (new TextEncoder().encode(text).length > 8 * 1024 * 1024) fail('SIZE', '响应超过 8 MiB 上限，本次未归档。');
         }
         try { return JSON.parse(text); } catch { fail('FORMAT', '返回结构无法解析，请等待适配器更新。'); }
-      } finally { clearTimeout(timer); }
+      } catch (error) {
+        // Some transports reject with a generic exception after aborting. The
+        // request's own signal still proves that its deadline has expired.
+        if (!failures.has(error)) checkDeadline();
+        throw error;
+      } finally { clearTimeout(timer); if (scope?.controller === controller) scope.controller = null; }
     }
     async function session() {
       const payload = await getJSON('/api/auth/session');
@@ -64,39 +186,153 @@ export async function probeChatGPT(request) {
       return { accountKey, displayName: typeof payload.user.name === 'string' ? payload.user.name.slice(0, 100) : accountKey,
         token: payload.accessToken };
     }
+    function detailShape(payload, format) {
+      if (!record(payload)) fail('FORMAT', '详情返回结构无法识别。');
+      const id = payload.conversation_id ?? payload.id;
+      if (id !== request.conversationId) fail('CONVERSATION_ID', '返回对话 ID 不匹配，本次未归档。');
+      if (format === 'flat' ? !Array.isArray(payload.messages) : !record(payload.mapping)) {
+        fail('FORMAT', '详情结构已变化，请等待适配器更新。');
+      }
+    }
+    function completeDetail(payload, format) {
+      const partial = reason => fail('INCOMPLETE_DETAIL', '详情完整性或消息结束状态尚未确认，已保留原归档，等待后续补采。', reason);
+      const page = payload.page_info;
+      if (payload.is_incomplete === true || payload.has_more === true || payload.has_more_messages === true ||
+          payload.has_next_page === true || payload.has_previous_page === true ||
+          page?.has_next_page === true || page?.has_previous_page === true || page?.has_more === true) partial('SOURCE_PARTIAL');
+      const inProgress = message => message && ['in_progress', 'streaming', 'pending'].includes(message.status);
+      if (format === 'flat') {
+        // A limited messages response without explicit end markers is not proof
+        // of complete history. Do not invent undocumented cursor parameters.
+        if (!record(page) || page.has_previous_page !== false || page.has_next_page !== false) partial('PAGE_FLAGS');
+        const seen = new Set();
+        for (const item of payload.messages) {
+          if (!record(item)) partial('MESSAGE_SHAPE');
+          const message = own(item, 'message') ? item.message : item;
+          if (message === null) continue;
+          if (!record(message)) partial('MESSAGE_SHAPE');
+          if (inProgress(message)) partial('MESSAGE_IN_PROGRESS');
+          const id = message.id ?? item.id;
+          if (typeof id !== 'string' || !id || seen.has(id)) partial('MESSAGE_ID');
+          seen.add(id);
+        }
+      } else {
+        const mapping = payload.mapping;
+        const keys = Object.keys(mapping);
+        if (!keys.length || typeof payload.current_node !== 'string' || !own(mapping, payload.current_node)) partial('TREE_CURRENT_NODE');
+        for (const key of keys) {
+          const node = mapping[key];
+          if (!record(node) || (node.message != null && !record(node.message))) partial('TREE_NODE_SHAPE');
+          if (node.parent !== null && node.parent !== undefined &&
+              (typeof node.parent !== 'string' || !own(mapping, node.parent))) partial('TREE_MISSING_PARENT');
+          if (node.children !== undefined && (!Array.isArray(node.children) ||
+              node.children.some(child => typeof child !== 'string' || !own(mapping, child)))) partial('TREE_MISSING_CHILD');
+        }
+        // Check every component, including non-selected branches, in linear time.
+        const verified = new Set();
+        for (const key of keys) {
+          const chain = new Set();
+          let cursor = key;
+          while (cursor !== null && cursor !== undefined && !verified.has(cursor)) {
+            if (chain.has(cursor)) partial('TREE_PARENT_CYCLE');
+            if (!own(mapping, cursor)) partial('TREE_MISSING_PARENT');
+            chain.add(cursor);
+            cursor = mapping[cursor].parent;
+          }
+          for (const id of chain) verified.add(id);
+        }
+        if (inspectMessageGeneration(payload).unresolvedUnfinishedCount > 0) partial('MESSAGE_IN_PROGRESS');
+      }
+      return 'complete';
+    }
+    function completePage(payload) {
+      const partial = reason => fail('INCOMPLETE_DETAIL', '消息页边界或内容尚未确认，原归档保持不变。', reason);
+      const page = payload.page_info;
+      if (!record(page) || typeof page.has_previous_page !== 'boolean' || typeof page.has_next_page !== 'boolean' ||
+          page.has_more === true) partial('PAGE_FLAGS');
+      if (!request.before && page.has_next_page !== false) partial('PAGE_DIRECTION');
+      if (['is_incomplete', 'has_more', 'has_more_messages', 'has_next_page', 'has_previous_page'].some(key => payload[key] === true)) partial('SOURCE_PARTIAL');
+      if (payload.messages.length > 2000) partial('PAGE_MESSAGE_LIMIT');
+      const ids = [];
+      const seen = new Set();
+      for (const item of payload.messages) {
+        if (!record(item)) partial('MESSAGE_SHAPE');
+        const message = own(item, 'message') ? item.message : item;
+        if (!record(message)) partial('MESSAGE_SHAPE');
+        if (['in_progress', 'streaming', 'pending'].includes(message.status)) partial('MESSAGE_IN_PROGRESS');
+        const id = message.id ?? item.id;
+        if (typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,160}$/.test(id) || seen.has(id)) partial('MESSAGE_ID');
+        ids.push(id); seen.add(id);
+      }
+      if (!ids.length) {
+        if (page.has_previous_page || page.has_next_page) partial('PAGE_DIRECTION');
+        if ([page.start_cursor, page.end_cursor].some(cursor => cursor !== undefined && cursor !== null && cursor !== '')) partial('PAGE_CURSOR_MISMATCH');
+      } else if (page.start_cursor !== ids[0] || page.end_cursor !== ids[ids.length - 1]) partial('PAGE_CURSOR_MISMATCH');
+      // This verifies only one page. The adapter must join cursor pages or a
+      // verified local prefix before describing the conversation as complete.
+      return 'page';
+    }
     const before = await session();
-    const identity = { accountKey: before.accountKey, displayName: before.displayName, workspace: 'unverified' };
+    const identity = { platform: 'chatgpt', accountKey: before.accountKey, displayName: before.displayName, workspace: 'unverified' };
     if (request.expectedAccountKey && before.accountKey !== request.expectedAccountKey) fail('ACCOUNT_CHANGED', '账号已改变，请重新识别；本次结果未归档。');
     if (request.kind === 'identity') return { ok: true, identity, capability: 'session-observed-only' };
-    let payload;
+    let payload, format, completeness = 'unknown';
     if (request.kind === 'list') {
       const raw = await getJSON(`/backend-api/conversations?offset=${request.offset}&limit=${limit}&order=updated`, before.token);
-      if (!Array.isArray(raw?.items) || raw.items.some(x => !x || typeof x.id !== 'string' || !/^[a-zA-Z0-9_-]{1,100}$/.test(x.id))) {
-        fail('FORMAT', '列表结构与原型预期不符，本次不推进分页。');
+      if (!record(raw) || !Array.isArray(raw.items) || raw.items.length > limit ||
+          raw.items.some(x => !record(x) || typeof x.id !== 'string' || !/^[a-zA-Z0-9_-]{1,100}$/.test(x.id))) {
+        fail('FORMAT', '列表结构发生变化，本次不推进分页。');
       }
-      const total = Number.isSafeInteger(raw.total) && raw.total >= 0 ? raw.total : null;
-      // A full page is only a candidate for another request, not proof of full coverage.
-      const nextOffset = raw.items.length === limit || (total !== null && request.offset + raw.items.length < total)
-        ? request.offset + raw.items.length : null;
+      if (new Set(raw.items.map(x => x.id)).size !== raw.items.length) fail('PAGINATION_STALLED', '列表页含重复对话，未标记扫描完成，请稍后重试。');
+      if (raw.total !== null && raw.total !== undefined && (!Number.isSafeInteger(raw.total) || raw.total < 0)) {
+        fail('FORMAT', '列表总数无效，本次不推进分页。');
+      }
+      const total = raw.total ?? null;
+      if (raw.offset !== undefined && raw.offset !== request.offset) fail('PAGINATION_STALLED', '列表分页位置不匹配，已停止本轮扫描。');
+      if (!raw.items.length && total !== null && request.offset < total) fail('PAGINATION_STALLED', '列表提前返回空页，未标记扫描完成，请稍后重试。');
+      if (total !== null && raw.items.length && request.offset + raw.items.length > total) {
+        fail('PAGINATION_CHANGED', '扫描时列表总数发生变化，已保留进度，请重新检查。');
+      }
+      // When the reported total is unknown, a full page requires another read.
+      const more = total === null ? raw.items.length === limit : request.offset + raw.items.length < total;
+      const nextOffset = more ? request.offset + raw.items.length : null;
+      if (nextOffset !== null && nextOffset > 100000) fail('PAGINATION_LIMIT', '本轮分页超过 100000 条，未标记扫描完成。');
       payload = { items: raw.items.map(x => ({ id: x.id, title: typeof x.title === 'string' ? x.title.slice(0, 200) : '未命名对话',
         createTime: typeof x.create_time === 'string' || typeof x.create_time === 'number' ? x.create_time : null,
         updateTime: typeof x.update_time === 'string' || typeof x.update_time === 'number' ? x.update_time : null })),
-        offset: request.offset, nextOffset: raw.items.length ? nextOffset : null, total, coverage: '普通列表的一页；项目、归档、临时会话未验证' };
+        offset: request.offset, nextOffset, total, coverage: '当前会话的普通列表；项目、归档、临时会话未验证' };
     } else {
-      const suffix = request.format === 'flat' ? `conversations/${request.conversationId}?num_turns=100` : `conversation/${request.conversationId}`;
-      payload = await getJSON(`/backend-api/${suffix}`, before.token);
-      const id = payload?.conversation_id ?? payload?.id;
-      if (id !== request.conversationId) fail('CONVERSATION_ID', '返回对话 ID 不匹配，本次未归档。');
-      if (request.format === 'flat' ? !Array.isArray(payload.messages) : !payload.mapping || typeof payload.mapping !== 'object' || Array.isArray(payload.mapping)) {
-        fail('FORMAT', '详情结构与所选接口类型不符；可手动切换类型再试。');
+      format = request.format === 'auto' ? 'tree' : request.format === 'page' ? 'flat' : request.format;
+      const read = async type => {
+        const suffix = type === 'flat' ? `conversations/${request.conversationId}?num_turns=100${request.before ? `&before=${encodeURIComponent(request.before)}` : ''}` : `conversation/${request.conversationId}`;
+        // Long histories need more time than identity/list requests. This is a
+        // total deadline for headers and body, not a renewed per-chunk timeout.
+        const value = await getJSON(`/backend-api/${suffix}`, before.token, 600000);
+        detailShape(value, type);
+        return value;
+      };
+      try { payload = await read(format); }
+      catch (error) {
+        // Auth, rate limits, identity mismatches and partial trees never fall back.
+        if (request.format !== 'auto' || !['HTTP_404', 'FORMAT'].includes(failures.get(error)?.code)) throw error;
+        format = 'flat';
+        payload = await read(format);
       }
+      // Explicit legacy formats remain useful for diagnostics. Page reads never
+      // claim full history; the production adapter assembles them separately.
+      if (request.format === 'page') completeness = completePage(payload);
+      else if (request.format === 'auto' || request.requireComplete === true) completeness = completeDetail(payload, format);
     }
     const after = await session();
     if (after.accountKey !== before.accountKey) fail('ACCOUNT_CHANGED', '请求期间账号发生变化，本次结果已丢弃。');
     return { ok: true, identity, payload, capturedAt: new Date().toISOString(), sourceFormat: 'chatgpt-web-detail',
-      coverage: request.kind === 'detail' ? '单次响应；消息分页和全部分支完整度未验证' : payload.coverage };
+      ...(request.kind === 'detail' ? { detailFormat: format, completeness } : {}),
+      coverage: request.kind === 'detail' ? '已检查返回结构；全部历史和平台全部分支完整度仍未验证，附件仅保留引用' : payload.coverage };
   } catch (error) {
-    return { ok: false, error: { code: error.code || (error.name === 'AbortError' ? 'TIMEOUT' : 'NETWORK'),
-      message: error.code ? error.message : error.name === 'AbortError' ? '请求超时，请稍后重试。' : '请求未完成，请检查网站登录状态和网络。' } };
-  }
+    const known = failures.get(error);
+    if (known) return { ok: false, error: known };
+    const timeout = error?.name === 'AbortError' || error?.name === 'TimeoutError';
+    return { ok: false, error: { code: timeout ? 'TIMEOUT' : 'NETWORK',
+      message: timeout ? '请求超时，请稍后重试。' : '请求未完成，请检查网站登录状态和网络。' } };
+  } finally { if (registry && registry.get(requestId) === scope) registry.delete(requestId); }
 }
