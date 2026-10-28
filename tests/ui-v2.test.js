@@ -22,6 +22,7 @@ class Element {
   removeAttribute(key) { delete this.attributes[key]; }
   addEventListener(name, listener) { this.listeners.set(name, listener); }
   remove() { this.removed = true; }
+  scrollIntoView() { this.scrolled = true; }
   async click() { if (!this.disabled) await this.listeners.get('click')?.(); }
 }
 const initialState = () => ({
@@ -1023,7 +1024,7 @@ test('failure classes and cross-run cooldown show actionable waiting without raw
   state.job = { status: 'running', accountCooldownUntil: Date.now() + 60000, diagnostics: { total: 1,
     items: [{ title: '重试对话', status: 'failed', retryDisposition: 'cooldown', attempt: 0, totalAttempts: 8 }] } };
   const app = await setup({ state });
-  assert.match(visibleText(app.elements.get('asset-failure-list')), /等待格式适配或手动重试/);
+  assert.match(visibleText(app.elements.get('asset-failure-list')), /已暂停自动重试，请检查文件大小或原始附件/);
   assert.doesNotMatch(visibleText(app.elements.get('asset-failure-list')), /重试等待至/);
   assert.match(visibleText(app.elements.get('download-queue')), /等待格式适配或手动重试/);
   assert.match(visibleText(app.elements.get('collection-queue')), /冷却后重试.*累计尝试 8 次/);
@@ -1357,4 +1358,97 @@ test('healthy local-only account has no problem shortcuts and offline diagnostic
   await app.click('open-diagnostics');
   assert.equal(app.elements.get('diagnostics').hidden, false);
   assert.equal(app.elements.get('diagnostics-account').value, 'stored');
+});
+
+
+test('attachment permission recovery opens settings without granting access or retrying implicitly', async () => {
+  for (const grant of [true, false]) {
+    const state = initialState(); state.platform = 'doubao';
+    state.assetDiagnostics = { pending: 1, failed: 1, failures: [{ code: 'ASSET_PERMISSION' }] };
+    const app = await setup({ state, grant });
+    assert.equal(app.elements.get('asset-recovery-settings').hidden, false);
+    await app.click('asset-recovery-settings');
+    assert.equal(app.elements.get('settings').hidden, false);
+    assert.equal(app.elements.get('grant-doubao-images').hidden, false);
+    assert.equal(app.elements.get('grant-doubao-images').scrolled, true);
+    assert.equal(app.permissionRequests.length, 0);
+    await app.click('grant-doubao-images');
+    assert.deepEqual(app.permissionRequests, [['https://*.byteimg.com/*']]);
+    assert.equal(app.messages.some(m => m.type === 'collector:permissions-changed'), grant);
+    if (!grant) assert.match(app.elements.get('global-status').textContent, /未获得豆包图片域名权限/);
+    assert(!app.messages.some(m => ['collector:retry-images', 'collector:start'].includes(m.type)));
+  }
+});
+
+test('attachment retry explains unmet prerequisites and directory recovery enables the existing retry', async () => {
+  const cases = [
+    [s => { s.identityChecking = true; }, /核验账号/],
+    [s => { s.identity = null; }, /所属平台和账号/],
+    [s => { s.identity.accountKey = 'other'; }, /所属平台和账号/],
+    [s => { s.account.enabled = false; }, /启用当前账号/],
+    [s => { s.tabId = null; }, /对话标签页/],
+    [s => { s.directory.granted = false; }, /目录读写权限/],
+  ];
+  for (const [change, message] of cases) {
+    const state = initialState(); state.assetDiagnostics = { pending: 1, failed: 1, failures: [] }; change(state);
+    const app = await setup({ state });
+    assert.equal(app.elements.get('retry-images').disabled, true);
+    assert.equal(app.elements.get('asset-retry-blocker').hidden, false);
+    assert.match(app.elements.get('asset-retry-blocker').textContent, message);
+    await app.click('retry-images');
+    assert(!app.messages.some(m => m.type === 'collector:retry-images'));
+    if (!state.directory.granted) {
+      await app.click('asset-recovery-settings');
+      assert.equal(app.elements.get('settings-restore-directory').scrolled, true);
+      await app.click('settings-restore-directory');
+      assert(app.events.includes('directory-permission'));
+      state.directory.granted = true; app.setState(state); await app.poll();
+      assert.equal(app.elements.get('asset-retry-blocker').hidden, true);
+      assert.equal(app.elements.get('retry-images').disabled, false);
+      assert(!app.events.includes('directory-picker'));
+      assert(!app.messages.some(m => m.type === 'collector:start'));
+    }
+  }
+});
+
+test('source unavailable and size failures provide bounded next steps and held state is explicit', async () => {
+  const state = initialState();
+  state.assetDiagnostics = { pending: 3, failed: 3, failures: [
+    { code: 'HTTP_404', retryHeld: true, waitingFor: 'source' },
+    { code: 'ASSET_SIZE', retryHeld: true, waitingFor: 'unsupported' },
+    { code: 'ASSET_UNKNOWN', message: 'private URL https://example.test/?secret=1' },
+  ] };
+  const app = await setup({ state });
+  const rows = app.elements.get('asset-failure-list').children.map(visibleText);
+  assert.match(rows[0], /原平台.*原网页可下载时再重试/);
+  assert.match(rows[0], /已暂停自动重试/);
+  assert.match(rows[1], /32 MiB.*自行保存.*不会将其标记为已归档/);
+  assert.match(rows[2], /诊断日志.*脱敏导出/);
+  assert.doesNotMatch(rows.join(' '), /private|secret=1|https:/);
+  assert.equal(app.elements.get('asset-recovery-settings').hidden, true);
+});
+
+test('recovery settings route only recognized permission reasons and clears when failures resolve', async () => {
+  for (const [code, reason, expected] of [
+    ['ASSET_LINK_UNKNOWN', 'external_permission_required', true],
+    ['ASSET_FORMAT', 'external_permission_required', false],
+    ['HTTP_403', undefined, false],
+    ['DIRECTORY_CHANGED', undefined, true],
+    ['ASSET_WRITE', undefined, true],
+  ]) {
+    const state = initialState(); state.assetDiagnostics = { pending: 1, failed: 1, failures: [{ code, reason }] };
+    const app = await setup({ state });
+    assert.equal(app.elements.get('asset-recovery-settings').hidden, !expected);
+    if (expected) {
+      await app.click('asset-recovery-settings');
+      const target = code === 'ASSET_LINK_UNKNOWN' ? 'grant-external-images' : 'choose-directory';
+      assert.equal(app.elements.get(target).scrolled, true);
+      assert.equal(app.permissionRequests.length, 0);
+      await app.click('back-home');
+    }
+    state.assetDiagnostics = { pending: 0, failed: 0, failures: [] };
+    app.setState(state); await app.poll();
+    assert.equal(app.elements.get('asset-recovery-settings').hidden, true);
+    assert.equal(app.elements.get('asset-retry-blocker').hidden, true);
+  }
 });

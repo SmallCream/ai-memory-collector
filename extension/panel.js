@@ -70,7 +70,7 @@ function assetFailureMessage(code) {
   // Error strings can originate in network/extension APIs. Only fixed messages
   // reach this diagnostic view; response bodies, signed URLs and tokens do not.
   if (/^(?:HTTP_401|HTTP_403|IDENTITY)$/.test(code)) return '请确认来源平台已登录，且当前账号可以打开原始附件。';
-  if (code === 'HTTP_404') return '请求的附件入口返回 404。可能是来源已失效或下载入口不匹配，尚不能据此判断文件已删除。';
+  if (code === 'HTTP_404') return '请求的附件入口返回 404，尚不能据此判断文件已删除。请在原平台打开上方对话并尝试下载此附件；原网页可下载时再重试。若原网页也无法下载，请保留来源记录，等待来源恢复；反复重试无法修复来源问题。';
   if (code === 'HTTP_429') return '附件请求受到限流，请稍后重试。';
   if (/^HTTP_5\d\d$/.test(code)) return '附件服务暂时不可用，请稍后重试。';
   if (code === 'ACCOUNT_CHANGED') return '账号已切换，已停止处理。请回到附件所属账号后重试。';
@@ -81,15 +81,15 @@ function assetFailureMessage(code) {
   if (/^(?:ASSET_URL|ASSET_REDIRECT|ASSET_PROTOCOL)$/.test(code)) return '附件下载地址或跳转尚未支持。可打开原始附件后重试；部分资源仍需适配。';
   if (/^(?:ASSET_NETWORK|ASSET_TIMEOUT)$/.test(code)) return '附件下载未完成，请检查网络后重试。';
   if (code === 'ASSET_LINK_UNKNOWN') return '外部链接尚未验证；原链接已保留。这不等于 ChatGPT 附件下载失败，请查看具体原因。';
-  if (/^(?:ASSET_SIZE|ASSET_TOO_LARGE)$/.test(code)) return '附件数据为空或超过当前处理上限。';
+  if (/^(?:ASSET_SIZE|ASSET_TOO_LARGE)$/.test(code)) return '附件数据为空或超过当前处理上限（单文件最多 32 MiB）。请在原网页检查文件大小并尝试下载；超过上限的文件需自行保存，插件不会将其标记为已归档。';
   if (/^(?:ASSET_FORMAT|ASSET_RESPONSE|ASSET_NOT_IMAGE|ASSET_NOT_FILE|ASSET_STREAM)$/.test(code)) return '未取得受支持的完整附件，任务已保留。';
   if (/^(?:ASSET_VARIANT|ASSET_HASH|ASSET_HASH_MISMATCH)$/.test(code)) return '下载内容与原始附件信息不一致，未保存。';
   if (/^(?:LOCAL_CONFLICT|ASSET_LOCAL_CONFLICT)$/.test(code)) return '本地文件已变化，已保留原文件。请检查对应对话或附件。';
-  if (code === 'DIRECTORY_PERMISSION') return '请恢复保存目录的读写权限。';
-  if (code === 'ASSET_PERMISSION') return '请在设置中点击“允许下载豆包原图（byteimg.com）”并授权，然后重试失败附件。';
+  if (code === 'DIRECTORY_PERMISSION') return '请在“权限与保存设置”中恢复原保存目录的读写权限，再返回首页重试失败附件。';
+  if (code === 'ASSET_PERMISSION') return '请在“权限与保存设置”中点击“允许下载豆包原图（byteimg.com）”并授权，然后重试失败附件。';
   if (code === 'DIRECTORY_CHANGED') return '附件写入尚未完成，请恢复原保存目录后重试。';
   if (code === 'ASSET_WRITE') return '附件写入未完成，请检查保存目录后重试。';
-  return '本次附件处理未完成，任务已保留。可根据错误代码继续排查。';
+  return '本次附件处理未完成，任务已保留。可根据错误代码继续排查：打开“诊断日志”，需要反馈时先预览脱敏导出。';
 }
 function assetLabel(value, fallback) {
   return safeMessage(typeof value === 'string' && value ? value : fallback)
@@ -120,7 +120,9 @@ function renderAssetFailures(diagnostics) {
     const explanation = document.createElement('p');
     explanation.textContent = assetFailureDiagnosticMessage({ code, reason: failure.reason }) || assetFailureMessage(code);
     const metadata = document.createElement('p'); metadata.classList.add('muted');
-    const held = waitReasons[failure.waitingFor] || (failure.retryHeld ? '等待条件恢复或手动重试' : '');
+    const held = ['ASSET_SIZE', 'ASSET_TOO_LARGE'].includes(code) && failure.waitingFor === 'unsupported' ?
+      '已暂停自动重试，请检查文件大小或原始附件' :
+      failure.retryHeld ? `已暂停自动重试 · ${waitReasons[failure.waitingFor] || '等待条件恢复或手动重试'}` : waitReasons[failure.waitingFor] || '';
     metadata.textContent = `${code} · 已尝试 ${count(failure.attempt)} 次${held ? ` · ${held}` : time(failure.retryAt) ? ` · 重试等待至 ${time(failure.retryAt)}` : ''}`;
     item.append(title, filename, explanation, metadata);
     for (const summary of assetFailureAttemptSummaries(failure.responseDiagnostics)) {
@@ -617,6 +619,17 @@ function render() {
   renderDetailedProgress();
   show('retry-images', failedImages > 0);
   show('image-retry-note', failedImages > 0);
+  const settingsNeeded = failedImages > 0 && (!granted || (Array.isArray(diagnostics?.failures) ? diagnostics.failures : []).some(failure =>
+    ['ASSET_PERMISSION', 'DIRECTORY_PERMISSION', 'DIRECTORY_CHANGED', 'ASSET_WRITE'].includes(failure.code) ||
+    failure.code === 'ASSET_LINK_UNKNOWN' && failure.reason === 'external_permission_required'));
+  show('asset-recovery-settings', settingsNeeded);
+  const retryBlocker = current.identityChecking ? '正在核验账号，完成后可重试。' :
+    !hasIdentity || account?.accountKey !== identity?.accountKey ? '请回到附件所属平台和账号，再打开采集器重试。' :
+    !account?.enabled ? '请先在首页启用当前账号，再重试附件。' :
+    !granted ? '请先在“权限与保存设置”中恢复原目录读写权限，再重试。' :
+    !Number.isSafeInteger(current.tabId) || current.tabId < 0 ? '请在来源平台的对话标签页打开采集器，再重试附件。' : '';
+  text('asset-retry-blocker', retryBlocker);
+  show('asset-retry-blocker', failedImages > 0 && Boolean(retryBlocker));
   const restore = current.restoreStatus;
   const restoreRunning = ['running', 'restoring', 'scanning', 'downloading', 'saving'].includes(restore?.status);
   const restoreProgress = restore?.progress || restore || {};
@@ -983,6 +996,15 @@ action('grant-external-images', async () => {
   await send('collector:permissions-changed');
 });
 action('open-settings', () => { screen = 'settings'; settingsLoaded = false; });
+action('asset-recovery-settings', () => {
+  screen = 'settings'; settingsLoaded = false; render();
+  const failures = Array.isArray(current?.assetDiagnostics?.failures) ? current.assetDiagnostics.failures : [];
+  const target = !current?.directory?.granted ? current?.directory?.name || directory ? 'settings-restore-directory' : 'choose-directory' :
+    failures.some(failure => ['DIRECTORY_PERMISSION', 'DIRECTORY_CHANGED', 'ASSET_WRITE'].includes(failure.code)) ? 'choose-directory' :
+    current?.platform === 'doubao' && failures.some(failure => failure.code === 'ASSET_PERMISSION') ? 'grant-doubao-images' :
+    failures.some(failure => failure.code === 'ASSET_LINK_UNKNOWN' && failure.reason === 'external_permission_required') ? 'grant-external-images' : 'settings-heading';
+  $(target).scrollIntoView({ block: 'center' });
+});
 action('back-home', () => { screen = 'home'; });
 action('save-schedule', () => send('collector:configure', { autoEnabled: $('auto-enabled').checked,
   localAssetsEnabled: $('local-assets-enabled').checked, intervalMinutes: Number($('interval-minutes').value) }));
