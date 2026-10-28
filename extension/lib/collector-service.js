@@ -183,8 +183,12 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
     continueSoon();
   }
   async function replaceDirectory() {
-    const candidate = await getSetting('directoryCandidate'), original = await getSetting('directory');
+    const candidate = await getSetting('directoryCandidate');
     if (!candidate) return;
+    // A rejected selection must never become a later permission-recovery action.
+    // Consume this intent before validation; a retry requires a new selection.
+    await setSetting('directoryCandidate', null);
+    const original = await getSetting('directory');
     if (candidate.kind !== 'directory' || typeof candidate.queryPermission !== 'function') throw collectorError('DIRECTORY_PERMISSION', '请选择有效的本地文件夹。');
     if (await candidate.queryPermission({ mode: 'readwrite' }) !== 'granted') throw collectorError('DIRECTORY_PERMISSION', '新目录尚未获得读写权限。');
     let same = false;
@@ -222,14 +226,17 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
         }
         if (belongsToOriginal) throw collectorError('DIRECTORY_PENDING', '原目录还有未完成的附件写入，请先在原目录重试附件，再更换目录。');
       }
-      for (const account of Object.values(config.accounts)) await engine.reset(account.accountKey);
+      for (const account of Object.values(config.accounts)) {
+        await engine.reset(account.accountKey);
+        // This summary describes files in the old directory, not the account globally.
+        await setSetting(`assetStatus:${account.accountKey}`, null);
+      }
       await settings.change(current => {
         for (const account of Object.values(current.accounts)) { account.initialized = false; account.lastResult = null; account.nextRunAt = now(); }
         return current;
       });
     }
     await setSetting('directory', candidate);
-    await setSetting('directoryCandidate', null);
     } finally { changingDirectory = false; continueSoon(); }
   }
   async function githubConfig(message) {

@@ -726,7 +726,7 @@ async function chooseDirectory() {
 async function restoreDirectory() {
   if (!directory) throw new Error('保存目录尚未加载，请稍后重试或重新选择目录。');
   if (await directory.requestPermission({ mode: 'readwrite' }) !== 'granted') throw new Error('目录权限未恢复；已有采集进度会保留。');
-  await send('collector:directory-changed');
+  // The action refreshes state next. Restoring access is not a directory selection.
 }
 async function grantGithub() {
   const granted = await chrome.permissions.request({ origins: ['https://api.github.com/*'] });

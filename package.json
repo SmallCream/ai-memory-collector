@@ -1,6 +1,6 @@
 {
   "name": "ai-memory-collector",
-  "version": "0.4.10",
+  "version": "0.4.11",
   "private": true,
   "type": "module",
   "description": "Local-first AI conversation and attachment backups with optional private GitHub sync",

@@ -787,11 +787,12 @@ test('unfinished asset writes block directory replacement even without an archiv
   const config = structuredClone(f.store.get('collectorConfigV2'));
   await assert.rejects(f.service.command({ type: 'collector:directory-changed' }, 1), { code: 'DIRECTORY_PENDING' });
   assert.equal(f.store.get('directory'), f.root);
-  assert.equal(f.store.get('directoryCandidate'), candidate);
+  assert.equal(f.store.get('directoryCandidate'), null);
   assert.deepEqual(f.store.get('collectorConfigV2'), config);
   assert.equal(f.store.get('assetWrite:synthetic-hash'), journal);
-  // Completing the original write clears its journal and permits the switch.
+  // Completing the original write permits a newly selected switch.
   f.store.set('assetWrite:synthetic-hash', null);
+  f.store.set('directoryCandidate', candidate);
   await f.service.command({ type: 'collector:directory-changed' }, 1);
   assert.equal(f.store.get('directory'), candidate);
 });
@@ -802,6 +803,7 @@ test('directory replacement checks verified-but-not-cleared journals and fails c
   f.store.set('assetWrite:verified', { directory: directory('original'), phase: 'verified' });
   await assert.rejects(f.service.command({ type: 'collector:directory-changed' }, 1), { code: 'DIRECTORY_PENDING' });
   f.store.delete('assetWrite:verified');
+  f.store.set('directoryCandidate', directory('replacement')); // Explicitly select again after refusal.
   f.dependencies.getSettingsByPrefix = async () => { throw issue('STORAGE'); };
   f.service = createCollectorService(f.dependencies);
   await assert.rejects(f.service.command({ type: 'collector:directory-changed' }, 1), { code: 'STORAGE' });

@@ -113,7 +113,8 @@ export function createLocalMaintenance({ getSetting = defaultGet, setSetting = d
   async function tick({ directory, account, force = false }) {
     return locked(account, async () => {
       let state = await read(account);
-      if (state && !force && !['running', 'requested'].includes(state.status) && state.nextRunAt > now()) return publicState(state);
+      const same = state && await sameDirectory(state.directory, directory);
+      if (state && same && !force && !['running', 'requested'].includes(state.status) && state.nextRunAt > now()) return publicState(state);
       if (!directory || await directory.queryPermission({ mode: 'readwrite' }) !== 'granted') {
         if (state) {
           state.status = 'blocked'; state.lastError = { code: 'DIRECTORY_PERMISSION' }; state.nextRunAt = now() + 60_000;
@@ -121,7 +122,6 @@ export function createLocalMaintenance({ getSetting = defaultGet, setSetting = d
         }
         return { ...publicState(state), status: 'blocked', runnable: false, lastError: { code: 'DIRECTORY_PERMISSION' } };
       }
-      const same = state && await sameDirectory(state.directory, directory);
       if (state?.deliveryConversationId && !same) {
         state.status = 'blocked'; state.lastError = { code: 'DIRECTORY_CHANGED' }; state.nextRunAt = now() + DAY;
         await setSetting(key(account), state); return publicState(state);

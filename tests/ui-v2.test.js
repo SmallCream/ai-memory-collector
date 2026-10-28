@@ -1131,3 +1131,13 @@ test('first use keeps cloud optional and full capture out of primary actions', a
   }
   assert.ok(html.indexOf('id="wizard-skip-github"') < html.indexOf('id="wizard-cloud-options"'));
 });
+
+
+test('restoring directory permission does not replay a failed or legacy directory selection', async () => {
+  const state = initialState(); state.directory.granted = false;
+  const app = await setup({ state });
+  await app.click('restore-directory');
+  assert.ok(app.events.includes('directory-permission'));
+  assert.equal(app.messages.some(message => message.type === 'collector:directory-changed'), false);
+  assert.ok(app.messages.some(message => message.type === 'collector:get-state'));
+});
