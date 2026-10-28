@@ -17,10 +17,8 @@
     </div>
   </header>
   <p id="global-status" class="feedback" role="status" aria-live="polite">正在读取本机配置…</p>
-
   <p id="context-error" class="notice" role="status" hidden></p>
   <p id="legacy-notice" class="hint" hidden>检测到旧版未保存的采集副本，已保留在此浏览器中。更新不会清除此副本。</p>
-
   <section id="wizard" hidden aria-labelledby="wizard-heading">
     <div class="wizard-heading"><p class="eyebrow">首次设置</p><h1 id="wizard-heading">让对话自动归档</h1><p class="muted">对话和附件优先保存在电脑，GitHub 备份可稍后配置。</p></div>
     <ol class="wizard-steps" aria-label="配置步骤"><li data-step="0">连接账号</li><li data-step="1">保存位置</li><li data-step="2">可选云备份</li><li data-step="3">完成</li></ol>
@@ -51,7 +49,6 @@
       <label for="wizard-branch">分支（可选）<input id="wizard-branch" autocomplete="off" spellcheck="false" placeholder="留空使用默认分支"></label>
       <label for="wizard-token">GitHub Token<input id="wizard-token" type="password" autocomplete="off" spellcheck="false" maxlength="1024" placeholder="粘贴仅授权此仓库的 Token"></label>
       <label class="check-line"><input id="wizard-github-enabled" type="checkbox"><span>自动备份对话到 GitHub</span></label>
-
       <details class="advanced-settings"><summary>高级设置</summary><label class="check-line"><input id="wizard-github-auto-restore" type="checkbox"><span>自动从 GitHub 补齐本地备份</span></label></details>
       <p class="hint">仅需此仓库的 Contents 读写权限。Token 保存在此浏览器，不进入对话文件，也不传给 AI 平台。</p>
       <p class="hint">连接仓库不会自动开启上传。GitHub 只备份对话 JSON、Markdown 和清单；图片和附件保存在本地。</p>
@@ -69,31 +66,22 @@
       <div class="wizard-footer"><button id="wizard-back-3">上一步</button><button id="wizard-finish" class="primary">开始首次备份</button></div>
     </div>
   </section>
-
   <section id="home" hidden aria-label="日常采集">
     <div class="account-row"><div id="account-avatar" class="avatar" aria-hidden="true">AI</div><div class="account-text"><strong id="account-name">识别账号中…</strong><span id="account-context" class="muted">ChatGPT</span></div><span id="account-badge" class="badge">检查中</span></div>
     <p id="identity-checking-note" class="hint warning-text" hidden>正在核验当前标签页；下方为上次确认账号的进度。</p>
     <div id="account-alert" class="notice" hidden><p id="account-alert-text"></p><label for="new-account-alias">账号名称<input id="new-account-alias" maxlength="60" autocomplete="off"></label><button id="bind-account" class="primary block">为此账号启用采集</button><button id="home-grant" class="primary block" hidden>授权 ChatGPT</button><button id="home-open-chatgpt" hidden>打开 ChatGPT</button><button id="home-open-doubao" hidden>打开豆包</button></div>
     <div class="headline"><h1 id="home-heading">自动归档你的对话</h1><p id="schedule-status" class="muted"></p></div>
-    <section class="backup-overview" aria-label="备份结果"><p id="run-summary" hidden></p><p id="overview-cloud" class="hint" hidden></p><p id="overview-problems" class="warning-text" hidden></p><button id="open-diagnostics" class="text-button">问题与诊断日志</button><div id="problem-actions" class="button-row" hidden><button id="problem-collection" class="text-button" hidden>查看对话问题</button><button id="problem-github" class="text-button" hidden>查看 GitHub 问题</button></div></section>
-    <section id="attachment-overview" class="attachment-overview" aria-label="附件下载结果">
-      <div class="attachment-heading"><h2>附件下载</h2><span id="attachment-state" class="badge" role="status"></span></div>
-      <div class="attachment-counts">
-        <div><strong id="attachment-saved">—</strong><span>已保存</span></div>
-        <div><strong id="attachment-pending">—</strong><span>排队／处理中</span></div>
-        <div id="attachment-failure-count"><strong id="attachment-failed">—</strong><span>失败</span></div>
-      </div>
-      <p id="overview-attachments" class="hint"></p>
-      <details id="asset-failures" class="asset-failures" hidden><summary id="asset-failures-heading">查看失败原因</summary><p id="asset-failures-limit" class="hint" hidden></p><ol id="asset-failure-list"></ol></details><button id="retry-images" class="text-button" hidden>重试失败附件</button><p id="image-retry-note" class="hint" hidden>逐项重试失败附件，不会重新扫描对话列表。对话采集暂停时，每项只尝试一次。</p>
-      <button id="problem-assets" class="text-button" hidden>查看附件诊断日志</button>
-    </section>
-    <div id="job-error" class="notice" role="status" hidden></div>
-    <div class="main-actions"><button id="start-capture" class="primary block">检查更新</button><button id="pause-capture" class="block" hidden>暂停采集</button><button id="resume-capture" class="primary block" hidden>继续采集</button><button id="stop-capture" class="block" title="结束本轮，不再继续旧队列；已保存数据保留。" hidden>停止本轮</button><button id="repair-recommended" class="block" hidden>补齐本地缺失</button></div>
-    <p id="task-action-help" class="hint" hidden></p>
-    <div class="destinations local-location"><div><span>本地目录</span><strong id="directory-name">尚未设置</strong><span id="directory-status" class="muted"></span></div><button id="restore-directory" class="text-button" hidden>恢复保存权限</button><p id="reading-help" class="hint" hidden>在此目录内打开 Markdown（.md）文件阅读对话；迁移时复制整个归档目录，保留附件和相对路径。</p></div>
-    <div id="job-progress" hidden><div class="progress-heading"><strong id="job-phase"></strong><span id="job-count" class="muted"></span></div><progress id="progress-meter" aria-label="采集进度"></progress><p id="job-detail" class="hint"></p></div>
+    <section id="conversation-overview" class="backup-overview" aria-label="对话备份">
+      <h2>对话备份</h2>
+    <div id="job-progress" hidden><div class="progress-heading"><strong id="job-phase"></strong><span id="job-count" class="muted"></span></div><progress id="progress-meter" aria-label="采集进度"></progress></div>
+      <p id="run-summary" hidden></p>
+      <p id="overview-problems" class="warning-text" hidden></p>
+    <div id="job-error" class="notice" role="status" hidden></div>    <div class="main-actions"><button id="start-capture" class="primary block">检查更新</button><button id="pause-capture" class="primary block" hidden>暂停采集</button><button id="resume-capture" class="primary block" hidden>继续采集</button><button id="stop-capture" class="block" title="结束本轮，不再继续旧队列；已保存数据保留。" hidden>停止本轮</button><button id="repair-recommended" class="block" hidden>补齐本地缺失</button></div>
+      <div id="problem-actions" class="button-row" hidden><button id="problem-collection" class="text-button" hidden>查看对话问题</button><button id="problem-github" class="text-button" hidden>查看 GitHub 问题</button></div>
+      <p id="job-detail" class="hint" hidden></p>
+      <details id="task-action-help-details" class="inline-help" hidden><summary>暂停与停止的区别</summary><p id="task-action-help" class="hint" hidden></p></details>
     <details id="collection-details" class="task-details" hidden>
-      <summary>采集详情<span id="collection-details-status" class="detail-badge"></span></summary>
+      <summary>对话进度与记录<span id="collection-details-status" class="detail-badge"></span></summary>
       <p id="collection-connection" class="hint warning-text" hidden></p>
       <p id="collection-wait" class="hint"></p>
       <p id="collection-detail-counts" class="detail-counts"></p>
@@ -103,11 +91,18 @@
       <section class="detail-section"><h3>对话队列</h3><p id="collection-queue-note" class="hint"></p><ol id="collection-queue" class="task-list"></ol></section>
       <section class="detail-section"><h3>最近处理记录</h3><p id="collection-recent-note" class="hint"></p><ol id="collection-recent" class="task-list recent-list"></ol></section>
     </details>
-    <p id="capture-help" class="hint center">JSON + Markdown 自动保存</p>
-    <p id="local-assets-policy" class="hint" hidden></p>
-    <p id="maintenance-status" class="notice" role="status" hidden></p>
-    <details id="archive-completeness" class="task-details" hidden><summary>本地备份完整性<span id="archive-completeness-badge" class="detail-badge"></span></summary><p id="archive-completeness-note" class="hint"></p><ol id="archive-completeness-list" class="task-list completeness-list"></ol></details>
-    <div class="destinations"><div id="github-destination" hidden><span>GitHub</span><strong id="github-state">未连接</strong></div><button id="retry-github" class="text-button" hidden>立即备份到 GitHub</button><p id="github-detail" class="hint" hidden></p><details id="transfer-details" class="task-details transfer-details">
+    </section>
+    <section id="attachment-overview" class="attachment-overview" aria-label="附件下载结果">
+      <div class="attachment-heading"><h2>附件下载</h2><span id="attachment-state" class="badge" role="status"></span></div>
+      <div class="attachment-counts">
+        <div><strong id="attachment-saved">—</strong><span>已保存</span></div>
+        <div><strong id="attachment-pending">—</strong><span>排队／处理中</span></div>
+        <div id="attachment-failure-count"><strong id="attachment-failed">—</strong><span>失败</span></div>
+      </div>
+      <p id="overview-attachments" class="hint"></p>
+      <details id="asset-failures" class="asset-failures" hidden><summary id="asset-failures-heading">查看失败原因</summary><p id="asset-failures-limit" class="hint" hidden></p><p id="image-retry-note" class="hint" hidden>逐项重试失败附件，不会重新扫描对话列表。对话采集暂停时，每项只尝试一次。</p><ol id="asset-failure-list"></ol></details><div class="attachment-actions"><button id="retry-images" class="text-button" hidden>重试失败附件</button>
+      <button id="problem-assets" class="text-button" hidden>诊断日志</button></div>
+<details id="transfer-details" class="task-details transfer-details">
       <summary><span id="transfer-heading">附件下载详情</span><span id="transfer-details-status" class="detail-badge"></span></summary>
       <div id="asset-summary" hidden><span>附件（含图片）</span><strong id="asset-summary-text"></strong></div><p id="transfer-connection" class="hint warning-text" hidden></p><p id="transfer-wait" class="hint"></p>
       <p id="transfer-detail-counts" class="detail-counts"></p><div id="transfer-current" class="activity-cards"></div>
@@ -115,12 +110,18 @@
       <section id="outbox-queue-section" class="detail-section" hidden><h3>待提交的对话</h3><p id="outbox-queue-note" class="hint"></p><ol id="outbox-queue" class="task-list"></ol></section>
       <section id="restore-queue-section" class="detail-section" hidden><h3>仓库恢复（全部账号）</h3><p id="transfer-restore-detail" class="hint"></p></section>
       <section class="detail-section"><h3>最近传输记录</h3><p id="transfer-recent-note" class="hint"></p><ol id="transfer-recent" class="task-list recent-list"></ol></section>
-    </details><details id="asset-internal" class="asset-failures asset-internal" hidden><summary id="asset-internal-heading">内部附件未下载</summary><p class="hint">工具内部看图附件返回 404，已停止自动重试；来源记录已保留。这些附件仍未下载，可手动再尝试获取。</p><p id="asset-internal-limit" class="hint" hidden></p><ol id="asset-internal-list"></ol><button id="retry-internal-images" class="text-button">尝试获取内部附件</button></details><button id="open-restore" class="text-button" hidden>从 GitHub 恢复对话</button></div>
+    </details>
+</section>
+    <div class="destinations local-location"><div><span>本地目录</span><strong id="directory-name">尚未设置</strong><span id="directory-status" class="muted"></span></div><button id="restore-directory" class="text-button" hidden>恢复保存权限</button><details id="reading-help" class="inline-help" hidden><summary>如何查看和迁移备份</summary><p>打开此目录中的 Markdown（.md）文件阅读。迁移时复制整个目录，保留附件及相对路径。</p><p id="capture-help" class="hint center">JSON + Markdown 自动保存</p></details></div>
+    <div class="home-tools"><button id="open-diagnostics" class="text-button">问题与诊断日志</button></div>
+    <p id="local-assets-policy" class="hint" hidden></p>
+    <p id="maintenance-status" class="notice" role="status" hidden></p>
+    <details id="archive-completeness" class="task-details" hidden><summary>本地备份完整性<span id="archive-completeness-badge" class="detail-badge"></span></summary><p id="archive-completeness-note" class="hint"></p><ol id="archive-completeness-list" class="task-list completeness-list"></ol></details>
+    <div id="cloud-transfer-tools" class="destinations"><p id="overview-cloud" class="hint" hidden></p><div id="github-destination" hidden><span>GitHub</span><strong id="github-state">未连接</strong></div><button id="retry-github" class="text-button" hidden>立即备份到 GitHub</button><p id="github-detail" class="hint" hidden></p><details id="asset-internal" class="asset-failures asset-internal" hidden><summary id="asset-internal-heading">内部附件未下载</summary><p class="hint">工具内部看图附件返回 404，已停止自动重试；来源记录已保留。这些附件仍未下载，可手动再尝试获取。</p><p id="asset-internal-limit" class="hint" hidden></p><ol id="asset-internal-list"></ol><button id="retry-internal-images" class="text-button">尝试获取内部附件</button></details><button id="open-restore" class="text-button" hidden>从 GitHub 恢复对话</button></div>
     <details id="last-result" class="task-details" hidden><summary id="history-heading">本轮变更明细<span id="last-result-time" class="muted"></span></summary><div class="stats"><div><strong id="count-added">0</strong><span>新增</span></div><div><strong id="count-updated">0</strong><span>更新</span></div><div><strong id="count-unchanged">0</strong><span>读取后无变化</span></div><div><strong id="count-failed">0</strong><span>待处理</span></div></div></details>
     <details id="advanced-actions" class="advanced-settings"><summary>高级操作</summary><p class="hint">日常使用“检查更新”即可。以下操作用于本地缺失或完整复核。</p><button id="repair-local" class="block">补齐缺失</button><p class="hint">检查本地文件，从有效 JSON 重建缺失 Markdown，并安排可获取附件的补采。</p><button id="full-capture" class="block">全量补采</button><div id="full-capture-confirmation" class="notice" hidden><p id="full-capture-explanation"></p><div class="button-row"><button id="confirm-full-capture">确认重新读取全部对话</button><button id="cancel-full-capture">取消</button></div></div></details>
     <details class="advanced-settings"><summary>支持范围与限制</summary><p class="scope-note">当前范围：ChatGPT 个人空间普通对话及豆包网页普通对话。豆包按消息链完整分页；非正文块和重新生成记录保留在 JSON。豆包原图支持 byteimg.com 来源，其他尚未适配资源保留原始信息并提示待处理。支持图片、ZIP、GZIP / TAR.GZ、PDF、DOCX / XLSX / PPTX 与常见文本附件，单文件上限 32 MiB（gzip 校验后的内容也限 32 MiB）。无法取得的附件标记待处理；内部看图附件返回 404 后单独标记未下载。</p></details>
   </section>
-
   <section id="settings" hidden aria-labelledby="settings-heading">
     <p id="extension-version" class="hint"></p>
     <div class="settings-heading"><button id="back-home" class="text-button">‹ 返回采集</button><h1 id="settings-heading">设置</h1></div>

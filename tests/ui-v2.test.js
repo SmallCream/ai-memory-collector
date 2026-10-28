@@ -1151,7 +1151,9 @@ test('home separates completed conversations from failed attachments and hides u
   assert.equal(app.elements.get('attachment-saved').textContent, '5');
   assert.equal(app.elements.get('attachment-failed').textContent, '1');
   assert.match(app.elements.get('overview-attachments').textContent, /失败项尚未保存.*内部附件未下载 1/);
-  assert.match(app.elements.get('overview-problems').textContent, /附件失败 1/);
+  assert.equal(app.elements.get('attachment-state').textContent, '1 个失败');
+  assert.equal(app.elements.get('start-capture').classList.contains('primary'), false);
+  assert.equal(app.elements.get('overview-problems').hidden, true);
   assert.equal(app.elements.get('overview-cloud').hidden, true);
   assert.equal(app.elements.get('repair-recommended').hidden, true);
   state.maintenanceStatus = { missingAssets: 1 }; app.setState(state); await app.poll();
@@ -1201,7 +1203,7 @@ test('a cleared failure count is explicit and no longer highlighted while remain
   assert.equal(app.elements.get('transfer-details-status').classList.contains('has-failures'), false);
   assert.equal(app.elements.get('asset-failures').hidden, true);
   assert.equal(app.elements.get('retry-images').hidden, true);
-  assert.match(app.elements.get('overview-attachments').textContent, /失败 0.*不代表已经全部保存/);
+  assert.match(app.elements.get('overview-attachments').textContent, /失败 0.*尚未全部保存/);
 });
 
 test('unknown attachment counts and excluded internal files never imply a complete backup', async () => {
@@ -1221,9 +1223,58 @@ test('unknown attachment counts and excluded internal files never imply a comple
 });
 
 test('attachment failures and retry entry live beside the summary rather than below collapsed transfer details', () => {
-  const card = html.slice(html.indexOf('<section id="attachment-overview"'), html.indexOf('<div id="job-error"'));
+  const card = html.slice(html.indexOf('<section id="attachment-overview"'), html.indexOf('<div class="destinations local-location"'));
   for (const id of ['attachment-failed', 'asset-failures', 'retry-images', 'problem-assets']) assert(card.includes(`id="${id}"`));
-  assert(!card.includes('id="transfer-details"'));
+  assert(card.indexOf('id="retry-images"') < card.indexOf('id="transfer-details"'));
+});
+
+test('manual running backup is not described as paused and scan discovery is not a completion fraction', async () => {
+  const state = initialState(); state.config.autoEnabled = false;
+  state.job = { status: 'running', mode: 'initial', phase: 'list', discovered: 160, processed: 0 };
+  const app = await setup({ state });
+  assert.equal(app.elements.get('home-heading').textContent, '正在进行首次备份');
+  assert.match(app.elements.get('schedule-status').textContent, /本轮正在进行.*自动检查未开启/);
+  assert.doesNotMatch(app.elements.get('schedule-status').textContent, /已暂停/);
+  assert.equal(app.elements.get('job-count').textContent, '160 条');
+  assert.match(app.elements.get('run-summary').textContent, /正在继续扫描列表/);
+  state.job.phase = 'detail'; state.job.processed = 25;
+  app.setState(state); await app.poll();
+  assert.equal(app.elements.get('job-count').textContent, '25 / 160');
+});
+
+test('empty completed maintenance is quiet but running work and real problems remain visible', async () => {
+  const state = initialState(); state.maintenanceStatus = { status: 'completed', checked: 0, total: 0, repaired: 0 };
+  const app = await setup({ state });
+  assert.equal(app.elements.get('maintenance-status').hidden, true);
+  state.maintenanceStatus.status = 'running'; app.setState(state); await app.poll();
+  assert.equal(app.elements.get('maintenance-status').hidden, false);
+  assert.equal(app.elements.get('maintenance-status').classList.contains('needs-attention'), false);
+  state.maintenanceStatus = { status: 'completed', checked: 2, total: 2, repaired: 0 }; app.setState(state); await app.poll();
+  assert.equal(app.elements.get('maintenance-status').hidden, false);
+  assert.equal(app.elements.get('maintenance-status').classList.contains('needs-attention'), false);
+  state.maintenanceStatus = { status: 'completed', checked: 0, total: 0, missingAttachments: 1 }; app.setState(state); await app.poll();
+  assert.equal(app.elements.get('maintenance-status').hidden, false);
+  assert.equal(app.elements.get('maintenance-status').classList.contains('needs-attention'), true);
+  state.maintenanceStatus = { status: 'failed', checked: 0, total: 0, error: { message: '恢复目录权限后重试' } };
+  app.setState(state); await app.poll();
+  assert.equal(app.elements.get('maintenance-status').hidden, false);
+  assert.match(app.elements.get('maintenance-status').textContent, /恢复目录权限/);
+});
+
+test('home groups progress and controls before attachments and keeps guidance collapsed with logs reachable', async () => {
+  const conversation = html.slice(html.indexOf('<section id="conversation-overview"'), html.indexOf('<section id="attachment-overview"'));
+  for (const id of ['job-progress', 'pause-capture', 'stop-capture', 'collection-details']) assert(conversation.includes(`id="${id}"`));
+  assert.match(conversation, /id="pause-capture" class="primary/);
+  assert(!conversation.includes('id="attachment-failed"'));
+  for (const id of ['reading-help', 'task-action-help-details']) {
+    const tag = html.match(new RegExp('<details[^>]*id="' + id + '"[^>]*>'))[0];
+    assert.doesNotMatch(tag, /\bopen\b/);
+  }
+  const app = await setup();
+  assert.equal(app.elements.get('open-diagnostics').hidden, false);
+  assert.equal(app.elements.get('cloud-transfer-tools').hidden, true);
+  assert.equal(app.elements.get('start-capture').classList.contains('primary'), true);
+  assert.equal(app.elements.get('task-action-help-details').hidden, true);
 });
 
 

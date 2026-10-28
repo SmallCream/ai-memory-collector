@@ -239,6 +239,13 @@ function renderCompleteness(diagnostics) {
       partial: '本地检查有待处理项', blocked: '本地检查需要处理', failed: '本地检查未完成', paused: '本地检查已暂停' };
     const missing = maintenance.missingConversationCount ?? (Array.isArray(maintenance.missingConversations) ? maintenance.missingConversations.length : maintenance.missingConversations);
     const missingAssets = maintenance.missingAttachments ?? maintenance.missingAssets;
+    const needsAttention = ['partial', 'blocked', 'failed'].includes(maintenance.status) || Number(missing) > 0 ||
+      Number(missingAssets) > 0 || Number(maintenance.conflicts) > 0 || Boolean(maintenance.error || maintenance.lastError?.code);
+    const emptyResult = ['completed', 'complete'].includes(maintenance.status) && !needsAttention &&
+      !Number(maintenance.conversationsChecked ?? maintenance.checked) && !Number(maintenance.totalConversations ?? maintenance.total) &&
+      !Number(maintenance.repairedMarkdown ?? maintenance.repaired);
+    show('maintenance-status', maintenance.status !== 'idle' && !emptyResult);
+    $('maintenance-status').classList.toggle('needs-attention', needsAttention);
     const parts = [labels[maintenance.status] || '本地检查进度已保留',
       `已检查 ${count(maintenance.conversationsChecked ?? maintenance.checked)} / ${count(maintenance.totalConversations ?? maintenance.total)} 条`,
       `已修复 ${count(maintenance.repairedMarkdown ?? maintenance.repaired)}`];
@@ -347,7 +354,9 @@ function renderDetailedProgress() {
   if (job?.status === 'running' && !liveCollection && Number(job?.nextRetryAt) > Date.now()) text('collection-details-status', '等待重试');
   text('collection-wait', collectionWait);
   show('run-summary', Boolean(job));
-  text('run-summary', job ? `本轮发现 ${count(job.discovered)} 条对话；未变化跳过 ${count(job.skipped)} 条，已新增 ${count(job.added)} 条、更新 ${count(job.updated)} 条，待处理 ${count(diagnostics.remaining ?? Math.max(0, (job.discovered || 0) - (job.processed || 0)))} 条。` : '');
+  text('run-summary', job ? ['list', 'listing', 'scan', 'scanning'].includes(job.phase) ?
+    `已发现 ${count(job.discovered)} 条对话，正在继续扫描列表。` :
+    `${job.status === 'running' || pausedStatuses.has(job.status) ? '' : `已处理 ${count(job.processed)} 条 · `}新增 ${count(job.added)} · 更新 ${count(job.updated)} · 未变化跳过 ${count(job.skipped)}` : '');
   text('collection-read-counts', job?.statistics ? `列表读取 ${count(job.statistics.listReads)} 次；正文读取 ${count(job.statistics.detailConversations)} 条／${count(job.statistics.detailReads)} 次（含重复尝试）。一次正文读取可能包含多页网络请求。` : job ? '此任务创建于旧版本，未记录完整读取次数；下一轮新建任务开始统计。' : '');
   text('collection-detail-counts', job ? `已发现 ${count(job.discovered)} 条 · 已处理 ${count(job.processed)} 条 · 未变化已跳过 ${count(diagnostics.skipped ?? job.skipped)} 条 · 待处理 ${count(diagnostics.remaining ?? Math.max(0, (job.discovered || 0) - (job.processed || 0)))} 条 · 失败／重试 ${count(diagnostics.failed !== undefined ? Number(diagnostics.failed) + Number(diagnostics.retrying || 0) : job.failed)} 条${job.pages ? ` · 已读 ${count(job.pages)} 页列表` : ''}` : '');
   const messages = job?.messageProgress;
@@ -486,22 +495,25 @@ function render() {
   }
   const interval = config.intervalMinutes || 30;
   text('home-heading', isRunning ?
-    job.mode === 'full' ? '正在全量补采' : job.mode === 'initial' ? '正在初始化采集' : '正在检查新增与更新' :
+    job.mode === 'full' ? '正在全量补采' : job.mode === 'initial' ? '正在进行首次备份' : '正在检查新增与更新' :
     isStopped ? '本轮采集已停止' : isPartial ? '部分采集已完成' : isPaused ? '采集已暂停' : !account?.initialized ? '准备好首次备份' : job?.status === 'completed' ? '本轮对话检查完成' : '对话归档已就绪');
-  text('schedule-status', isStopped ? '当前账号自动采集和自动附件下载已停止；重新开始后按设置恢复，手动补齐仍可使用。' : config.autoEnabled === false ? '自动采集已暂停，可以手动采集。' :
-    isRunning ? `每 ${interval} 分钟自动检查 · 当前任务完成后继续调度` :
-    current.nextRunAt ? `自动采集已开启 · 下次检查 ${time(current.nextRunAt)}` : `自动采集已开启 · 每 ${interval} 分钟检查`);
+  text('schedule-status', isStopped ? '本轮已停止，可点击检查更新重新开始。' : config.autoEnabled === false ?
+    isRunning ? '本轮正在进行 · 自动检查未开启' : '自动检查未开启，可手动备份。' :
+    isRunning ? `自动检查：每 ${interval} 分钟 · 本轮完成后继续` :
+    current.nextRunAt ? `自动检查已开启 · 下次检查 ${time(current.nextRunAt)}` : `自动检查已开启 · 每 ${interval} 分钟检查`);
   show('job-progress', isRunning || isPaused);
   const phases = { list: '扫描对话列表', listing: '扫描对话列表', scan: '扫描对话列表', scanning: '扫描对话列表', detail: '读取对话详情', details: '读取对话详情', capture: '读取对话详情', save: '保存 JSON 与 Markdown', saving: '保存 JSON 与 Markdown', sync: '同步 GitHub', syncing: '同步 GitHub', complete: '采集完成' };
   text('job-phase', phases[job?.phase] || (isPaused ? '进度已保留' : '正在处理'));
   const discovered = Number(job?.discovered) || 0;
   const processed = Number(job?.processed) || 0;
-  text('job-count', discovered ? `${processed} / ${discovered}` : '');
-  if (discovered > 0 && !['list', 'listing', 'scan', 'scanning'].includes(job?.phase)) {
+  const scanningList = ['list', 'listing', 'scan', 'scanning'].includes(job?.phase);
+  text('job-count', scanningList ? discovered ? `${count(discovered)} 条` : '发现中' : discovered ? `${processed} / ${discovered}` : '');
+  if (discovered > 0 && !scanningList) {
     $('progress-meter').max = Math.max(discovered, processed, 1);
     $('progress-meter').value = processed;
   } else $('progress-meter').removeAttribute('value');
   text('job-detail', isPartial ? `已保存的对话会保留，继续处理未完成项${Number(job?.failed) > 0 ? `（${count(job.failed)} 条待处理）` : ''}。` : isPaused ? '恢复后继续处理未完成项。' : '收起面板不会主动暂停任务。');
+  show('job-detail', isRunning || isPaused);
   const error = (!isStopped && jobError(job)) || (hasIdentity ? current.error?.message : '');
   show('job-error', Boolean(error)); text('job-error', safeMessage(error || ''));
   show('start-capture', !isRunning && !isPaused);
@@ -539,6 +551,8 @@ function render() {
   const pendingImages = Number(diagnostics?.pending ?? assets.pendingCapture) || 0;
   const failedImages = Number(diagnostics?.failed ?? assets.failed) || 0;
   const internalMissing = Number(diagnostics?.internalMissing ?? assets.internalMissing) || 0;
+  show('cloud-transfer-tools', cloud.upload || cloud.restore || internalMissing > 0);
+  $('start-capture').classList.toggle('primary', failedImages === 0 && internalMissing === 0);
   const assetParts = [];
   if (Number(assets.local) > 0) assetParts.push(`本地附件 ${count(assets.local)}`);
   if (Number(assets.external) > 0) assetParts.push(`外链 ${count(assets.external)}`);
@@ -562,20 +576,18 @@ function render() {
     downloadRunning ? '正在下载' : pendingImages > 0 ? config.localAssetsEnabled === false ? '自动下载已关闭' : isStopped ? '自动下载已停止' : '等待下载' : '当前无失败');
   let attachmentNote = failedImages > 0 ? '失败项尚未保存。查看原因后可重试，不影响已保存文件。' :
     !countsKnown ? '尚无可显示的统计，不能据此确认全部附件已保存。' : pendingImages > 0 ?
-    '当前失败 0 个；其余附件尚在排队或处理中，不代表已经全部保存。' :
+    '当前失败 0 个；待处理附件尚未全部保存。' :
     '当前已发现的附件暂无排队项；请结合本地备份完整性确认归档结果。';
   if (internalMissing > 0) attachmentNote += ` 内部附件未下载 ${count(internalMissing)} 个，自动重试已停止。`;
   if (unsupportedImages > 0) attachmentNote += ` 暂不支持 ${count(unsupportedImages)} 个。`;
   if (Number(assets.external) > 0) attachmentNote += ` 外链 ${count(assets.external)} 个。`;
-  if (isRunning) attachmentNote += ' 后续对话可能继续发现附件。';
+  if (isRunning) attachmentNote += ' 数量会随对话采集更新。';
   text('overview-attachments', attachmentNote);
   show('overview-cloud', cloud.upload || cloud.restore);
   text('overview-cloud', cloud.upload ? `GitHub 对话备份：${githubDescription}。附件仅保存在本地。` : 'GitHub 恢复状态请在传输详情中查看；附件需单独补齐。');
   const attention = [];
   if (Number(job?.failed) > 0) attention.push(`对话失败／重试 ${count(job.failed)} 条`);
   else if (job?.status === 'blocked' || job?.status === 'partial') attention.push('对话检查尚未完成');
-  if (failedImages > 0) attention.push(`附件失败 ${count(failedImages)} 个`);
-  if (internalMissing > 0) attention.push(`内部附件未下载 ${count(internalMissing)} 个`);
   if (!granted) attention.push('保存目录需要选择或授权');
   if (cloud.upload && (githubError || current.githubStatus?.status === 'conflicts')) attention.push('GitHub 备份需要处理');
   text('overview-problems', attention.join(' · ')); show('overview-problems', attention.length > 0);
@@ -589,6 +601,7 @@ function render() {
     Number(maintenance?.missingAttachments ?? maintenance?.missingAssets) > 0;
   show('repair-recommended', localMissing);
   show('task-action-help', isRunning || isPaused || isStopped);
+  show('task-action-help-details', isRunning || isPaused || isStopped);
   text('task-action-help', '暂停可继续原队列；停止本轮后，下次检查重新扫描。已保存文件保留，GitHub 备份和手动附件任务独立运行。');
   if (!account?.enabled || fullCaptureAccount !== account.accountKey || isRunning || current.identityChecking) fullCaptureAccount = null;
   show('full-capture-confirmation', Boolean(fullCaptureAccount));
