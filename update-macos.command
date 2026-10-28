@@ -16,7 +16,9 @@ AI Memory Collector — macOS 更新工具
 首次双击若提示没有执行权限，可在终端输入 bash 和一个空格，拖入此文件后按回车。
 无需 sudo、Git、Node 或 Python，不会安装常驻程序。
 更新结束后仍需在 chrome://extensions 或 edge://extensions 点击“重新加载”。
-不要卸载扩展，不要换目录加载。请先保存采集结果并关闭采集台。
+不要卸载扩展，不要换目录加载。关闭采集台不会停止后台任务。
+更新前暂停自动任务；有进行中的对话任务先“停止本轮”，等待独立传输和文件写入结束。
+本工具不读取浏览器任务状态，无法替你确认是否空闲。操作步骤见 docs/macos-update.md。
 HELP
 }
 
@@ -185,7 +187,7 @@ printf '%s\n' "$target_dir" > "$state_dir/target-path.next"
 mv "$state_dir/target-path.next" "$state_dir/target-path"
 installed_version=${installed_info%%|*}
 printf '\n原安装目录：%s\n当前版本：%s\n' "$target_dir" "$installed_version"
-printf '请确认已保存采集结果并关闭采集台；更新后需要重新加载插件。\n'
+printf '更新前应已暂停自动任务；有进行中的对话任务先“停止本轮”，并等待独立传输和文件写入结束。\n关闭采集台不会停止任务；本工具不读取浏览器状态，无法确认是否空闲。更新后需要重新加载插件。\n'
 
 stage_dir=$(mktemp -d "$parent_dir/.ai-memory-collector-stage.XXXXXX")
 if [ "$mode" = rollback ]; then
@@ -256,4 +258,4 @@ if ! mv "$target_state/last-backup.next" "$target_state/last-backup"; then
   printf '\n代码已更新，但备份位置记录保存失败；请保留这个路径用于手动恢复：%s\n' "$backup_dir" >&2
 fi
 printf '\n完成：%s → %s\n原安装目录保持不变：%s\n原代码备份：%s\n' "$installed_version" "${source_info%%|*}" "$target_dir" "$backup_dir"
-printf '\n接下来：\n1. 打开 chrome://extensions（Edge 使用 edge://extensions）。\n2. 找到 AI Memory Collector，点击“重新加载”。\n3. 关闭旧采集台，再点击扩展图标打开。\n不要卸载或换目录重新安装。此脚本不读取或修改浏览器中的 Token、设置和对话数据。\n'
+printf '\n接下来：\n1. 打开 chrome://extensions（Edge 使用 edge://extensions）。\n2. 找到 AI Memory Collector，点击“重新加载”。\n3. 刷新来源平台页，关闭旧采集台，再点击扩展图标打开。\n4. 核对版本、账号和保存目录，按更新前记录恢复需要的自动开关。已停止的账号需主动“检查更新”开始新一轮。\n不要卸载或换目录重新安装。此脚本不读取或修改浏览器中的 Token、设置和对话数据。\n'
