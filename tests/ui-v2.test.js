@@ -1148,7 +1148,9 @@ test('home separates completed conversations from failed attachments and hides u
   state.assetStatus = { local: 5, failed: 1, pendingCapture: 1, internalMissing: 1 };
   const app = await setup({ state });
   assert.equal(app.elements.get('home-heading').textContent, '本轮对话检查完成');
-  assert.match(app.elements.get('overview-attachments').textContent, /本地附件 5.*失败 1.*内部附件未下载 1/);
+  assert.equal(app.elements.get('attachment-saved').textContent, '5');
+  assert.equal(app.elements.get('attachment-failed').textContent, '1');
+  assert.match(app.elements.get('overview-attachments').textContent, /失败项尚未保存.*内部附件未下载 1/);
   assert.match(app.elements.get('overview-problems').textContent, /附件失败 1/);
   assert.equal(app.elements.get('overview-cloud').hidden, true);
   assert.equal(app.elements.get('repair-recommended').hidden, true);
@@ -1168,6 +1170,60 @@ test('first use keeps cloud optional and full capture out of primary actions', a
     assert.doesNotMatch(tag, /\bopen\b/);
   }
   assert.ok(html.indexOf('id="wizard-skip-github"') < html.indexOf('id="wizard-cloud-options"'));
+});
+
+test('attachment overview separates failures from queued work and keeps failures visible while downloading', async () => {
+  const state = initialState(); state.assetStatus = { local: 142 };
+  state.assetDiagnostics = { pending: 114, failed: 4, failures: [{ code: 'ASSET_PERMISSION', fileName: 'sample.png' }] };
+  state.activity = { download: { current: { status: 'running', step: 'fetch' } } };
+  const app = await setup({ state });
+  assert.equal(app.elements.get('attachment-saved').textContent, '142');
+  assert.equal(app.elements.get('attachment-pending').textContent, '110');
+  assert.equal(app.elements.get('attachment-failed').textContent, '4');
+  assert.equal(app.elements.get('attachment-state').textContent, '4 个失败');
+  assert.equal(app.elements.get('attachment-overview').classList.contains('has-failures'), true);
+  assert.match(app.elements.get('transfer-details-status').textContent, /^失败 4.*正在处理/);
+  assert.equal(app.elements.get('asset-failures').hidden, false);
+  assert.equal(app.elements.get('retry-images').hidden, false);
+  await app.click('retry-images');
+  assert.equal(app.messages.filter(message => message.type === 'collector:retry-images').length, 1);
+  assert.equal(app.messages.some(message => message.type === 'collector:start'), false);
+});
+
+test('a cleared failure count is explicit and no longer highlighted while remaining downloads continue', async () => {
+  const state = initialState(); state.assetStatus = { local: 10 }; state.assetDiagnostics = { pending: 3, failed: 2 };
+  const app = await setup({ state });
+  state.assetDiagnostics = { pending: 1, failed: 0 }; state.assetStatus.local = 12;
+  app.setState(state); await app.poll();
+  assert.equal(app.elements.get('attachment-failed').textContent, '0');
+  assert.equal(app.elements.get('attachment-pending').textContent, '1');
+  assert.equal(app.elements.get('attachment-overview').classList.contains('has-failures'), false);
+  assert.equal(app.elements.get('transfer-details-status').classList.contains('has-failures'), false);
+  assert.equal(app.elements.get('asset-failures').hidden, true);
+  assert.equal(app.elements.get('retry-images').hidden, true);
+  assert.match(app.elements.get('overview-attachments').textContent, /失败 0.*不代表已经全部保存/);
+});
+
+test('unknown attachment counts and excluded internal files never imply a complete backup', async () => {
+  const app = await setup();
+  for (const id of ['attachment-saved', 'attachment-pending', 'attachment-failed']) assert.equal(app.elements.get(id).textContent, '—');
+  assert.equal(app.elements.get('attachment-state').textContent, '尚无统计');
+  const state = initialState(); state.assetStatus = { local: 2 };
+  app.setState(state); await app.poll();
+  assert.equal(app.elements.get('attachment-saved').textContent, '2');
+  assert.equal(app.elements.get('attachment-failed').textContent, '—');
+  assert.equal(app.elements.get('attachment-pending').textContent, '—');
+  state.assetDiagnostics = { pending: 0, failed: 0, internalMissing: 1, unsupported: 2 };
+  app.setState(state); await app.poll();
+  assert.equal(app.elements.get('attachment-state').textContent, '1 个内部附件未下载');
+  assert.match(app.elements.get('overview-attachments').textContent, /内部附件未下载 1.*暂不支持 2/);
+  assert.doesNotMatch(app.elements.get('attachment-state').textContent, /已完成|全部保存/);
+});
+
+test('attachment failures and retry entry live beside the summary rather than below collapsed transfer details', () => {
+  const card = html.slice(html.indexOf('<section id="attachment-overview"'), html.indexOf('<div id="job-error"'));
+  for (const id of ['attachment-failed', 'asset-failures', 'retry-images', 'problem-assets']) assert(card.includes(`id="${id}"`));
+  assert(!card.includes('id="transfer-details"'));
 });
 
 

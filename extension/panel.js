@@ -377,7 +377,10 @@ function renderDetailedProgress() {
   else if (cloud.upload && job?.status === 'running' && Number(outbox.total ?? github.pending) > 0) { badge = '等待提交'; wait = '对话采集中，完成本轮后提交 GitHub；附件下载仍可继续处理。'; }
   else if (Number(asset.pending) > 0 || cloud.upload && Number(outbox.total ?? github.pending) > 0) { badge = '等待处理'; wait = '等待后台处理队列，对话和附件各自保留进度。'; }
   else if (cloud.upload && github.status === 'synced') { badge = '已同步'; wait = '当前已知的对话提交已完成；未下载附件仍保留各自状态。'; }
-  text('transfer-details-status', badge); text('transfer-wait', wait);
+  const transferFailures = Number(asset.failed ?? current.assetStatus?.failed) || 0;
+  text('transfer-details-status', transferFailures > 0 ? `失败 ${count(transferFailures)} · ${badge}` : badge);
+  $('transfer-details-status').classList.toggle('has-failures', transferFailures > 0);
+  text('transfer-wait', wait);
   text('transfer-detail-counts', `附件待处理 ${count(asset.pending)} · 失败 ${count(asset.failed)} · 内部附件未下载 ${count(asset.internalMissing)}${cloud.upload ? ` · 待提交对话 ${count(outbox.total ?? github.pending)}` : ''}`);
   renderActivityCards('transfer-current', transferChannels);
   renderTaskList('download-queue', 'download-queue-note', asset.captureItems, asset.captureTotal, '暂无附件下载任务。');
@@ -544,7 +547,28 @@ function render() {
   if (internalMissing > 0) assetParts.push(`内部附件未下载 ${count(internalMissing)}`);
   if (Number(diagnostics?.unsupported ?? assets.unsupported) > 0) assetParts.push(`暂不支持 ${count(diagnostics?.unsupported ?? assets.unsupported)}`);
   text('asset-summary-text', assetParts.join(' · ')); show('asset-summary', assetParts.length > 0);
-  text('overview-attachments', assetParts.length ? `附件累计：${assetParts.join(' · ')}。` : '附件：尚无可显示的统计，不能据此确认全部附件已保存。');
+  const pendingKnown = Number.isFinite(diagnostics?.pending ?? assets.pendingCapture);
+  const failuresKnown = Number.isFinite(diagnostics?.failed ?? assets.failed);
+  const countsKnown = pendingKnown && failuresKnown;
+  const waitingImages = Math.max(0, pendingImages - failedImages);
+  const unsupportedImages = Number(diagnostics?.unsupported ?? assets.unsupported) || 0;
+  const downloadRunning = current.activity?.download?.current?.status === 'running';
+  text('attachment-saved', assets.local == null ? '—' : count(assets.local));
+  text('attachment-pending', countsKnown ? count(waitingImages) : '—');
+  text('attachment-failed', failuresKnown ? count(failedImages) : '—');
+  $('attachment-overview').classList.toggle('has-failures', failedImages > 0);
+  text('attachment-state', failedImages > 0 ? `${count(failedImages)} 个失败` : internalMissing > 0 ? `${count(internalMissing)} 个内部附件未下载` :
+    unsupportedImages > 0 ? '部分附件暂不支持' : !countsKnown ? '尚无统计' :
+    downloadRunning ? '正在下载' : pendingImages > 0 ? config.localAssetsEnabled === false ? '自动下载已关闭' : isStopped ? '自动下载已停止' : '等待下载' : '当前无失败');
+  let attachmentNote = failedImages > 0 ? '失败项尚未保存。查看原因后可重试，不影响已保存文件。' :
+    !countsKnown ? '尚无可显示的统计，不能据此确认全部附件已保存。' : pendingImages > 0 ?
+    '当前失败 0 个；其余附件尚在排队或处理中，不代表已经全部保存。' :
+    '当前已发现的附件暂无排队项；请结合本地备份完整性确认归档结果。';
+  if (internalMissing > 0) attachmentNote += ` 内部附件未下载 ${count(internalMissing)} 个，自动重试已停止。`;
+  if (unsupportedImages > 0) attachmentNote += ` 暂不支持 ${count(unsupportedImages)} 个。`;
+  if (Number(assets.external) > 0) attachmentNote += ` 外链 ${count(assets.external)} 个。`;
+  if (isRunning) attachmentNote += ' 后续对话可能继续发现附件。';
+  text('overview-attachments', attachmentNote);
   show('overview-cloud', cloud.upload || cloud.restore);
   text('overview-cloud', cloud.upload ? `GitHub 对话备份：${githubDescription}。附件仅保存在本地。` : 'GitHub 恢复状态请在传输详情中查看；附件需单独补齐。');
   const attention = [];
@@ -559,7 +583,7 @@ function render() {
   const assetProblem = failedImages > 0 || internalMissing > 0;
   const githubProblem = cloud.upload && Boolean(githubError || current.githubStatus?.status === 'conflicts');
   show('problem-collection', collectionProblem); show('problem-assets', assetProblem); show('problem-github', githubProblem);
-  show('problem-actions', collectionProblem || assetProblem || githubProblem);
+  show('problem-actions', collectionProblem || githubProblem);
   const maintenance = current.maintenanceStatus;
   const localMissing = Number(maintenance?.missingConversationCount ?? (Array.isArray(maintenance?.missingConversations) ? maintenance.missingConversations.length : maintenance?.missingConversations)) > 0 ||
     Number(maintenance?.missingAttachments ?? maintenance?.missingAssets) > 0;
