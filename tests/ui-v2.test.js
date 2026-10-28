@@ -1141,3 +1141,75 @@ test('restoring directory permission does not replay a failed or legacy director
   assert.equal(app.messages.some(message => message.type === 'collector:directory-changed'), false);
   assert.ok(app.messages.some(message => message.type === 'collector:get-state'));
 });
+
+
+test('problem links select the current account and relevant local logs without starting work', async () => {
+  const state = initialState();
+  state.job = { status: 'partial', failed: 1 };
+  state.assetStatus = { failed: 1, local: 2 };
+  state.config.github = { enabled: true, hasToken: true, repository: 'example/archive' };
+  state.githubStatus = { status: 'error', error: { code: 'HTTP_403', message: 'Denied' } };
+  const record = { operationId: 'fixture', stage: 'download', status: 'failed', code: 'HTTP_404', finishedAt: Date.now() };
+  const accounts = [{ accountKey: 'acct-demo', platform: 'chatgpt', label: 'Demo' }, { accountKey: 'acct-other', platform: 'doubao', label: 'Other' }];
+  const app = await setup({ state, messageHook: message => message.type === 'collector:diagnostics' ?
+    { ok: true, diagnostics: { accountKey: message.accountKey, accounts, channels: { download: { history: [record] }, collection: { history: [] }, github: { history: [] } } } } : undefined });
+  for (const id of ['problem-collection', 'problem-assets', 'problem-github']) assert.equal(app.elements.get(id).hidden, false);
+  await app.click('problem-assets');
+  assert.equal(app.elements.get('diagnostics-channel').value, 'download');
+  assert.equal(app.elements.get('diagnostics-status').value, 'failed');
+  assert.equal(app.elements.get('diagnostics-list').children.length, 1);
+  assert.match(app.elements.get('diagnostics-help').textContent, /正文完成不代表附件已保存/);
+  app.elements.get('diagnostics-account').value = 'acct-other';
+  await app.poll();
+  assert.equal(app.messages.filter(m => m.type === 'collector:diagnostics').at(-1).accountKey, 'acct-other');
+  await app.click('diagnostics-back'); await app.click('problem-collection');
+  assert.equal(app.messages.filter(m => m.type === 'collector:diagnostics').at(-1).accountKey, 'acct-demo');
+  assert.equal(app.elements.get('diagnostics-channel').value, 'collection');
+  assert.equal(app.elements.get('diagnostics-status').value, 'all');
+  await app.click('diagnostics-back'); await app.click('problem-github');
+  assert.equal(app.elements.get('diagnostics-channel').value, 'github');
+  assert.match(app.elements.get('diagnostics-help').textContent, /无需重新采集/);
+  assert.equal(app.messages.some(m => /collector:(?:start|resume|retry|configure|github-config|restore)/.test(m.type)), false);
+});
+
+test('general diagnostic entry resets stale filters and follows a changed home account', async () => {
+  const accounts = [{ accountKey: 'acct-demo', platform: 'chatgpt', label: 'Demo' }, { accountKey: 'acct-other', platform: 'doubao', label: 'Other' }];
+  const app = await setup({ messageHook: message => message.type === 'collector:diagnostics' ?
+    { ok: true, diagnostics: { accountKey: message.accountKey, accounts, channels: {} } } : undefined });
+  await app.click('open-diagnostics');
+  app.elements.get('diagnostics-code').value = 'HTTP_404'; app.elements.get('diagnostics-channel').value = 'download';
+  app.elements.get('diagnostics-status').value = 'failed'; app.elements.get('diagnostics-period').value = 'day';
+  await app.click('diagnostics-back');
+  const changed = initialState(); changed.account.accountKey = 'acct-other'; changed.identity.accountKey = 'acct-other'; changed.identity.platform = 'doubao';
+  app.setState(changed); await app.poll(); await app.click('open-diagnostics');
+  assert.equal(app.messages.filter(m => m.type === 'collector:diagnostics').at(-1).accountKey, 'acct-other');
+  assert.equal(app.elements.get('diagnostics-code').value, '');
+  assert.equal(app.elements.get('diagnostics-channel').value, 'all');
+  assert.equal(app.elements.get('diagnostics-status').value, 'all');
+  assert.equal(app.elements.get('diagnostics-period').value, 'week');
+});
+
+test('resetting filters preserves selected account without reading or mutating data', async () => {
+  const app = await setup({ messageHook: message => message.type === 'collector:diagnostics' ?
+    { ok: true, diagnostics: { accountKey: 'acct-demo', accounts: [{ accountKey: 'acct-demo', label: 'Demo' }], channels: {} } } : undefined });
+  await app.click('open-diagnostics');
+  app.elements.get('diagnostics-code').value = 'HTTP_404'; app.elements.get('diagnostics-channel').value = 'download';
+  const before = app.messages.length;
+  await app.click('reset-diagnostics-filters');
+  assert.equal(app.messages.length, before);
+  assert.equal(app.elements.get('diagnostics-account').value, 'acct-demo');
+  assert.equal(app.elements.get('diagnostics-code').value, '');
+  assert.equal(app.elements.get('diagnostics-channel').value, 'all');
+  assert.match(app.elements.get('diagnostics-help').textContent, /本机保留/);
+});
+
+test('healthy local-only account has no problem shortcuts and offline diagnostics remain available', async () => {
+  const state = initialState(); state.identity = null; state.account = null;
+  const app = await setup({ state, messageHook: message => message.type === 'collector:diagnostics' ?
+    { ok: true, diagnostics: { accountKey: 'stored', accounts: [{ accountKey: 'stored', label: 'Stored' }], channels: {} } } : undefined });
+  assert.equal(app.elements.get('problem-actions').hidden, true);
+  assert.equal(app.elements.get('problem-github').hidden, true);
+  await app.click('open-diagnostics');
+  assert.equal(app.elements.get('diagnostics').hidden, false);
+  assert.equal(app.elements.get('diagnostics-account').value, 'stored');
+});

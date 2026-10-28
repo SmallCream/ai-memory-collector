@@ -74,7 +74,7 @@
     <p id="identity-checking-note" class="hint warning-text" hidden>正在核验当前标签页；下方为上次确认账号的进度。</p>
     <div id="account-alert" class="notice" hidden><p id="account-alert-text"></p><label for="new-account-alias">账号名称<input id="new-account-alias" maxlength="60" autocomplete="off"></label><button id="bind-account" class="primary block">为此账号启用采集</button><button id="home-grant" class="primary block" hidden>授权 ChatGPT</button><button id="home-open-chatgpt" hidden>打开 ChatGPT</button><button id="home-open-doubao" hidden>打开豆包</button></div>
     <div class="headline"><h1 id="home-heading">自动归档你的对话</h1><p id="schedule-status" class="muted"></p></div>
-    <section class="backup-overview" aria-label="备份结果"><p id="run-summary" hidden></p><p id="overview-attachments" class="hint"></p><p id="overview-cloud" class="hint" hidden></p><p id="overview-problems" class="warning-text" hidden></p><button id="open-diagnostics" class="text-button">问题与诊断日志</button></section>
+    <section class="backup-overview" aria-label="备份结果"><p id="run-summary" hidden></p><p id="overview-attachments" class="hint"></p><p id="overview-cloud" class="hint" hidden></p><p id="overview-problems" class="warning-text" hidden></p><button id="open-diagnostics" class="text-button">问题与诊断日志</button><div id="problem-actions" class="button-row" hidden><button id="problem-collection" class="text-button" hidden>查看对话问题</button><button id="problem-assets" class="text-button" hidden>查看附件问题</button><button id="problem-github" class="text-button" hidden>查看 GitHub 问题</button></div></section>
     <div id="job-error" class="notice" role="status" hidden></div>
     <div class="main-actions"><button id="start-capture" class="primary block">检查更新</button><button id="pause-capture" class="block" hidden>暂停采集</button><button id="resume-capture" class="primary block" hidden>继续采集</button><button id="stop-capture" class="block" title="结束本轮，不再继续旧队列；已保存数据保留。" hidden>停止本轮</button><button id="repair-recommended" class="block" hidden>补齐本地缺失</button></div>
     <p id="task-action-help" class="hint" hidden></p>
@@ -132,7 +132,7 @@
       <label for="diagnostics-period">时间<select id="diagnostics-period"><option value="week">最近 7 天</option><option value="day">最近 24 小时</option></select></label>
       <label for="diagnostics-code">错误代码<input id="diagnostics-code" placeholder="例如 HTTP_403" maxlength="60" autocomplete="off"></label>
     </div>
-    <div class="button-row"><button id="refresh-diagnostics">刷新日志</button><button id="preview-diagnostics">预览脱敏导出</button><button id="clear-diagnostics">清除已结束日志</button></div>
+    <p id="diagnostics-help" class="notice" role="status"></p><div class="button-row"><button id="reset-diagnostics-filters">重置筛选</button><button id="refresh-diagnostics">刷新日志</button><button id="preview-diagnostics">预览脱敏导出</button><button id="clear-diagnostics">清除已结束日志</button></div>
     <p class="hint">清除只影响所选账号和仓库恢复的日志，进行中的步骤、采集任务及已保存文件保留。日志不自动上传。</p>
     <p id="diagnostics-count" class="hint" role="status"></p><ol id="diagnostics-list" class="task-list diagnostic-list"></ol>
     <section id="diagnostics-export" hidden><h2>脱敏导出预览</h2><p class="hint">导出所选账号与仓库恢复的保留记录，不受列表筛选影响。只含版本、平台、时间、阶段、固定错误码和计数；对象使用本次导出内的匿名编号。不包含正文、标题、文件名、账号名称、凭据、网址或完整本地路径。</p><pre id="diagnostics-preview" tabindex="0"></pre><div class="button-row"><button id="save-diagnostics" class="primary">保存诊断 JSON</button><button id="cancel-diagnostics-export">关闭预览</button></div></section>

@@ -553,6 +553,11 @@ function render() {
   if (!granted) attention.push('保存目录需要选择或授权');
   if (cloud.upload && (githubError || current.githubStatus?.status === 'conflicts')) attention.push('GitHub 备份需要处理');
   text('overview-problems', attention.join(' · ')); show('overview-problems', attention.length > 0);
+  const collectionProblem = Number(job?.failed) > 0 || ['blocked', 'partial'].includes(job?.status);
+  const assetProblem = failedImages > 0 || internalMissing > 0;
+  const githubProblem = cloud.upload && Boolean(githubError || current.githubStatus?.status === 'conflicts');
+  show('problem-collection', collectionProblem); show('problem-assets', assetProblem); show('problem-github', githubProblem);
+  show('problem-actions', collectionProblem || assetProblem || githubProblem);
   const maintenance = current.maintenanceStatus;
   const localMissing = Number(maintenance?.missingConversationCount ?? (Array.isArray(maintenance?.missingConversations) ? maintenance.missingConversations.length : maintenance?.missingConversations)) > 0 ||
     Number(maintenance?.missingAttachments ?? maintenance?.missingAssets) > 0;
@@ -773,9 +778,9 @@ async function closePanel(hide = false) {
   await send('collector:close-panel', { hide });
   if (!setupPage) window.close();
 }
-async function loadDiagnostics(type = 'collector:diagnostics') {
+async function loadDiagnostics(type = 'collector:diagnostics', entryAccountKey = null) {
   const revision = ++diagnosticRevision;
-  const accountKey = $('diagnostics-account').value || diagnosticSnapshot?.accountKey || current?.account?.accountKey;
+  const accountKey = entryAccountKey || $('diagnostics-account').value || diagnosticSnapshot?.accountKey || current?.account?.accountKey;
   const reply = await send(type, accountKey ? { accountKey } : {});
   if (revision !== diagnosticRevision) return;
   diagnosticSnapshot = reply.diagnostics;
@@ -796,6 +801,13 @@ async function loadDiagnostics(type = 'collector:diagnostics') {
 function renderDiagnostics() {
   const channelNames = { collection: '对话采集／写入', download: '附件下载／写入', github: 'GitHub 备份', restore: '仓库恢复' };
   const selectedChannel = $('diagnostics-channel').value || 'all', selectedStatus = $('diagnostics-status').value || 'all';
+  const guidance = {
+    collection: '先查看失败步骤与原因。恢复登录或目录权限后，回首页重试未完成项；遇到本地冲突，先保留并核对自己的修改，不必直接全量补采。',
+    download: '正文完成不代表附件已保存。先在来源平台确认附件可打开，再回首页“重试失败附件”；来源已删除或返回 404 时，反复重试不保证恢复。',
+    github: '这里只表示对话文件备份，附件仍在本地。先按错误原因检查网络、仓库权限或冲突，再到设置中的 GitHub 备份处理；无需重新采集对话。',
+    restore: '仓库恢复记录覆盖该仓库全部恢复账号。先检查保存目录和仓库权限，再到设置重新尝试恢复；二进制附件需要从原电脑复制或从来源平台补齐。',
+  };
+  text('diagnostics-help', guidance[selectedChannel] || '这里展示本机保留的步骤记录，不代表当前所有问题。先选账号和阶段查看原因，回首页处理；需要反馈时先预览脱敏导出，再保存诊断文件。');
   const after = Date.now() - ($('diagnostics-period').value === 'day' ? 1 : 7) * 86400000;
   const code = $('diagnostics-code').value.trim().toUpperCase();
   const records = [];
@@ -841,9 +853,18 @@ function renderDiagnostics() {
   }
   if (Number.isFinite(scroll)) list.scrollTop = scroll;
 }
-for (const id of ['open-diagnostics', 'settings-diagnostics']) action(id, async () => {
+for (const [id, channel] of [['open-diagnostics', 'all'], ['settings-diagnostics', 'all'],
+  ['problem-collection', 'collection'], ['problem-assets', 'download'], ['problem-github', 'github']]) action(id, async () => {
   diagnosticExport = null; show('diagnostics-export', false);
-  await loadDiagnostics(); screen = 'diagnostics';
+  $('diagnostics-channel').value = channel;
+  $('diagnostics-status').value = channel === 'download' ? 'failed' : 'all';
+  $('diagnostics-period').value = 'week'; $('diagnostics-code').value = '';
+  await loadDiagnostics('collector:diagnostics', current?.account?.accountKey); screen = 'diagnostics';
+});
+$('reset-diagnostics-filters').addEventListener('click', () => {
+  $('diagnostics-channel').value = 'all'; $('diagnostics-status').value = 'all';
+  $('diagnostics-period').value = 'week'; $('diagnostics-code').value = '';
+  renderDiagnostics();
 });
 action('diagnostics-back', () => { screen = 'home'; });
 action('refresh-diagnostics', () => loadDiagnostics());
