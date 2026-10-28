@@ -86,6 +86,7 @@ function assetFailureMessage(code) {
   if (/^(?:ASSET_VARIANT|ASSET_HASH|ASSET_HASH_MISMATCH)$/.test(code)) return '下载内容与原始附件信息不一致，未保存。';
   if (/^(?:LOCAL_CONFLICT|ASSET_LOCAL_CONFLICT)$/.test(code)) return '本地文件已变化，已保留原文件。请检查对应对话或附件。';
   if (code === 'DIRECTORY_PERMISSION') return '请恢复保存目录的读写权限。';
+  if (code === 'ASSET_PERMISSION') return '请在设置中点击“允许下载豆包原图（byteimg.com）”并授权，然后重试失败附件。';
   if (code === 'DIRECTORY_CHANGED') return '附件写入尚未完成，请恢复原保存目录后重试。';
   if (code === 'ASSET_WRITE') return '附件写入未完成，请检查保存目录后重试。';
   return '本次附件处理未完成，任务已保留。可根据错误代码继续排查。';
@@ -472,6 +473,7 @@ function render() {
   show('home-open-doubao', !hasIdentity);
   text('home-grant', `授权 ${current.siteLabel || 'ChatGPT'}`);
   show('grant-doubao-images', current.platform === 'doubao');
+  show('wizard-doubao-images-hint', current.platform === 'doubao');
   text('account-alert-text', hasIdentity ? '当前账号尚未启用。确认后会保存到它自己的目录。' :
     safeMessage(current.error?.message || '请打开并登录 ChatGPT 或豆包。页面会自动更新，无需手动选择标签页。'));
   if (activeAliasKey !== identity?.accountKey) {
@@ -903,6 +905,13 @@ action('wizard-next-2', () => { step = 3; });
 action('wizard-skip-github', () => { step = 3; });
 for (let index = 1; index <= 3; index++) action(`wizard-back-${index}`, () => { step = index - 1; });
 action('wizard-finish', async () => {
+  if (current.platform === 'doubao' && $('wizard-local-assets-enabled').checked) {
+    // Request directly from the click, before messaging loses user activation.
+    if (!await chrome.permissions.request({ origins: ['https://*.byteimg.com/*'] })) {
+      throw new Error('未获得豆包图片域名权限。请再次授权，或取消“自动下载图片和附件到本地”后开始正文备份。');
+    }
+    await send('collector:permissions-changed');
+  }
   await send('collector:configure', { setupComplete: true, autoEnabled: $('wizard-auto-enabled').checked,
     localAssetsEnabled: $('wizard-local-assets-enabled').checked, intervalMinutes: 30 });
   await send('collector:start', { mode: 'initial' });

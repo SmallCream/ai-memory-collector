@@ -426,6 +426,47 @@ test('permission revocation removes the content entry and exposes recovery; hear
   assert.equal((await f.service.state(1)).error.code, 'SITE_PERMISSION_REQUIRED');
 });
 
+test('installation and permission events cannot register the same content script concurrently', async () => {
+  const f = fixture(); let registrations = 0;
+  f.dependencies.browser.scripting.registerContentScripts = async values => {
+    for (const value of values) {
+      registrations++;
+      if (f.scripts.has(value.id)) throw new Error('Duplicate script ID');
+      f.scripts.set(value.id, value);
+    }
+  };
+  const outcomes = await Promise.allSettled([f.service.initialize(), f.service.initialize(),
+    f.service.command({ type: 'collector:permissions-changed' }, 1)]);
+  assert(outcomes.every(result => result.status === 'fulfilled'));
+  assert.equal(registrations, 1);
+  assert.equal((await f.service.state(1)).error, null);
+});
+
+test('successful permission setup clears a prior startup error and failed setup remains visible', async () => {
+  const f = fixture(), scripting = f.dependencies.browser.scripting;
+  const register = scripting.registerContentScripts;
+  scripting.registerContentScripts = async () => { throw new Error('private browser error'); };
+  await f.service.initialize();
+  assert.equal((await f.service.state(1)).error.code, 'OPERATION_FAILED');
+  await assert.rejects(f.service.command({ type: 'collector:permissions-changed' }, 1));
+  scripting.registerContentScripts = register;
+  const reply = await f.service.command({ type: 'collector:permissions-changed' }, 1);
+  assert.equal(reply.state.error, null);
+});
+
+test('permission revocation arriving during startup is applied after registration completes', async () => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  const register = f.dependencies.browser.scripting.registerContentScripts;
+  f.dependencies.browser.scripting.registerContentScripts = async values => {
+    entered.resolve(); await release.promise; await register(values);
+  };
+  const first = f.service.initialize(); await entered.promise;
+  f.permissions.delete(site);
+  const revoked = f.service.initialize(); release.resolve();
+  await Promise.all([first, revoked]);
+  assert.equal(f.scripts.size, 0);
+});
+
 test('GitHub omitted token preserves it, explicit empty clears it and a changed destination requires backfill', async () => {
   const f = fixture({ github: { enabled: false, repository: 'owner/old', token: 'token' } });
   await f.service.command({ type: 'collector:github-config', branch: 'main' }, 1);

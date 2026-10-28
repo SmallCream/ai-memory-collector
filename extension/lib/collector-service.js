@@ -18,6 +18,7 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
   const activity = createActivityLog({ getSetting, setSetting, now });
   let pumping = null, continuation = null, startupError = null, restoring = null, changingDirectory = false;
   let mutationQueue = Promise.resolve();
+  let initializationQueue = Promise.resolve();
   let fileQueue = Promise.resolve();
   // Short commands and file commits are serialized independently of network
   // waits. Each account still has one worker; directory replacement drains it.
@@ -559,12 +560,18 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
       }
     }
   }
-  async function initialize() {
-    try {
-      await browser.sidePanel.setOptions({ enabled: false });
-      if (!await browser.alarms.get(ALARM_NAME)) await browser.alarms.create(ALARM_NAME, { periodInMinutes: 1 });
-      await registerContent(); startupError = null;
-    } catch (error) { startupError = safeError(error); }
+  function initialize() {
+    // Installation, worker startup and permission events may overlap. Preserve
+    // every event so a queued revocation rechecks permissions after registration.
+    initializationQueue = initializationQueue.then(async () => {
+      try {
+        await browser.sidePanel.setOptions({ enabled: false });
+        if (!await browser.alarms.get(ALARM_NAME)) await browser.alarms.create(ALARM_NAME, { periodInMinutes: 1 });
+        await registerContent(); startupError = null;
+      } catch (error) { startupError = safeError(error); }
+      return startupError;
+    });
+    return initializationQueue;
   }
   async function executeCommand(message, tabId) {
     switch (message.type) {
@@ -619,7 +626,11 @@ export function createCollectorService({ browser, getSetting, setSetting, getSet
         });
         continueSoon(); break;
       }
-      case 'collector:permissions-changed': await registerContent(); break;
+      case 'collector:permissions-changed': {
+        const error = await initialize();
+        if (error) throw error;
+        break;
+      }
       case 'collector:retry-images': {
         if (!assetService?.retryFailed) throw collectorError('ASSET_UNAVAILABLE', '当前版本不支持附件补采。');
         const tab = await sourceTab(tabId), site = siteFor(tab?.url);

@@ -16,7 +16,7 @@ JSON 包含版本、构建渠道、源提交、工作区是否有未提交修改
 
 ```sh
 cd dist
-shasum -a 256 -c ai-memory-collector-0.4.13.sha256
+shasum -a 256 -c ai-memory-collector-0.4.14.sha256
 ```
 
 CI 对提交运行测试、静态检查和测试打包，上传名称含提交编号的测试产物，包括三个文件。它不自动创建 GitHub Release、不合并 PR，也不发布到浏览器商店。

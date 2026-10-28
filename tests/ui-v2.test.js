@@ -131,6 +131,7 @@ test('initial setup requires account bind and directory grant before final initi
   await app.click('wizard-finish');
   assert.equal(app.messages.filter(x => x.type === 'collector:start').at(-1).mode, 'initial');
   assert.equal(app.messages.filter(x => x.type === 'collector:start').at(-1).tabId, 22);
+  assert.equal(app.permissionRequests.length, 0);
 });
 
 test('GitHub grant denial cannot persist a token or enable sync', async () => {
@@ -143,6 +144,33 @@ test('GitHub grant denial cannot persist a token or enable sync', async () => {
   assert(!app.messages.some(x => x.type === 'collector:github-config'));
   assert.match(app.elements.get('global-status').textContent, /未获得 GitHub/);
 });
+
+for (const download of [true, false]) for (const grant of [true, false]) {
+  test(`Doubao first backup requests image permission before starting: download=${download}, grant=${grant}`, async () => {
+    const state = initialState(); state.config.setupComplete = false;
+    state.platform = 'doubao'; state.identity.platform = 'doubao'; state.account.initialized = false;
+    const app = await setup({ state, grant });
+    await app.click('wizard-bind'); await app.click('wizard-next-1'); await app.click('wizard-skip-github');
+    app.elements.get('wizard-local-assets-enabled').checked = download;
+    const before = app.events.length;
+    await app.click('wizard-finish');
+    assert.equal(app.elements.get('wizard-doubao-images-hint').hidden, false);
+    if (download) {
+      assert.equal(app.events[before], 'permission:https://*.byteimg.com/*');
+      assert.deepEqual(app.permissionRequests, [['https://*.byteimg.com/*']]);
+    } else assert.equal(app.permissionRequests.length, 0);
+    if (download && !grant) {
+      assert.equal(app.messages.some(message => message.type === 'collector:configure'), false);
+      assert.equal(app.messages.some(message => message.type === 'collector:start'), false);
+      assert.equal(app.elements.get('wizard').hidden, false);
+      assert.match(app.elements.get('global-status').textContent, /取消.*自动下载/);
+    } else {
+      assert.equal(app.messages.find(message => message.type === 'collector:configure').localAssetsEnabled, download);
+      assert.equal(app.messages.find(message => message.type === 'collector:start').mode, 'initial');
+      if (download) assert(app.events.indexOf('collector:permissions-changed') < app.events.indexOf('collector:start'));
+    }
+  });
+}
 
 test('GitHub credentials are cleared from form after successful save and never echoed', async () => {
   const app = await setup(); await app.click('open-settings');
@@ -1000,6 +1028,16 @@ test('failure classes and cross-run cooldown show actionable waiting without raw
   assert.match(visibleText(app.elements.get('download-queue')), /等待格式适配或手动重试/);
   assert.match(visibleText(app.elements.get('collection-queue')), /冷却后重试.*累计尝试 8 次/);
   assert.match(app.elements.get('collection-wait').textContent, /当前账号请求已降速/);
+});
+
+test('legacy Doubao image permission failures give the exact recovery path', async () => {
+  const state = initialState();
+  state.assetDiagnostics = { pending: 1, failed: 1, failures: [{ code: 'ASSET_PERMISSION', attempt: 2,
+    message: 'private response should never appear', conversationTitle: 'Demo', fileName: 'image.png' }] };
+  const app = await setup({ state });
+  const failure = visibleText(app.elements.get('asset-failure-list'));
+  assert.match(failure, /设置.*允许下载豆包原图（byteimg.com）.*重试失败附件/);
+  assert.doesNotMatch(failure, /private response/);
 });
 
 test('maintenance displays conversation counts separately from filesystem checks', async () => {
